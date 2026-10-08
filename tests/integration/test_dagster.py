@@ -29,7 +29,7 @@ def _definitions(root: Path, world=None):
 
 def test_bootstrap_job_captures_loads_builds_and_publishes(tmp_path: Path) -> None:
     settings, defs = _definitions(tmp_path)
-    result = defs.get_job_def("bootstrap").execute_in_process(raise_on_error=False)
+    result = defs.resolve_job_def("bootstrap").execute_in_process(raise_on_error=False)
     assert result.success, [
         e.event_specific_data.error.message
         for e in result.all_events
@@ -42,7 +42,7 @@ def test_bootstrap_job_captures_loads_builds_and_publishes(tmp_path: Path) -> No
 
 def test_publish_job_fails_and_publishes_nothing_without_a_build(tmp_path: Path) -> None:
     settings, defs = _definitions(tmp_path)
-    result = defs.get_job_def("publish").execute_in_process(raise_on_error=False)
+    result = defs.resolve_job_def("publish").execute_in_process(raise_on_error=False)
     assert not result.success
     assert current_release(settings) is None
 
@@ -62,7 +62,7 @@ def test_validate_job_runs_dbt_test_and_appends_no_snapshot(tmp_path: Path) -> N
     assert before >= 1
 
     defs = build_definitions(settings, transport=FakeGamma(demo_world()).transport())
-    result = defs.get_job_def("validate").execute_in_process(raise_on_error=False)
+    result = defs.resolve_job_def("validate").execute_in_process(raise_on_error=False)
 
     assert result.success
     assert _snapshot_count(settings.warehouse_path) == before, "validate must not run build"
@@ -72,7 +72,7 @@ def test_validate_job_fails_when_dbt_tests_fail(tmp_path: Path) -> None:
     # No build has run, so the tests have no marts to read and the job must fail.
     settings = make_settings(tmp_path)
     defs = build_definitions(settings, transport=FakeGamma(demo_world()).transport())
-    result = defs.get_job_def("validate").execute_in_process(raise_on_error=False)
+    result = defs.resolve_job_def("validate").execute_in_process(raise_on_error=False)
     assert not result.success
 
 

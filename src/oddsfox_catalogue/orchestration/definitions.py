@@ -164,7 +164,9 @@ def build_definitions(
     @dbt_assets(manifest=project.manifest_path, project=project)
     def catalogue_dbt(context: AssetExecutionContext, dbt: DbtCliResource) -> Iterator[Any]:
         assert_warehouse_released(settings.warehouse_path)
-        yield from dbt.cli(with_quality_vars(settings, ["build"]), context=context).stream()
+        yield from dbt.cli(
+            with_quality_vars(settings, ["build"]), context=context.op_execution_context
+        ).stream()
         # Reached only after a passing build. Same check as the CLI stage, logged to the run.
         warning = open_event_drop_warning(settings)
         if warning is not None:
