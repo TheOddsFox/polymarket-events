@@ -40,10 +40,6 @@ testpaths = ["tests"]
 pythonpath = ["tests"]
 addopts = "-ra --strict-markers"
 timeout = 120
-markers = [
-    "integration: exercises dlt/DuckDB/dbt together",
-    "e2e: full pipeline run against the fake Gamma server",
-]
 
 [tool.ruff]
 line-length = 100

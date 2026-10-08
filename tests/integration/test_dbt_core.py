@@ -8,30 +8,16 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from fakes.built_warehouse import capture_and_load
 from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
-from fakes.harness import FIXED_NOW, build_runtime, make_settings
+from fakes.harness import FIXED_NOW, build_runtime
 from fakes.world import demo_world
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
 from oddsfox_catalogue.warehouse import read_open_event_ids
-
-
-def _capture_and_load(root: Path, world=None) -> Settings:
-    runtime, _ = build_runtime(root, FakeGamma(world or demo_world()))
-    try:
-        run_capture(runtime, "bootstrap")
-    finally:
-        runtime.ledger.close()
-    settings = make_settings(root)
-    ledger = Ledger(settings.ledger_path)
-    try:
-        load_pending(LoadRuntime(settings=settings, ledger=ledger, now=lambda: FIXED_NOW))
-    finally:
-        ledger.close()
-    return settings
 
 
 def _scalar(warehouse: Path, sql: str):
@@ -45,7 +31,7 @@ def _scalar(warehouse: Path, sql: str):
 @pytest.fixture(scope="module")
 def built(tmp_path_factory) -> tuple[Path, Settings]:
     root = tmp_path_factory.mktemp("dbt_root")
-    settings = _capture_and_load(root)
+    settings = capture_and_load(root)
     result = run_dbt(["build"], settings.warehouse_path, root)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     return root, settings
@@ -101,7 +87,7 @@ def _snapshot(warehouse: Path, table: str, key: str) -> list[tuple]:
 
 
 def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) -> None:
-    settings = _capture_and_load(tmp_path)
+    settings = capture_and_load(tmp_path)
     assert run_dbt(["build"], settings.warehouse_path, tmp_path).returncode == 0
 
     # Event 202 closes between batches. Daily capture must fetch it by ID and reflect it.
@@ -177,7 +163,7 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) 
 
 def test_count_regression_blocks_the_build(tmp_path: Path) -> None:
     """A sudden drop in open events must fail the build, so publication never runs on it."""
-    settings = _capture_and_load(tmp_path)
+    settings = capture_and_load(tmp_path)
     assert run_dbt(["build"], settings.warehouse_path, tmp_path).returncode == 0
 
     closed_world = demo_world()
