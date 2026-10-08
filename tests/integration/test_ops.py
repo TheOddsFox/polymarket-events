@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import subprocess
 from datetime import timedelta
 from pathlib import Path
 
@@ -240,6 +241,27 @@ def _stage_rows(settings) -> list[dict]:
         return list(ledger.stage_runs())
     finally:
         ledger.close()
+
+
+def test_make_recipes_quote_paths_that_contain_spaces() -> None:
+    dagster = subprocess.run(
+        ["make", "-n", "dagster-home"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert 'mkdir -p "' in dagster.stdout
+    assert 'cp ops/dagster.yaml "' in dagster.stdout
+
+    backup = subprocess.run(
+        ["make", "-n", "verify-backup", "BACKUP=data/backups/a b"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert 'backup verify "data/backups/a b"' in backup.stdout
 
 
 def test_launchd_templates_are_valid_plists() -> None:

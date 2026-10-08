@@ -23,8 +23,8 @@ test:
 test-dev: lint test
 
 dagster-home:
-	mkdir -p $(DAGSTER_HOME)
-	cp ops/dagster.yaml $(DAGSTER_HOME)/dagster.yaml
+	mkdir -p "$(DAGSTER_HOME)"
+	cp ops/dagster.yaml "$(DAGSTER_HOME)/dagster.yaml"
 
 # First run on an empty project: captures every bootstrap page, loads, builds, publishes.
 bootstrap: dagster-home
@@ -63,7 +63,7 @@ backup:
 
 # Usage: make verify-backup BACKUP=data/backups/20261008T060000Z
 verify-backup:
-	$(CATALOGUE) backup verify $(BACKUP)
+	$(CATALOGUE) backup verify "$(BACKUP)"
 
 # Rebuild from raw in a scratch area and compare table fingerprints with the live warehouse.
 rebuild:
