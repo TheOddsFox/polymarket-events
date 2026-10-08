@@ -22,10 +22,8 @@ from oddsfox_catalogue.gamma.scans import list_scans_for
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
 CHILD = TESTS_DIR / "fakes" / "capture_child.py"
-SIX_LIST_SCANS = [
+BOOTSTRAP_LIST_SCANS = [
     "events_keyset_all",
-    "events_keyset_open",
-    "events_keyset_closed",
     "events_archived_offset",
     "markets_keyset_open",
     "markets_keyset_closed",
@@ -69,7 +67,12 @@ def test_bootstrap_captures_list_scans_and_resolves_references(tmp_path: Path) -
 
         scans = runtime.ledger.list_scans(summary.batch_id)
         names = [s["scan_name"] for s in scans]
-        assert names[:6] == SIX_LIST_SCANS
+        assert names[: len(BOOTSTRAP_LIST_SCANS)] == BOOTSTRAP_LIST_SCANS
+        list_requests = [params for path, params in fake.requests if path == "/events/keyset"]
+        assert list_requests, "bootstrap must list events"
+        assert all("closed" not in params for params in list_requests), (
+            "events_keyset_all must not filter by closed"
+        )
         assert "events_by_id_0001" in names, "references must be fetched by ID"
         assert "events_by_id_single_0001" in names, (
             "unresolved IDs must fall back to single lookups"
@@ -318,4 +321,6 @@ def test_daily_scan_set_is_only_the_open_list(tmp_path: Path) -> None:
     daily = list_scans_for("daily", settings.gamma)
     assert [s.name for s in daily] == ["events_keyset_open"]
     bootstrap = list_scans_for("bootstrap", settings.gamma)
-    assert [s.name for s in bootstrap] == SIX_LIST_SCANS
+    assert [s.name for s in bootstrap] == BOOTSTRAP_LIST_SCANS
+    reconcile = list_scans_for("reconcile", settings.gamma)
+    assert [s.name for s in reconcile] == BOOTSTRAP_LIST_SCANS

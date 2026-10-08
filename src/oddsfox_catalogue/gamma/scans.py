@@ -2,7 +2,9 @@
 
 Plan shape (see the design notes in the plan):
 
-* bootstrap / reconcile: six list scans, then reference resolution by ID.
+* bootstrap / reconcile: four list scans, then reference resolution by ID.
+  ``events_keyset_all`` already returns open and closed events, so no separate
+  open or closed event scan is needed.
 * daily: the open-event scan, then re-fetch previously open IDs missing from it.
 
 Follow-up scans (ID chunks, then single lookups) are created after their
@@ -88,16 +90,6 @@ def event_keyset_open(settings: GammaSettings) -> ScanSpec:
     )
 
 
-def event_keyset_closed(settings: GammaSettings) -> ScanSpec:
-    return ScanSpec(
-        "events_keyset_closed",
-        "keyset",
-        "/events/keyset",
-        "events",
-        _freeze(_event_params(settings, True)),
-    )
-
-
 def events_archived_offset(settings: GammaSettings) -> ScanSpec:
     params = {
         "limit": settings.page_limit,
@@ -132,8 +124,6 @@ def list_scans_for(mode: str, settings: GammaSettings) -> list[ScanSpec]:
     if mode in {"bootstrap", "reconcile"}:
         return [
             event_keyset_all(settings),
-            event_keyset_open(settings),
-            event_keyset_closed(settings),
             events_archived_offset(settings),
             markets_keyset_open(settings),
             markets_keyset_closed(settings),
