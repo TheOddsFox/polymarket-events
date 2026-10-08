@@ -1,0 +1,58 @@
+version: 2
+
+models:
+  - name: int_event_semantic
+    description: Fields that define an event's meaning, hashed under the projection version. Volatile fields are excluded.
+    columns:
+      - name: semantic_hash
+        tests: [not_null]
+
+  - name: int_market_semantic
+    description: Fields that define a market's meaning, hashed under the projection version. Prices and volume are excluded.
+    columns:
+      - name: semantic_hash
+        tests: [not_null]
+
+  - name: event_history
+    description: SCD2 versions of each event. A new version starts when its semantic hash changes.
+    columns:
+      - name: event_id
+        tests: [not_null]
+      - name: version_no
+        tests: [not_null]
+      - name: valid_from
+        tests: [not_null]
+      - name: is_current
+        tests: [not_null]
+    tests:
+      - unique:
+          arguments:
+            column_name: "venue || '|' || event_id || '|' || version_no"
+
+  - name: market_history
+    description: SCD2 versions of each market. A new version starts when its semantic hash changes.
+    columns:
+      - name: market_id
+        tests: [not_null]
+      - name: version_no
+        tests: [not_null]
+      - name: valid_from
+        tests: [not_null]
+      - name: is_current
+        tests: [not_null]
+    tests:
+      - unique:
+          arguments:
+            column_name: "venue || '|' || market_id || '|' || version_no"
+
+  - name: event_metrics
+    description: Volatile event measurements, one row per observation. Append-only; never rewritten.
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]
+
+  - name: market_metrics
+    description: Volatile market measurements, one row per observation. Append-only; never rewritten.
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]

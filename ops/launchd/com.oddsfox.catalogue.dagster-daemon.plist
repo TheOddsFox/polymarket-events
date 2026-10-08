@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Dagster daemon: runs schedules, sensors (failure and missed-run alerts), and the queued run
+  coordinator. KeepAlive restarts it after a crash. Requires `make dagster-home` to have run.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.oddsfox.catalogue.dagster-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/.venv/bin/dagster-daemon</string>
+    <string>run</string>
+    <string>-w</string>
+    <string>__PROJECT_ROOT__/ops/workspace.yaml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DAGSTER_HOME</key>
+    <string>__PROJECT_ROOT__/.state/dagster_home</string>
+    <key>CATALOGUE_ROOT</key>
+    <string>__PROJECT_ROOT__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/.state/logs/dagster-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/.state/logs/dagster-daemon.err.log</string>
+</dict>
+</plist>

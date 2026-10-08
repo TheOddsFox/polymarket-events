@@ -1,0 +1,12 @@
+# Profile used by the local pipeline. The warehouse path comes from the environment so
+# the same project works for the real warehouse and for test warehouses.
+#
+#   CATALOGUE_WAREHOUSE=/abs/path/catalogue.duckdb dbt build --project-dir dbt --profiles-dir dbt
+oddsfox_catalogue:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('CATALOGUE_WAREHOUSE') }}"
+      schema: main
+      threads: 1

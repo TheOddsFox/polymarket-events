@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily incremental refresh (Mon to Sat, 06:00 local). Copy to ~/Library/LaunchAgents/, replace
+  every __PLACEHOLDER__, then: launchctl bootstrap gui/$(id -u) <file>
+  Logs go to the project's .state/logs directory.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.oddsfox.catalogue.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/make</string>
+    <string>-C</string>
+    <string>__PROJECT_ROOT__</string>
+    <string>refresh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PROJECT_ROOT__/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+      <key>Weekday</key><integer>1</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+      <key>Weekday</key><integer>2</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+      <key>Weekday</key><integer>3</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+      <key>Weekday</key><integer>4</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+      <key>Weekday</key><integer>5</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>6</integer>
+      <key>Minute</key><integer>0</integer>
+      <key>Weekday</key><integer>6</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/.state/logs/daily.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/.state/logs/daily.err.log</string>
+</dict>
+</plist>

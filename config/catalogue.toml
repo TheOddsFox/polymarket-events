@@ -1,0 +1,51 @@
+# Committed defaults for the OddsFox Polymarket catalogue pipeline.
+#
+# Every key can be overridden with an environment variable named
+# CATALOGUE_<SECTION>_<KEY> (upper case), for example
+# CATALOGUE_GAMMA_REQUESTS_PER_SECOND=1.5.
+# Paths are relative to the project root unless absolute.
+
+[gamma]
+base_url = "https://gamma-api.polymarket.com"
+requests_per_second = 2.0
+connect_timeout_s = 10.0
+read_timeout_s = 60.0
+max_retries = 5
+backoff_base_s = 1.0
+backoff_cap_s = 60.0
+page_limit = 100
+# Optional expansions. Off by default because they enlarge payloads.
+include_chat = false
+include_template = false
+include_best_lines = false
+
+[paths]
+data_dir = "data"
+state_dir = ".state"
+warehouse_file = "data/warehouse/catalogue.duckdb"
+dbt_project_dir = "dbt"
+dbt_profiles_dir = "dbt"
+
+[load]
+dataset_name = "bronze"
+# Pages per dlt pipeline.run. Each chunk commits before the next starts.
+max_pages_per_run = 200
+duckdb_memory_limit = "2GB"
+duckdb_threads = 2
+
+[quality]
+# Maximum share of observations that may be quarantined before a batch fails.
+quarantine_max_ratio = 0.01
+# Maximum share of unresolved event references tolerated.
+unresolved_reference_max_ratio = 0.01
+# Open-event drop versus the previous release, in percent.
+open_events_drop_warn_pct = 10.0
+open_events_drop_error_pct = 30.0
+
+[publish]
+# Number of immutable releases kept on disk besides current and previous.
+retain_releases = 5
+
+[schedule]
+daily_cron = "0 6 * * 1-6"
+weekly_cron = "0 3 * * 0"

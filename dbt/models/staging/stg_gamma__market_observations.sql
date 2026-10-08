@@ -1,0 +1,35 @@
+-- Typed view over market observations from registered batches. Array-valued fields
+-- stay as raw JSON text here; int_market_outcomes decodes and checks their alignment.
+select
+    observation_id,
+    venue,
+    entity_id as market_id,
+    batch_id,
+    page_id,
+    endpoint,
+    observed_at,
+    b.batch_loaded_at,
+    source_updated_at,
+    payload_hash,
+    source_kind,
+    json_pointer,
+    json_extract_string(payload, '$.question') as question,
+    json_extract_string(payload, '$.slug') as slug,
+    json_extract_string(payload, '$.conditionId') as condition_id,
+    json_extract_string(payload, '$.version') as projection_source_version,
+    coalesce(try_cast(json_extract_string(payload, '$.active') as boolean), false) as active,
+    coalesce(try_cast(json_extract_string(payload, '$.closed') as boolean), false) as closed,
+    coalesce(try_cast(json_extract_string(payload, '$.archived') as boolean), false) as archived,
+    try_cast(json_extract_string(payload, '$.endDate') as timestamptz) as end_date,
+    try_cast(json_extract_string(payload, '$.volume') as double) as volume,
+    try_cast(json_extract_string(payload, '$.liquidity') as double) as liquidity,
+    json_extract_string(payload, '$.outcomes') as outcomes_raw,
+    json_extract_string(payload, '$.outcomePrices') as outcome_prices_raw,
+    json_extract_string(payload, '$.clobTokenIds') as clob_token_ids_raw,
+    json_extract_string(payload, '$.positionIds') as position_ids_raw,
+    {{ json_array_present('payload', '$.events') }} as event_refs_present,
+    json_extract(payload, '$.events') as event_refs_json,
+    {{ json_array_present('payload', '$.tags') }} as tags_present,
+    json_extract(payload, '$.tags') as tags_json
+from {{ source('bronze', 'market_observations') }} o
+join {{ ref('stg_gamma__batches') }} b using (batch_id)

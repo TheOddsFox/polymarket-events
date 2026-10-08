@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly reconcile (Sunday, 03:00 local). Same install steps as the daily agent.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.oddsfox.catalogue.reconcile</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/make</string>
+    <string>-C</string>
+    <string>__PROJECT_ROOT__</string>
+    <string>reconcile</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PROJECT_ROOT__/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>0</integer>
+    <key>Weekday</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/.state/logs/reconcile.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/.state/logs/reconcile.err.log</string>
+</dict>
+</plist>

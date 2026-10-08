@@ -1,0 +1,106 @@
+{
+  "events": [
+    {
+      "active": true,
+      "archived": false,
+      "categories": [],
+      "category": "Politics",
+      "chats": [],
+      "closed": false,
+      "collections": [],
+      "commentCount": 3,
+      "commentsEnabled": true,
+      "competitive": 0.5,
+      "createdAt": "2026-09-01T09:00:00.000Z",
+      "creationDate": "2026-09-01T09:00:00.000Z",
+      "description": "Event: Bitcoin price on Dec 31?",
+      "endDate": "2026-12-31T23:59:59Z",
+      "eventCreators": [],
+      "featured": false,
+      "icon": null,
+      "id": "202",
+      "image": null,
+      "liquidity": 800.0,
+      "markets": [
+        {
+          "acceptingOrders": true,
+          "active": true,
+          "archived": false,
+          "bestAsk": 0.21000000000000002,
+          "bestBid": 0.19,
+          "category": "Politics",
+          "clobTokenIds": null,
+          "closed": false,
+          "conditionId": "0x0000000000000000000000000000000000000000000000000000000000001771",
+          "createdAt": "2026-09-01T09:00:00.000Z",
+          "description": "Resolves per the rules of: Will BTC exceed 200k?",
+          "enableOrderBook": true,
+          "endDate": "2026-12-31T23:59:59Z",
+          "events": [
+            {
+              "id": "202",
+              "slug": "bitcoin-price-on-dec-31",
+              "ticker": "bitcoin-price-on-dec-31",
+              "title": "Bitcoin price on Dec 31?"
+            }
+          ],
+          "featured": false,
+          "formatType": "decimal",
+          "id": "6001",
+          "lastTradePrice": 0.2,
+          "liquidity": "310.25",
+          "liquidityNum": 310.25,
+          "marketType": "normal",
+          "negRisk": false,
+          "new": false,
+          "orderMinSize": 5,
+          "orderPriceMinTickSize": 0.01,
+          "outcomePrices": "[\"0.200\", \"0.700\", \"0.100\"]",
+          "outcomes": "[\"Yes\", \"No\", \"Maybe\"]",
+          "positionIds": [
+            "651150819117105875331414918119047680898421632356043490229292782433652012816",
+            "651150819117105875331414918119047680898421632356043490229292782433652012817",
+            "651150819117105875331414918119047680898421632356043490229292782433652012818"
+          ],
+          "question": "Will BTC exceed 200k?",
+          "restricted": false,
+          "slug": "will-btc-exceed-200k",
+          "startDate": "2026-09-02T00:00:00Z",
+          "updatedAt": "2026-10-01T12:00:00.000Z",
+          "version": "v2",
+          "volume": "1250.5",
+          "volume24hr": 12.0,
+          "volumeNum": 1250.5
+        }
+      ],
+      "negRisk": false,
+      "negRiskMarketID": null,
+      "new": false,
+      "openInterest": 0.0,
+      "resolutionSource": "https://example.test/source",
+      "restricted": false,
+      "series": [],
+      "slug": "bitcoin-price-on-dec-31",
+      "startDate": "2026-09-02T00:00:00Z",
+      "subcategory": null,
+      "subtitle": null,
+      "tags": [
+        {
+          "createdAt": "2026-09-01T09:00:00.000Z",
+          "forceShow": false,
+          "id": "21",
+          "label": "Crypto",
+          "publishedAt": "2026-09-01T09:00:00.000Z",
+          "slug": "crypto",
+          "updatedAt": "2026-10-01T12:00:00.000Z"
+        }
+      ],
+      "templates": [],
+      "ticker": "bitcoin-price-on-dec-31",
+      "title": "Bitcoin price on Dec 31?",
+      "updatedAt": "2026-10-01T12:00:00.000Z",
+      "volume": 4200.0,
+      "volume24hr": 40.0
+    }
+  ]
+}

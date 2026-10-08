@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OddsFox catalogue pipeline (local state and derived data are never committed)
+data/
+.state/
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+.tmp_dagster_home_*/

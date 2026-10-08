@@ -1,0 +1,55 @@
+version: 2
+
+models:
+  - name: stg_gamma__batches
+    columns:
+      - name: batch_id
+        tests: [unique, not_null]
+
+  - name: stg_gamma__event_observations
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]
+      - name: event_id
+        tests: [not_null]
+      - name: batch_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_gamma__batches')
+                field: batch_id
+
+  - name: stg_gamma__market_observations
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]
+      - name: market_id
+        tests: [not_null]
+      - name: batch_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_gamma__batches')
+                field: batch_id
+
+  - name: stg_gamma__event_tags
+    columns:
+      - name: observation_id
+        tests: [not_null]
+
+  - name: stg_gamma__event_series
+    columns:
+      - name: observation_id
+        tests: [not_null]
+
+  - name: stg_gamma__market_tags
+    columns:
+      - name: observation_id
+        tests: [not_null]
+
+  - name: stg_gamma__market_event_refs
+    columns:
+      - name: observation_id
+        tests: [not_null]
+      - name: event_id
+        tests: [not_null]

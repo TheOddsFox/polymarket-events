@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.12"
+      # Tests must never reach the live Gamma API. Every fixture-backed test uses an
+      # in-process transport; this address is unroutable and would fail loudly if one leaked.
+      CATALOGUE_GAMMA_BASE_URL: "http://127.0.0.1:9"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Verify lockfile is up to date
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: dbt parse
+        run: uv run catalogue dbt -- parse
+
+      - name: Unit tests
+        run: uv run pytest -q tests/unit
+
+      - name: Capture and crash recovery (after_page_rename, after_ledger_commit, expired cursor)
+        run: uv run pytest -q tests/integration/test_capture.py
+
+      - name: Loader (duplicates, closures, schema drift, mid_dlt_load, before_registry)
+        run: uv run pytest -q tests/integration/test_load.py
+
+      - name: dbt models (closures, SCD2 history, count regression, incremental equivalence)
+        run: uv run pytest -q tests/integration/test_dbt_core.py
+
+      - name: Publication (fingerprints, pointer swap, mid_publish crash, publication blocking)
+        run: uv run pytest -q tests/integration/test_publish.py
+
+      - name: Operations (rebuild verify, replay order, backups, stage metrics, launchd)
+        run: uv run pytest -q tests/integration/test_ops.py
+
+      - name: Dagster jobs and run queue config
+        run: uv run pytest -q tests/integration/test_dagster.py

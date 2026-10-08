@@ -1,0 +1,5 @@
+# Dagster code location for the daemon and the Dagster UI. Paths are relative to the project.
+load_from:
+  - python_module:
+      module_name: oddsfox_catalogue.orchestration.definitions
+      attribute: defs

@@ -1,0 +1,53 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: Raw envelope tables written by dlt. Insert-only; never edited by dbt.
+    schema: bronze
+    tables:
+      - name: batch_registry
+        description: One row per batch whose pages are all loaded. dbt reads only these batches.
+        meta:
+          dagster:
+            asset_key: ["bronze", "batch_registry"]
+        columns:
+          - name: batch_id
+            tests:
+              - unique
+              - not_null
+          - name: status
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: ["loaded"]
+
+      - name: event_observations
+        description: One row per event observed on one page.
+        meta:
+          dagster:
+            asset_key: ["bronze", "event_observations"]
+        columns:
+          - name: observation_id
+            tests:
+              - unique
+              - not_null
+          - name: entity_id
+            tests:
+              - not_null
+
+      - name: market_observations
+        description: One row per market observed on one page, embedded or direct.
+        meta:
+          dagster:
+            asset_key: ["bronze", "market_observations"]
+        columns:
+          - name: observation_id
+            tests:
+              - unique
+              - not_null
+
+      - name: quarantined_records
+        description: Records that failed envelope checks. Kept for inspection; never published.
+        meta:
+          dagster:
+            asset_key: ["bronze", "quarantined_records"]
