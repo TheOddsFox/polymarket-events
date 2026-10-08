@@ -7,6 +7,12 @@ Asset graph::
 Every step runs in the same process (in_process_executor), under the run lock, so a
 single host never runs two writers at once. Runs are queued by QueuedRunCoordinator
 (see ops/dagster.yaml), so schedules cannot overlap.
+
+Scheduling: this daemon's schedules (daily_refresh_schedule, weekly_reconcile_schedule) run
+in UTC. They replace the launchd agents in ops/launchd/, which run in local time. Enable one
+scheduler, never both; see README, Scheduling.
+
+The ``validate`` job runs ``dbt test`` only and never appends a catalogue_snapshots row.
 """
 
 import json
@@ -33,7 +39,9 @@ from dagster import (
     asset,
     define_asset_job,
     in_process_executor,
+    job,
     multi_asset,
+    op,
     run_failure_sensor,
     sensor,
 )
@@ -41,9 +49,20 @@ from dagster_dbt import DbtCliResource, DbtProject, dbt_assets
 
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.config import Settings, load_settings
-from oddsfox_catalogue.dbt_runner import DBT_DIR, assert_warehouse_released, run_dbt_at
+from oddsfox_catalogue.dbt_runner import (
+    DBT_DIR,
+    assert_warehouse_released,
+    run_dbt_at,
+    with_quality_vars,
+)
 from oddsfox_catalogue.ids import utc_now
-from oddsfox_catalogue.pipeline import capture_stage, load_stage, publish_stage
+from oddsfox_catalogue.pipeline import (
+    capture_stage,
+    dbt_stage,
+    load_stage,
+    open_event_drop_warning,
+    publish_stage,
+)
 from oddsfox_catalogue.publish import PublishBlocked
 
 BRONZE_TABLES = (
@@ -145,7 +164,16 @@ def build_definitions(
     @dbt_assets(manifest=project.manifest_path, project=project)
     def catalogue_dbt(context: AssetExecutionContext, dbt: DbtCliResource) -> Iterator[Any]:
         assert_warehouse_released(settings.warehouse_path)
-        yield from dbt.cli(["build"], context=context).stream()
+        yield from dbt.cli(with_quality_vars(settings, ["build"]), context=context).stream()
+        # Reached only after a passing build. Same check as the CLI stage, logged to the run.
+        warning = open_event_drop_warning(settings)
+        if warning is not None:
+            context.log.warning(
+                "open events dropped %.2f%% (%s to %s), inside the warn band",
+                warning["open_events_drop_pct"],
+                warning["open_events_previous"],
+                warning["open_events_latest"],
+            )
 
     @asset(
         key=PUBLISHED_KEY,
@@ -201,7 +229,18 @@ def build_definitions(
         | AssetSelection.assets(PUBLISHED_KEY),
         executor_def=in_process_executor,
     )
-    validate = define_asset_job("validate", selection=dbt_only, executor_def=in_process_executor)
+
+    @op(name="dbt_test")
+    def dbt_test_op() -> None:
+        # ``dbt test`` only: validating must not append a catalogue_snapshots row.
+        result = dbt_stage(settings, ["test"])
+        if result.returncode != 0:
+            raise Failure(f"dbt test failed:\n{result.stdout[-2000:]}")
+
+    @job(name="validate", executor_def=in_process_executor)
+    def validate() -> None:
+        dbt_test_op()
+
     publish = define_asset_job(
         "publish", selection=AssetSelection.assets(PUBLISHED_KEY), executor_def=in_process_executor
     )

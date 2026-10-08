@@ -12,25 +12,7 @@ with sem as (
     select * from {{ ref('int_event_semantic') }}
 ),
 
-{% if is_incremental() %}
-scope as (
-    select distinct venue, event_id
-    from sem
-    where batch_loaded_at >= (
-        select coalesce(max(built_through), timestamp '1970-01-01 00:00:00+00') from {{ this }}
-    )
-),
-
-scoped as (
-    select s.*
-    from sem s
-    join scope using (venue, event_id)
-),
-{% else %}
-scoped as (
-    select * from sem
-),
-{% endif %}
+{{ scoped_rows('sem', 'venue, event_id') }}
 
 starts as (
     select
@@ -74,9 +56,7 @@ versions as (
     group by venue, event_id, version_no
 ),
 
-watermark as (
-    select max(batch_loaded_at) as built_through from sem
-)
+{{ batch_watermark('sem') }}
 
 select
     v.venue,

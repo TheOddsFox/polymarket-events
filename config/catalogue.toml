@@ -34,13 +34,18 @@ duckdb_memory_limit = "2GB"
 duckdb_threads = 2
 
 [quality]
-# Maximum share of observations that may be quarantined before a batch fails.
+# Maximum share of a batch's records that may be quarantined. Above it the batch is not
+# registered, so dbt never reads it, and refresh/replay stop before the build. A share exactly at
+# the limit passes.
 quarantine_max_ratio = 0.01
-# Maximum share of unresolved event references tolerated.
+# Maximum share of market event references that may not resolve to a captured event.
+# Above it `dbt build` fails, so nothing is published. Passed to dbt as a variable.
 unresolved_reference_max_ratio = 0.01
-# Open-event drop versus the previous release, in percent.
-open_events_drop_warn_pct = 10.0
-open_events_drop_error_pct = 30.0
+# Open-event drop versus the previous build, in percent. Drops from warn up to error are
+# logged (the CLI stage row also records them); the build still passes. Above error, `dbt build`
+# fails and nothing is published. error is passed to dbt as max_open_events_drop_pct.
+open_events_drop_warn_pct = 5.0
+open_events_drop_error_pct = 10.0
 
 [publish]
 # Number of immutable releases kept on disk besides current and previous.

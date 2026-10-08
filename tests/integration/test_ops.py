@@ -3,21 +3,24 @@ and launchd templates."""
 
 from __future__ import annotations
 
+import json
 import plistlib
 from datetime import timedelta
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from fakes.built_warehouse import build_warehouse, capture_and_load
 from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
-from fakes.harness import FIXED_NOW, build_runtime
+from fakes.harness import FIXED_NOW, build_runtime, make_settings
 from fakes.world import demo_world
 from oddsfox_catalogue.backup import MANIFEST, create_backup, verify_backup
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import rebuild_from_raw, run_capture
-from oddsfox_catalogue.pipeline import dbt_stage, load_stage
+from oddsfox_catalogue.gamma.http import MalformedResponse
+from oddsfox_catalogue.pipeline import capture_stage, dbt_stage, load_stage
 from oddsfox_catalogue.rebuild import (
     VERIFIED_TABLES,
     rebuild_and_verify,
@@ -124,6 +127,119 @@ def test_stages_record_their_outcome_in_stage_runs(tmp_path: Path) -> None:
     failed_rows = [r for r in runs if r["stage"].startswith("dbt:") and r["status"] == "failed"]
     assert failed_rows, "a failing dbt command must be recorded as failed"
     assert failed_rows[0]["error"] is not None
+
+
+def _capture_rows(settings) -> list[dict]:
+    ledger = Ledger(settings.ledger_path)
+    try:
+        return [r for r in ledger.stage_runs() if r["stage"].startswith("capture:")]
+    finally:
+        ledger.close()
+
+
+def test_capture_stage_writes_exactly_one_row_on_success(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    summary = capture_stage(
+        settings,
+        "bootstrap",
+        transport=FakeGamma(demo_world()).transport(),
+        now=lambda: FIXED_NOW,
+    )
+    assert summary.status == "captured"
+
+    rows = _capture_rows(settings)
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["stage"] == "capture:bootstrap"
+    assert row["status"] == "succeeded"
+    assert row["batch_id"] == summary.batch_id
+    assert row["error"] is None
+    counts = json.loads(row["counts_json"])
+    assert counts["http"]["requests"] > 0
+    assert counts["records"] == summary.records
+
+
+def test_capture_stage_writes_one_failed_row_when_capture_raises(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    fake = FakeGamma(demo_world())
+    # A 400 is not retryable: the first list scan fails the batch immediately.
+    fake.fail_status("/events/keyset", 400)
+    with pytest.raises(MalformedResponse):
+        capture_stage(settings, "bootstrap", transport=fake.transport(), now=lambda: FIXED_NOW)
+
+    rows = _capture_rows(settings)
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["stage"] == "capture:bootstrap"
+    assert row["status"] == "failed"
+    assert row["batch_id"] is not None
+    assert "MalformedResponse" in row["error"]
+
+
+def _close_event_202_and_load(settings) -> None:
+    """Close one of the demo world's two open events and load the resulting daily batch."""
+    closed_world = demo_world()
+    closed_world.events["202"]["closed"] = True
+    closed_world.events["202"]["updatedAt"] = "2026-10-08T07:00:00Z"
+    runtime, _ = build_runtime(
+        settings.root,
+        FakeGamma(closed_world),
+        now=FIXED_NOW + timedelta(days=1),
+        open_event_ids=lambda: read_open_event_ids(settings.warehouse_path),
+    )
+    try:
+        assert run_capture(runtime, "daily").status == "captured"
+    finally:
+        runtime.ledger.close()
+    load_stage(settings)
+
+
+def test_open_event_drop_in_warn_band_builds_and_is_recorded(tmp_path: Path) -> None:
+    """A 50% drop sits between warn (40%) and error (60%): the build passes and says so."""
+    settings = capture_and_load(tmp_path)
+    assert dbt_stage(settings, ["build"]).returncode == 0  # first snapshot, nothing to compare
+
+    tolerant = make_settings(
+        tmp_path,
+        {
+            "CATALOGUE_QUALITY_OPEN_EVENTS_DROP_WARN_PCT": "40",
+            "CATALOGUE_QUALITY_OPEN_EVENTS_DROP_ERROR_PCT": "60",
+        },
+    )
+    _close_event_202_and_load(tolerant)
+    built = dbt_stage(tolerant, ["build"])
+    assert built.returncode == 0, built.stdout[-3000:]
+
+    row = [r for r in _stage_rows(tolerant) if r["stage"] == "dbt:build"][-1]
+    assert row["status"] == "succeeded"
+    counts = json.loads(row["counts_json"])
+    assert counts["open_events_drop_warn"] is True
+    assert counts["open_events_previous"] == 2
+    assert counts["open_events_latest"] == 1
+    assert counts["open_events_drop_pct"] == 50.0
+
+
+def test_open_event_drop_above_error_fails_the_stage(tmp_path: Path) -> None:
+    """With the default 10% error cap, the same 50% drop fails the build and is recorded."""
+    settings = capture_and_load(tmp_path)
+    assert dbt_stage(settings, ["build"]).returncode == 0
+    _close_event_202_and_load(settings)
+
+    failed = dbt_stage(settings, ["build"])
+    assert failed.returncode != 0
+    assert "assert_open_events_not_dropping" in failed.stdout
+
+    row = [r for r in _stage_rows(settings) if r["stage"] == "dbt:build"][-1]
+    assert row["status"] == "failed"
+    assert "open_events_drop_warn" not in json.loads(row["counts_json"])
+
+
+def _stage_rows(settings) -> list[dict]:
+    ledger = Ledger(settings.ledger_path)
+    try:
+        return list(ledger.stage_runs())
+    finally:
+        ledger.close()
 
 
 def test_launchd_templates_are_valid_plists() -> None:

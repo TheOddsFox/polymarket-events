@@ -30,7 +30,7 @@ make lint
 | `make refresh` | Daily incremental run: open events plus recently changed events. |
 | `make reconcile` | Weekly full pass: archived events and by-ID checks for open events. |
 | `make replay` | Load pending raw pages, build, publish. No Gamma calls. |
-| `make validate` | Run dbt tests against the warehouse. |
+| `make validate` | Run dbt tests against the warehouse. Never builds, so it appends no `catalogue_snapshots` row. |
 | `make publish` | Write a release if the last dbt build passed. |
 | `make current` | Show the current published release pointer. |
 | `make status` | List capture batches and their states. |
@@ -45,15 +45,52 @@ Lower-level commands: `uv run catalogue --help`.
 
 ## Scheduling
 
-Dagster defines the schedules, sensors, and jobs (`make dagster-home` installs
-`ops/dagster.yaml`, which allows one run at a time through `QueuedRunCoordinator`).
+Run exactly one scheduler. Two are available, and they must not both be enabled:
+
+- **Dagster daemon** (`make dagster-home`, then run `dagster-daemon` with `ops/workspace.yaml`).
+  Schedules `daily_refresh_schedule` (`daily_cron`) and `weekly_reconcile_schedule`
+  (`weekly_cron`). `ops/dagster.yaml` allows one run at a time through `QueuedRunCoordinator`.
+- **launchd agents** (`ops/launchd/`). The daily agent runs `make refresh` Monday to Saturday and
+  the weekly agent runs `make reconcile` on Sunday.
+
+Both schedulers fire capture on the same days at different times. Enabling both doubles Gamma
+traffic and writes a second batch of raw pages for every run. The run lock stops two writers
+from racing, but it does not deduplicate work.
+
+**Timezones.** Dagster schedules are cron strings in `config/catalogue.toml` (`[schedule]`) and
+run in UTC (`execution_timezone="UTC"`), so `0 6 * * 1-6` means 06:00 UTC. The launchd templates
+use the Mac's local time (`StartCalendarInterval` has no timezone), so 06:00 local. Changing
+`[schedule]` does not change the launchd templates; edit both if you switch schedulers.
+
 Jobs: `bootstrap`, `daily_refresh`, `weekly_reconcile`, `replay`, `validate`, `publish`.
+`validate` runs `dbt test` only. `replay` and the refresh jobs run `dbt build`.
 Sensors: `alert_on_run_failure` and `missed_run_alert` (writes `.state/alerts.log` when no
 capture has run for 30 hours).
 
-On macOS, `ops/launchd/` has templates for the daily and weekly runs and for the Dagster
-daemon. Replace each `__PROJECT_ROOT__`, copy the files to `~/Library/LaunchAgents/`, and load
-them with `launchctl bootstrap gui/$(id -u) <file>`.
+On macOS, `ops/launchd/` has templates. Install either the daily and reconcile agents (launchd
+scheduler) or the Dagster daemon agent (Dagster scheduler), never both. Replace each
+`__PROJECT_ROOT__`, copy the files to `~/Library/LaunchAgents/`, and load them with
+`launchctl bootstrap gui/$(id -u) <file>`.
+
+## Quality limits
+
+Each limit is a `[quality]` setting in `config/catalogue.toml`, overridable with
+`CATALOGUE_QUALITY_<KEY>`. Values are validated when settings load: ratios must lie in [0, 1],
+percentages in [0, 100], and the warn limit may not exceed the error limit.
+
+| Check | Setting | Default | Above the limit |
+| --- | --- | --- | --- |
+| Quarantined records per batch | `quarantine_max_ratio` | 1% | The batch is not registered and the load exits 3. `refresh` and `replay` then stop before `dbt build`, so nothing publishes until the batch is resolved. Batches registered in the same load are not built either. |
+| Unresolved event references in market refs | `unresolved_reference_max_ratio` | 1% | `dbt build` fails, so nothing is published. |
+| Open-event drop vs the previous build, warn | `open_events_drop_warn_pct` | 5% | Logged. The CLI stage row records `open_events_drop_warn`; the Dagster run logs the warning only. The build passes. |
+| Open-event drop vs the previous build, error | `open_events_drop_error_pct` | 10% | `dbt build` fails, so nothing is published. |
+
+**Recovering a blocked batch.** A quarantine above the cap is a data problem first. Inspect
+`quarantine` in the ledger, and raise `quarantine_max_ratio` only if the records are expected.
+Then run `make replay`: it registers the blocked batch and builds from it, with no Gamma calls.
+
+The open-event limits are passed to dbt as `max_open_events_drop_pct` and
+`max_unresolved_reference_ratio`, so `dbt build` and the Dagster build enforce the same numbers.
 
 ## Recovery
 

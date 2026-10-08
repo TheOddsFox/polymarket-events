@@ -11,25 +11,7 @@ with obs as (
     select * from {{ ref('stg_gamma__market_observations') }}
 ),
 
-{% if is_incremental() %}
-scope as (
-    select distinct venue, market_id
-    from obs
-    where batch_loaded_at >= (
-        select coalesce(max(built_through), timestamp '1970-01-01 00:00:00+00') from {{ this }}
-    )
-),
-
-scoped as (
-    select o.*
-    from obs o
-    join scope s using (venue, market_id)
-),
-{% else %}
-scoped as (
-    select * from obs
-),
-{% endif %}
+{{ scoped_rows('obs', 'venue, market_id') }}
 
 ranked as (
     select
@@ -43,9 +25,7 @@ ranked as (
     from scoped
 ),
 
-watermark as (
-    select max(batch_loaded_at) as built_through from obs
-)
+{{ batch_watermark('obs') }}
 
 select
     r.venue,

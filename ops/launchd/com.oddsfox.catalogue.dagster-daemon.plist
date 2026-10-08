@@ -3,6 +3,8 @@
 <!--
   Dagster daemon: runs schedules, sensors (failure and missed-run alerts), and the queued run
   coordinator. KeepAlive restarts it after a crash. Requires `make dagster-home` to have run.
+  Use this agent only when Dagster is the scheduler; do not load the daily or reconcile agents
+  alongside it (see README, Scheduling).
 -->
 <plist version="1.0">
 <dict>

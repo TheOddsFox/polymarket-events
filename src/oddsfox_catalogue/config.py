@@ -50,8 +50,8 @@ class LoadSettings:
 class QualitySettings:
     quarantine_max_ratio: float = 0.01
     unresolved_reference_max_ratio: float = 0.01
-    open_events_drop_warn_pct: float = 10.0
-    open_events_drop_error_pct: float = 30.0
+    open_events_drop_warn_pct: float = 5.0
+    open_events_drop_error_pct: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -190,7 +190,26 @@ def load_settings(
         name: _build_section(cls, raw.get(name, {}), name, environ)
         for name, cls in known_sections.items()
     }
-    return Settings(root=project_root, **built)
+    settings = Settings(root=project_root, **built)
+    _validate(settings)
+    return settings
+
+
+def _validate(settings: Settings) -> None:
+    """Reject quality limits that would silently disable a gate or make no sense."""
+    quality = settings.quality
+    for name in ("quarantine_max_ratio", "unresolved_reference_max_ratio"):
+        value = getattr(quality, name)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"[quality] {name} must be between 0 and 1, got {value}")
+    for name in ("open_events_drop_warn_pct", "open_events_drop_error_pct"):
+        value = getattr(quality, name)
+        if not 0.0 <= value <= 100.0:
+            raise ValueError(f"[quality] {name} must be between 0 and 100, got {value}")
+    if quality.open_events_drop_warn_pct > quality.open_events_drop_error_pct:
+        raise ValueError(
+            "[quality] open_events_drop_warn_pct must not exceed open_events_drop_error_pct"
+        )
 
 
 def settings_as_dict(settings: Settings) -> dict[str, Any]:

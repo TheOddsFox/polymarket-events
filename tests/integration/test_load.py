@@ -19,7 +19,7 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
-from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
+from oddsfox_catalogue.load.runner import LoadBlocked, LoadRuntime, load_pending
 from oddsfox_catalogue.load.source import event_resource, make_pipeline
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
@@ -211,7 +211,9 @@ def test_quarantined_records_load_without_blocking_the_page(tmp_path: Path) -> N
         batch_id = run_capture(runtime, "bootstrap").batch_id
     finally:
         runtime.ledger.close()
-    settings = make_settings(tmp_path)
+    # One malformed record in a small world is above the 1% default; this test is about
+    # the record not blocking the page, so it raises the cap to let the batch through.
+    settings = make_settings(tmp_path, {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "0.5"})
 
     summary = _load(settings)
 
@@ -228,6 +230,32 @@ def test_quarantined_records_load_without_blocking_the_page(tmp_path: Path) -> N
         )
         >= 1
     ), "the event still loads; only its malformed nested market is quarantined"
+
+
+def test_batch_over_quarantine_cap_is_blocked_and_not_registered(tmp_path: Path) -> None:
+    world = demo_world()
+    world.add_event(
+        make_event(
+            "555",
+            "Event with a malformed nested market",
+            markets=[make_market("8555", "Malformed?")],
+        )
+    )
+    fake = FakeGamma(world)
+    fake.nested_overrides["8555"] = "not-an-object"
+    runtime, _ = build_runtime(tmp_path, fake)
+    try:
+        batch_id = run_capture(runtime, "bootstrap").batch_id
+    finally:
+        runtime.ledger.close()
+    # A cap of zero blocks any quarantined record.
+    settings = make_settings(tmp_path, {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "0"})
+
+    with pytest.raises(LoadBlocked, match="quarantine_max_ratio"):
+        _load(settings)
+
+    assert _batch_status(settings, batch_id) == "captured", "a blocked batch stays unloaded"
+    assert _registry_rows(settings) == [], "a blocked batch is never registered"
 
 
 def test_insert_only_merge_keys_on_observation_id_not_payload(tmp_path: Path) -> None:

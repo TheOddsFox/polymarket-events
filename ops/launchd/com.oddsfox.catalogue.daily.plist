@@ -3,6 +3,8 @@
 <!--
   Daily incremental refresh (Mon to Sat, 06:00 local). Copy to ~/Library/LaunchAgents/, replace
   every __PLACEHOLDER__, then: launchctl bootstrap gui/$(id -u) <file>
+  Use this agent only when launchd is the scheduler. Do not load it while the Dagster daemon
+  is running its schedules: both would capture the same days (see README, Scheduling).
   Logs go to the project's .state/logs directory.
 -->
 <plist version="1.0">

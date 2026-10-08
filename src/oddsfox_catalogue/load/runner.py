@@ -186,13 +186,37 @@ def _chunks(items: list[dict[str, Any]], size: int) -> Iterator[list[dict[str, A
         yield items[start : start + size]
 
 
+def quarantine_over_limit(
+    event_rows: int, market_rows: int, quarantine_rows: int, max_ratio: float
+) -> bool:
+    """True when quarantined records are a larger share than ``max_ratio`` of the batch.
+
+    The share is quarantined over every record the batch produced (loaded or quarantined).
+    A share exactly at the limit passes. A batch with no records passes.
+    """
+    observed = event_rows + market_rows + quarantine_rows
+    if observed <= 0:
+        return False
+    return quarantine_rows / observed > max_ratio
+
+
 def _register_complete_batches(rt: LoadRuntime, summary: LoadSummary, batch_id: str | None) -> None:
+    blocked: list[str] = []
     for batch in rt.ledger.list_batches("captured"):
         if batch_id is not None and batch["batch_id"] != batch_id:
             continue
         if rt.ledger.pending_load_pages(batch["batch_id"]):
             continue
         totals = rt.ledger.batch_load_totals(batch["batch_id"])
+        if quarantine_over_limit(
+            int(totals["event_rows"]),
+            int(totals["market_rows"]),
+            int(totals["quarantine_rows"]),
+            rt.settings.quality.quarantine_max_ratio,
+        ):
+            # Left unregistered, so dbt never reads it. Other batches still register.
+            blocked.append(batch["batch_id"])
+            continue
         row = {
             "batch_id": batch["batch_id"],
             "mode": batch["mode"],
@@ -211,10 +235,21 @@ def _register_complete_batches(rt: LoadRuntime, summary: LoadSummary, batch_id: 
             summary.load_ids.append(str(info.loads_ids[-1]))
         rt.ledger.set_batch_status(batch["batch_id"], "loaded", row["loaded_at"])
         summary.batches_registered.append(batch["batch_id"])
+    if blocked:
+        raise LoadBlocked(
+            f"quarantine share above [quality] quarantine_max_ratio "
+            f"({rt.settings.quality.quarantine_max_ratio}) for batch(es) {', '.join(blocked)}; "
+            "left unregistered. Inspect bronze.quarantined_records, then raise the limit "
+            "and run make replay to register them."
+        )
 
 
 def load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
-    """Load every fetched-but-unloaded page (optionally for one batch), then register batches."""
+    """Load every fetched-but-unloaded page (optionally for one batch), then register batches.
+
+    Raises ``LoadBlocked`` after registering every batch that passes the quarantine gate, if
+    any batch fails it.
+    """
     summary = LoadSummary()
     pending = rt.ledger.pending_load_pages(batch_id)
     for chunk in _chunks(pending, rt.settings.load.max_pages_per_run):

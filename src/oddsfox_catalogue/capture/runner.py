@@ -563,51 +563,96 @@ def _abandon(
 # ---------------------------------------------------------------------------
 
 
-def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
-    """Start, or resume, a capture batch for ``mode`` until it is captured or a scan fails."""
-    resumable = rt.ledger.find_resumable_batch(mode)
-    resumed = resumable is not None
-    batch = resumable if resumable is not None else _start_batch(rt, mode)
-    batch_id = batch["batch_id"]
-    summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=resumed)
-    started = iso_utc(rt.now())
-
-    try:
-        while True:
-            progressed = _advance_plan(rt, batch_id)
-            batch = rt.ledger.get_batch(batch_id)
-            assert batch is not None
-            runnable = [
-                s for s in rt.ledger.list_scans(batch_id) if s["status"] in {"running", "failed"}
-            ]
-            if runnable:
-                runnable.sort(key=lambda s: (s["plan_order"], s["attempt"]))
-                _run_scan(rt, batch, runnable[0], summary)
-                continue
-            if not progressed:
-                break
-    except Exception as exc:
-        rt.ledger.set_batch_status(
-            batch_id, "capturing", iso_utc(rt.now()), f"{type(exc).__name__}: {exc}"[:500]
+def _record_capture_stage(
+    rt: CaptureRuntime,
+    *,
+    mode: str,
+    batch_id: str | None,
+    started: str,
+    summary: CaptureSummary | None,
+    error: str | None,
+) -> None:
+    """Write the single ``stage_runs`` row for one capture attempt, success or failure."""
+    captured = summary is not None and summary.status == "captured" and error is None
+    counts: dict[str, Any] = {"mode": mode, "http": rt.client.stats.as_dict()}
+    if summary is not None:
+        counts.update(
+            {
+                "pages_written": summary.pages_written,
+                "pages_adopted": summary.pages_adopted,
+                "records": summary.records,
+                "scans": len(summary.scans),
+                "batch_status": summary.status,
+            }
         )
-        raise
-
-    summary.status = _finalise_if_complete(rt, batch_id)
     rt.ledger.record_stage_run(
         run_id=uuid.uuid4().hex,
         batch_id=batch_id,
-        stage="capture",
+        stage=f"capture:{mode}",
         started_at=started,
         finished_at=iso_utc(rt.now()),
-        status=summary.status,
-        counts={
-            "pages_written": summary.pages_written,
-            "pages_adopted": summary.pages_adopted,
-            "records": summary.records,
-            "scans": len(summary.scans),
-            "http": rt.client.stats.as_dict(),
-        },
+        status="succeeded" if captured else "failed",
+        counts=counts,
         git_sha=rt.git_sha,
+        error=error,
+    )
+
+
+def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
+    """Start, or resume, a capture batch for ``mode`` until it is captured or a scan fails.
+
+    Writes exactly one ``stage_runs`` row (stage ``capture:<mode>``) whether the batch
+    captures, ends short of captured, or raises.
+    """
+    started = iso_utc(rt.now())
+    batch_id: str | None = None
+    summary: CaptureSummary | None = None
+    try:
+        resumable = rt.ledger.find_resumable_batch(mode)
+        resumed = resumable is not None
+        batch = resumable if resumable is not None else _start_batch(rt, mode)
+        batch_id = batch["batch_id"]
+        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=resumed)
+
+        try:
+            while True:
+                progressed = _advance_plan(rt, batch_id)
+                batch = rt.ledger.get_batch(batch_id)
+                assert batch is not None
+                runnable = [
+                    s
+                    for s in rt.ledger.list_scans(batch_id)
+                    if s["status"] in {"running", "failed"}
+                ]
+                if runnable:
+                    runnable.sort(key=lambda s: (s["plan_order"], s["attempt"]))
+                    _run_scan(rt, batch, runnable[0], summary)
+                    continue
+                if not progressed:
+                    break
+        except Exception as exc:
+            rt.ledger.set_batch_status(
+                batch_id, "capturing", iso_utc(rt.now()), f"{type(exc).__name__}: {exc}"[:500]
+            )
+            raise
+
+        summary.status = _finalise_if_complete(rt, batch_id)
+    except BaseException as exc:
+        _record_capture_stage(
+            rt,
+            mode=mode,
+            batch_id=batch_id,
+            started=started,
+            summary=summary,
+            error=f"{type(exc).__name__}: {exc}"[:2000],
+        )
+        raise
+
+    error = None
+    if summary.status != "captured":
+        error = f"capture ended with status {summary.status}"
+    _record_capture_stage(
+        rt, mode=mode, batch_id=batch_id, started=started, summary=summary, error=error
     )
     return summary
 

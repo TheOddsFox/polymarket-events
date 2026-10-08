@@ -15,5 +15,9 @@ select
     liquidity
 from {{ ref('stg_gamma__market_observations') }}
 {% if is_incremental() %}
-where observation_id not in (select observation_id from {{ this }})
+-- Only batches loaded since the last build. The ">=" re-reads rows at the watermark itself;
+-- delete+insert on observation_id makes that re-read idempotent.
+where batch_loaded_at >= (
+    select coalesce(max(batch_loaded_at), timestamp '1970-01-01 00:00:00+00') from {{ this }}
+)
 {% endif %}

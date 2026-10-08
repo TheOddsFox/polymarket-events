@@ -9,6 +9,7 @@ error, so operators can see what ran and how long it took without reading logs.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import uuid
 from collections.abc import Callable, Iterator
@@ -22,13 +23,15 @@ import httpx
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import CaptureRuntime, CaptureSummary, run_capture
 from oddsfox_catalogue.config import Settings
-from oddsfox_catalogue.dbt_runner import run_dbt
+from oddsfox_catalogue.dbt_runner import run_dbt, with_quality_vars
 from oddsfox_catalogue.gamma.http import GammaClient
 from oddsfox_catalogue.ids import MODES, iso_utc, utc_now
 from oddsfox_catalogue.load.runner import LoadRuntime, LoadSummary, load_pending
 from oddsfox_catalogue.publish import ReleaseInfo, publish_release
 from oddsfox_catalogue.runlock import current_git_sha, run_lock
-from oddsfox_catalogue.warehouse import read_open_event_ids
+from oddsfox_catalogue.warehouse import last_two_open_event_counts, read_open_event_ids
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "MODES",
@@ -100,18 +103,8 @@ def capture_stage(
                 open_event_ids=lambda: read_open_event_ids(settings.warehouse_path),
                 git_sha=current_git_sha(settings.root),
             )
-            with _recorded(settings, f"capture:{mode}") as run:
-                summary = run_capture(runtime, mode)
-                run.counts = {
-                    "pages_written": summary.pages_written,
-                    "pages_adopted": summary.pages_adopted,
-                    "records": summary.records,
-                    "status": summary.status,
-                }
-                run.status = "succeeded" if summary.status == "captured" else "failed"
-                if summary.status != "captured":
-                    run.error = f"capture ended with status {summary.status}"
-                return summary
+            # run_capture writes the single capture:<mode> stage_runs row itself.
+            return run_capture(runtime, mode)
         finally:
             ledger.close()
             client.close()
@@ -138,13 +131,49 @@ def load_stage(
         return summary
 
 
+def open_event_drop_warning(settings: Settings) -> dict[str, Any] | None:
+    """A warning when the latest open-event drop is in the warn band, else None.
+
+    The warn band is ``open_events_drop_warn_pct <= drop <= open_events_drop_error_pct``.
+    At the error limit the build still passes (the dbt test fails only above it), so the
+    band includes it. A drop above the error limit never reaches this check, because the
+    build has already failed.
+    """
+    counts = last_two_open_event_counts(settings.warehouse_path)
+    if counts is None:
+        return None
+    previous, latest = counts
+    if previous <= 0 or latest >= previous:
+        return None
+    drop_pct = (previous - latest) / previous * 100.0
+    quality = settings.quality
+    if not quality.open_events_drop_warn_pct <= drop_pct <= quality.open_events_drop_error_pct:
+        return None
+    return {
+        "open_events_drop_warn": True,
+        "open_events_previous": previous,
+        "open_events_latest": latest,
+        "open_events_drop_pct": round(drop_pct, 2),
+    }
+
+
 def dbt_stage(settings: Settings, args: list[str]) -> subprocess.CompletedProcess[str]:
     with run_lock(settings.run_lock_path), _recorded(settings, f"dbt:{' '.join(args)}") as run:
-        result = run_dbt(settings, args)
+        result = run_dbt(settings, with_quality_vars(settings, args))
         run.counts = {"returncode": result.returncode}
         if result.returncode != 0:
             run.status = "failed"
             run.error = result.stdout[-2000:]
+        elif args and args[0] in {"build", "run", "test"}:
+            warning = open_event_drop_warning(settings)
+            if warning is not None:
+                run.counts.update(warning)
+                logger.warning(
+                    "open events dropped %.2f%% (%s to %s), inside the warn band",
+                    warning["open_events_drop_pct"],
+                    warning["open_events_previous"],
+                    warning["open_events_latest"],
+                )
         return result
 
 

@@ -28,6 +28,7 @@ from oddsfox_catalogue.capture.runner import (
 from oddsfox_catalogue.config import Settings, load_settings, settings_as_dict
 from oddsfox_catalogue.gamma.http import GammaClient
 from oddsfox_catalogue.ids import MODES
+from oddsfox_catalogue.load.runner import LoadBlocked
 from oddsfox_catalogue.pipeline import dbt_stage, load_stage, publish_stage, refresh
 from oddsfox_catalogue.publish import PublishBlocked, current_release
 from oddsfox_catalogue.rebuild import rebuild_and_verify
@@ -323,7 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     handler: Handler = args.handler
     try:
         return handler(args)
-    except (RunBusy, PublishBlocked, BaselineMissing) as exc:
+    except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
 

@@ -7,6 +7,7 @@ never race a load.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -65,6 +66,39 @@ def run_dbt_at(
     return subprocess.run(
         command, env=env, capture_output=True, text=True, check=False, cwd=work_dir
     )
+
+
+def quality_dbt_vars(settings: Settings) -> dict[str, float]:
+    """dbt variables that carry the configured quality limits into the project's tests.
+
+    The same numbers reach ``dbt build`` from the stage runner and from the Dagster asset,
+    so an operator edit in ``config/catalogue.toml`` changes the gate that actually runs.
+    """
+    quality = settings.quality
+    return {
+        "max_open_events_drop_pct": quality.open_events_drop_error_pct / 100.0,
+        "max_unresolved_reference_ratio": quality.unresolved_reference_max_ratio,
+    }
+
+
+def with_quality_vars(settings: Settings, args: Sequence[str]) -> list[str]:
+    """Return ``args`` with the configured quality vars merged into ``--vars``.
+
+    A ``--vars`` the caller passed (JSON object) wins for the keys it sets. Keys it does not
+    set take the configured value.
+    """
+    defaults = quality_dbt_vars(settings)
+    out = list(args)
+    if "--vars" not in out:
+        return [*out, "--vars", json.dumps(defaults, sort_keys=True)]
+    index = out.index("--vars")
+    if index + 1 >= len(out):
+        raise ValueError("--vars requires a JSON object value")
+    caller = json.loads(out[index + 1])
+    if not isinstance(caller, dict):
+        raise ValueError("--vars must be a JSON object")
+    out[index + 1] = json.dumps({**defaults, **caller}, sort_keys=True)
+    return out
 
 
 def run_dbt(settings: Settings, args: Sequence[str]) -> subprocess.CompletedProcess[str]:

@@ -14,8 +14,8 @@ from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
 
 
-def capture_and_load(root: Path) -> Settings:
-    runtime, _ = build_runtime(root, FakeGamma(demo_world()))
+def capture_and_load(root: Path, world=None) -> Settings:
+    runtime, _ = build_runtime(root, FakeGamma(world or demo_world()))
     try:
         run_capture(runtime, "bootstrap")
     finally:

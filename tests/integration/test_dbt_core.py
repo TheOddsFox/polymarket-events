@@ -12,7 +12,7 @@ from fakes.built_warehouse import capture_and_load
 from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
 from fakes.harness import FIXED_NOW, build_runtime
-from fakes.world import demo_world
+from fakes.world import demo_world, make_market
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.config import Settings
@@ -86,18 +86,26 @@ def _snapshot(warehouse: Path, table: str, key: str) -> list[tuple]:
         con.close()
 
 
-def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) -> None:
-    settings = capture_and_load(tmp_path)
-    assert run_dbt(["build"], settings.warehouse_path, tmp_path).returncode == 0
+STATE_TABLES = {
+    "core.events_current": "venue, event_id",
+    "core.markets_current": "venue, market_id",
+    "history.event_history": "venue, event_id, version_no",
+    "history.market_history": "venue, market_id, version_no",
+    "history.event_metrics": "observation_id",
+    "history.market_metrics": "observation_id",
+}
+INCREMENTAL_MODELS = (
+    "events_current markets_current event_history market_history event_metrics market_metrics"
+)
+DROP_THRESHOLD = '{"max_open_events_drop_pct": 0.9}'
 
-    # Event 202 closes between batches. Daily capture must fetch it by ID and reflect it.
-    closed_world = demo_world()
-    closed_world.events["202"]["closed"] = True
-    closed_world.events["202"]["updatedAt"] = "2026-10-08T07:00:00Z"
+
+def _daily_batch(settings: Settings, root: Path, world, days: int) -> None:
+    """Capture one daily batch of ``world`` taken ``days`` after bootstrap, then load it."""
     runtime, _ = build_runtime(
-        tmp_path,
-        FakeGamma(closed_world),
-        now=FIXED_NOW + timedelta(days=1),
+        root,
+        FakeGamma(world),
+        now=FIXED_NOW + timedelta(days=days),
         open_event_ids=lambda: read_open_event_ids(settings.warehouse_path),
     )
     try:
@@ -106,36 +114,26 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) 
         runtime.ledger.close()
     _load(settings)
 
+
+def _state(settings: Settings) -> dict[str, list[tuple]]:
+    return {t: _snapshot(settings.warehouse_path, t, k) for t, k in STATE_TABLES.items()}
+
+
+def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) -> None:
+    settings = capture_and_load(tmp_path)
+    assert run_dbt(["build"], settings.warehouse_path, tmp_path).returncode == 0
+
+    # Event 202 closes between batches. Daily capture must fetch it by ID and reflect it.
+    closed_world = demo_world()
+    closed_world.events["202"]["closed"] = True
+    closed_world.events["202"]["updatedAt"] = "2026-10-08T07:00:00Z"
+    _daily_batch(settings, tmp_path, closed_world, days=1)
+
     # The demo world has two open events, so closing one is a 50% drop by design. The
     # regression threshold is loosened for this test only; the blocking test below keeps it.
-    incremental = run_dbt(
-        ["build", "--vars", '{"max_open_events_drop_pct": 0.9}'],
-        settings.warehouse_path,
-        tmp_path,
-    )
+    incremental = run_dbt(["build", "--vars", DROP_THRESHOLD], settings.warehouse_path, tmp_path)
     assert incremental.returncode == 0, incremental.stdout[-3000:]
-    tables = {
-        "core.events_current": "venue, event_id",
-        "core.markets_current": "venue, market_id",
-        "history.event_history": "venue, event_id, version_no",
-        "history.market_history": "venue, market_id, version_no",
-    }
-    after_incremental = {t: _snapshot(settings.warehouse_path, t, k) for t, k in tables.items()}
 
-    full = run_dbt(
-        [
-            "run",
-            "--select",
-            "events_current markets_current event_history market_history",
-            "--full-refresh",
-        ],
-        settings.warehouse_path,
-        tmp_path,
-    )
-    assert full.returncode == 0, full.stdout[-3000:]
-    after_full = {t: _snapshot(settings.warehouse_path, t, k) for t, k in tables.items()}
-
-    assert after_incremental == after_full, "incremental state must equal a full rebuild"
     closed = _scalar(
         settings.warehouse_path,
         "SELECT closed FROM core.events_current WHERE event_id = '202'",
@@ -159,6 +157,29 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) 
         "SELECT COUNT(*) FROM history.event_history WHERE event_id = '101'",
     )
     assert unchanged == [(1,)], "an unchanged event keeps a single version"
+
+    # A second batch on top of the incremental state. The metrics tables must gain its
+    # observations, each exactly once.
+    metric_rows = _scalar(settings.warehouse_path, "SELECT COUNT(*) FROM history.event_metrics")
+    _daily_batch(settings, tmp_path, closed_world, days=2)
+    second = run_dbt(["build", "--vars", DROP_THRESHOLD], settings.warehouse_path, tmp_path)
+    assert second.returncode == 0, second.stdout[-3000:]
+    assert _scalar(settings.warehouse_path, "SELECT COUNT(*) FROM history.event_metrics") > (
+        metric_rows
+    ), "the second batch must add metric rows"
+    for table in ("history.event_metrics", "history.market_metrics"):
+        duplicates = _snapshot_query(
+            settings.warehouse_path,
+            f"SELECT observation_id FROM {table} GROUP BY observation_id HAVING COUNT(*) > 1",
+        )
+        assert duplicates == [], f"{table} repeats an observation: {duplicates[:3]}"
+    after_incremental = _state(settings)
+
+    full = run_dbt(
+        ["run", "--select", INCREMENTAL_MODELS, "--full-refresh"], settings.warehouse_path, tmp_path
+    )
+    assert full.returncode == 0, full.stdout[-3000:]
+    assert after_incremental == _state(settings), "incremental state must equal a full rebuild"
 
 
 def test_count_regression_blocks_the_build(tmp_path: Path) -> None:
@@ -184,3 +205,27 @@ def test_count_regression_blocks_the_build(tmp_path: Path) -> None:
     blocked = run_dbt(["build"], settings.warehouse_path, tmp_path)
     assert blocked.returncode != 0
     assert "assert_open_events_not_dropping" in blocked.stdout
+
+
+def test_unresolved_event_reference_blocks_the_build(tmp_path: Path) -> None:
+    """A market whose nested event stub names an event that was never captured.
+
+    The demo world resolves every reference, so it builds. This world adds one market whose
+    ``events`` stub points at event 999999, which is not in the captured events. That single
+    unresolved reference is far above the 1% cap, so the build must fail.
+    """
+    world = demo_world()
+    ghost = {"id": "999999", "ticker": None, "slug": None, "title": "gone"}
+    world.add_direct_market(make_market("9002", "Ghost market?", event_stub=ghost))
+    settings = capture_and_load(tmp_path, world=world)
+
+    result = run_dbt(["build"], settings.warehouse_path, tmp_path)
+    assert result.returncode != 0
+    assert "assert_unresolved_event_refs_within_limit" in result.stdout
+
+
+def test_demo_world_resolves_every_event_reference(tmp_path: Path) -> None:
+    """Control for the test above: the unmodified demo world builds cleanly."""
+    settings = capture_and_load(tmp_path)
+    result = run_dbt(["build"], settings.warehouse_path, tmp_path)
+    assert result.returncode == 0, result.stdout[-3000:]
