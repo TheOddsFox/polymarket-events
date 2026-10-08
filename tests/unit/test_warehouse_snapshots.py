@@ -32,6 +32,20 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
+def test_skip_warning_is_reported_through_the_supplied_callback(tmp_path: Path) -> None:
+    warehouse = tmp_path / "catalogue.duckdb"
+    warehouse.write_bytes(b"not a duckdb file" * 4096)
+    reported: list[str] = []
+
+    result = last_two_open_event_counts(
+        warehouse, warn=lambda message, *args: reported.append(message % args)
+    )
+
+    assert result is None
+    assert len(reported) == 1
+    assert "cannot open" in reported[0]
+
+
 def test_returns_previous_and_latest_counts(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

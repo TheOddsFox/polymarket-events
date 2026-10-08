@@ -10,6 +10,7 @@ load or dbt build runs.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -21,21 +22,25 @@ class BaselineMissing(RuntimeError):
     """The warehouse has no open-event baseline yet. Run bootstrap first."""
 
 
-def last_two_open_event_counts(warehouse: Path) -> tuple[int, int] | None:
+def last_two_open_event_counts(
+    warehouse: Path, warn: Callable[..., object] | None = None
+) -> tuple[int, int] | None:
     """``(previous, latest)`` open-event counts from ``marts.catalogue_snapshots``.
 
     Returns None when the warehouse, the snapshot table, or two snapshots do not exist yet.
     Any other failure (the file is held by another connection, is not a DuckDB file, or the
-    snapshot table has a different shape) also returns None, but logs a warning first. The
-    warn-band check is advisory; the ``assert_open_events_not_dropping`` test still enforces
-    the error limit inside the dbt build. The ordering matches that test.
+    snapshot table has a different shape) also returns None, after reporting a warning
+    through ``warn`` (default: this module's logger). The warn-band check is advisory; the
+    ``assert_open_events_not_dropping`` test still enforces the error limit inside the dbt
+    build. The ordering matches that test.
     """
     if not warehouse.exists():
         return None
+    report = warn or logger.warning
     try:
         connection = duckdb.connect(str(warehouse), read_only=True)
     except duckdb.Error as exc:
-        logger.warning("open-event drop check skipped: cannot open %s: %s", warehouse, exc)
+        report("open-event drop check skipped: cannot open %s: %s", warehouse, exc)
         return None
     try:
         rows = connection.execute(
@@ -45,7 +50,7 @@ def last_two_open_event_counts(warehouse: Path) -> tuple[int, int] | None:
         # The first build has not created the snapshot table yet.
         return None
     except duckdb.Error as exc:
-        logger.warning("open-event drop check skipped: snapshot query failed: %s", exc)
+        report("open-event drop check skipped: snapshot query failed: %s", exc)
         return None
     finally:
         connection.close()

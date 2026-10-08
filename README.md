@@ -82,7 +82,7 @@ percentages in [0, 100], and the warn limit may not exceed the error limit.
 | --- | --- | --- | --- |
 | Quarantined records per batch | `quarantine_max_ratio` | 1% | The batch is not registered and the load exits 3. `refresh` and `replay` then stop before `dbt build`, so nothing publishes until the batch is resolved. Batches registered in the same load are not built either. |
 | Unresolved event references in market refs | `unresolved_reference_max_ratio` | 1% | `dbt build` fails, so nothing is published. |
-| Open-event drop vs the previous build, warn | `open_events_drop_warn_pct` | 5% | Logged. The CLI stage row records `open_events_drop_warn`; the Dagster run logs the warning only. The build passes. If the snapshot history cannot be read (another connection holds the file, or the file or snapshot table is unreadable), the warning is logged as skipped and the build still runs the error check. |
+| Open-event drop vs the previous build, warn | `open_events_drop_warn_pct` | 5% | Logged. The CLI stage row records `open_events_drop_warn`; the Dagster run logs the warning only. The build passes. If the snapshot history cannot be read (another connection holds the file, or the file or snapshot table is unreadable), the skip is written to the Dagster run log (or to the `oddsfox_catalogue.warehouse` logger outside Dagster), and the build still runs the error check. |
 | Open-event drop vs the previous build, error | `open_events_drop_error_pct` | 10% | `dbt build` fails, so nothing is published. |
 
 **Recovering a blocked batch.** A quarantine above the cap is a data problem first. Inspect

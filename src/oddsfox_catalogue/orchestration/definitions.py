@@ -168,7 +168,7 @@ def build_definitions(
             with_quality_vars(settings, ["build"]), context=context.op_execution_context
         ).stream()
         # Reached only after a passing build. Same check as the CLI stage, logged to the run.
-        warning = open_event_drop_warning(settings)
+        warning = open_event_drop_warning(settings, warn=context.log.warning)
         if warning is not None:
             context.log.warning(
                 "open events dropped %.2f%% (%s to %s), inside the warn band",

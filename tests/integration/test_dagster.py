@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 import duckdb
-from dagster import DagsterInstance
+from dagster import DagsterInstance, job, op
 from dagster._core.run_coordinator import QueuedRunCoordinator
 
 from fakes.built_warehouse import capture_and_load
@@ -15,7 +15,7 @@ from fakes.fake_gamma import FakeGamma
 from fakes.harness import make_settings
 from fakes.world import demo_world
 from oddsfox_catalogue.orchestration.definitions import build_definitions
-from oddsfox_catalogue.pipeline import dbt_stage
+from oddsfox_catalogue.pipeline import dbt_stage, open_event_drop_warning
 from oddsfox_catalogue.publish import current_release
 
 REPO = Path(__file__).resolve().parents[2]
@@ -74,6 +74,29 @@ def test_validate_job_fails_when_dbt_tests_fail(tmp_path: Path) -> None:
     defs = build_definitions(settings, transport=FakeGamma(demo_world()).transport())
     result = defs.resolve_job_def("validate").execute_in_process(raise_on_error=False)
     assert not result.success
+
+
+def test_skipped_snapshot_check_reaches_the_dagster_run_log(tmp_path: Path) -> None:
+    # The warn-band check runs inside the Dagster asset. A skip logged only through the module
+    # logger never reaches the run log, so the operator would see nothing.
+    settings = make_settings(tmp_path)
+    settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.warehouse_path.write_bytes(b"not a duckdb file" * 4096)
+
+    @op
+    def check_snapshots(context) -> None:
+        open_event_drop_warning(settings, warn=context.log.warning)
+
+    @job
+    def snapshot_job() -> None:
+        check_snapshots()
+
+    with DagsterInstance.ephemeral() as instance:
+        result = snapshot_job.execute_in_process(instance=instance, raise_on_error=False)
+        messages = [str(entry.user_message) for entry in instance.all_logs(result.run_id)]
+
+    assert result.success
+    assert any("open-event drop check skipped: cannot open" in m for m in messages)
 
 
 def test_ops_dagster_yaml_selects_a_single_run_queue(tmp_path: Path) -> None:

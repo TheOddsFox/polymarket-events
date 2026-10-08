@@ -131,7 +131,9 @@ def load_stage(
         return summary
 
 
-def open_event_drop_warning(settings: Settings) -> dict[str, Any] | None:
+def open_event_drop_warning(
+    settings: Settings, warn: Callable[..., object] | None = None
+) -> dict[str, Any] | None:
     """A warning when the latest open-event drop is in the warn band, else None.
 
     The warn band is ``open_events_drop_warn_pct <= drop <= open_events_drop_error_pct``.
@@ -139,7 +141,7 @@ def open_event_drop_warning(settings: Settings) -> dict[str, Any] | None:
     band includes it. A drop above the error limit never reaches this check, because the
     build has already failed.
     """
-    counts = last_two_open_event_counts(settings.warehouse_path)
+    counts = last_two_open_event_counts(settings.warehouse_path, warn)
     if counts is None:
         return None
     previous, latest = counts
