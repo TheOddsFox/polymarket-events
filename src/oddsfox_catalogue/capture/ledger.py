@@ -105,10 +105,6 @@ CREATE TABLE IF NOT EXISTS quarantine (
 """
 
 
-class LedgerError(RuntimeError):
-    """Raised when the ledger is asked for something it cannot represent."""
-
-
 class Ledger:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -284,7 +284,3 @@ def demo_world() -> World:
         )
     )
     return world
-
-
-def to_json_bytes(payload: Any) -> bytes:
-    return json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")

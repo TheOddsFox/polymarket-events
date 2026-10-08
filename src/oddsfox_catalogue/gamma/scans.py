@@ -19,7 +19,6 @@ from typing import Any, Literal
 from oddsfox_catalogue.config import GammaSettings
 
 ScanKind = Literal["keyset", "offset", "keyset_ids", "single_ids"]
-MODE_ORDER = ("bootstrap", "reconcile", "daily")
 ID_CHUNK = 100
 
 
@@ -35,10 +34,6 @@ class ScanSpec:
     @property
     def param_dict(self) -> dict[str, Any]:
         return dict(self.params)
-
-    @property
-    def is_follow_up(self) -> bool:
-        return self.kind in {"keyset_ids", "single_ids"}
 
 
 def _event_params(settings: GammaSettings, closed: bool | None) -> dict[str, Any]:

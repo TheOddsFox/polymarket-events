@@ -124,10 +124,6 @@ class Settings:
     def published_dir(self) -> Path:
         return self.data_dir / "published"
 
-    @property
-    def artifacts_dir(self) -> Path:
-        return self.data_dir / "artifacts"
-
 
 def _coerce(value: str, target: Any) -> Any:
     if isinstance(target, bool):
