@@ -231,3 +231,11 @@ dbt/.user.yml
 # Pad generated skills: .agents/skills/pad stays tracked; .claude/ is generated and ignored
 # (same layout as personal/website).
 .claude/
+
+# Universal Pad runtime state and credentials stay local. The lock file is tracked.
+.mcp.json
+credentials.json
+encryption.key
+pad.db
+.pad/*
+!.pad/universal.lock.json
