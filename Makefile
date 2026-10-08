@@ -6,7 +6,7 @@ RUN := $(UV) run --locked
 CATALOGUE := $(RUN) catalogue
 export DAGSTER_HOME := $(CURDIR)/.state/dagster_home
 
-.PHONY: sync lint test dagster-home bootstrap refresh reconcile replay validate publish \
+.PHONY: sync lint test test-dev dagster-home bootstrap refresh reconcile replay validate publish \
 	current status dbt-parse backup verify-backup rebuild
 
 sync:
@@ -18,6 +18,9 @@ lint:
 
 test:
 	$(RUN) pytest -q
+
+# Fast loop for repo-change-review: lint, then the full test suite.
+test-dev: lint test
 
 dagster-home:
 	mkdir -p $(DAGSTER_HOME)

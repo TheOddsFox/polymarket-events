@@ -227,3 +227,7 @@ dbt/logs/
 dbt/dbt_packages/
 dbt/.user.yml
 .tmp_dagster_home_*/
+
+# Pad generated skills: .agents/skills/pad stays tracked; .claude/ is generated and ignored
+# (same layout as personal/website).
+.claude/
