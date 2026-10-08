@@ -20,6 +20,7 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 make sync      # uv sync --locked
 make test      # full test suite; never calls the live Gamma API
 make lint
+make test-dev  # fast dev loop: lint, then the full test suite
 ```
 
 ## Operator commands
