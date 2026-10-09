@@ -102,6 +102,15 @@ def test_penalize_pauses_a_spawned_client_once() -> None:
         client.close()
 
 
+def test_overlapping_penalties_share_one_deadline() -> None:
+    clock = FakeClock()
+    bucket = TokenBucket(1000.0, clock=clock, sleep=clock.sleep)
+    bucket.penalize(10)
+    bucket.penalize(10)
+    bucket.acquire()
+    assert clock.t == pytest.approx(10)
+
+
 def test_429_honours_retry_after_then_succeeds() -> None:
     calls = {"n": 0}
 

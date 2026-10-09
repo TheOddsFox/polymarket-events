@@ -134,14 +134,17 @@ class Ledger:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            started = False
             try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                started = True
                 yield self._conn
-            except BaseException:
-                self._conn.execute("ROLLBACK")
-                raise
-            else:
                 self._conn.execute("COMMIT")
+                started = False
+            except BaseException:
+                if started:
+                    self._conn.execute("ROLLBACK")
+                raise
 
     def _one(self, sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         with self._lock:

@@ -198,6 +198,24 @@ def offset_pages(
         offset = next_offset
 
 
+def _reject_window_mismatch(
+    endpoint: str, wanted: list[int], records: list[Any], cursor: str | None
+) -> None:
+    """A window that ignores the id list would never end, or would skip ids."""
+    wanted_ids = set(wanted)
+    outside = [
+        record.get("id")
+        for record in records
+        if isinstance(record, dict)
+        and str(record.get("id", "")).isdigit()
+        and int(record["id"]) not in wanted_ids
+    ]
+    if outside:
+        raise MalformedResponse(f"{endpoint}: id window returned ids outside the request")
+    if cursor and len(records) < len(wanted):
+        raise MalformedResponse(f"{endpoint}: id window returned a short page with a cursor")
+
+
 def _window_params(ids: list[int], record_key: str, closed: bool | None) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": len(ids), "id": ids}
     if closed is not None:
@@ -283,7 +301,8 @@ def _fetch_id_window(
             )
         if response.status != 200:
             raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
-        records, _ = unpack(response.json, record_key)
+        records, cursor = unpack(response.json, record_key)
+        _reject_window_mismatch(endpoint, wanted, records, cursor)
         return records, [], [response]
 
     def _fetch_single(entity_id: int) -> tuple[list[Any], list[int], list[Response]]:

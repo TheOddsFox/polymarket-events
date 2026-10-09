@@ -71,7 +71,10 @@ def test_shared_bucket_keeps_the_pool_inside_the_rate(tmp_path: Path) -> None:
         assert summary.status == "captured"
         requests = runtime.client.stats.requests
         assert requests > 1
-        assert clock.t == pytest.approx((requests - 1) / 5)
+        # Elapsed fake time is at least one gap per request after the first.
+        # Workers sleep outside the bucket lock, so the fake clock can count
+        # overlapping waits more than once. It must not count fewer.
+        assert clock.t + 1e-9 >= (requests - 1) / 5
     finally:
         runtime.ledger.close()
 

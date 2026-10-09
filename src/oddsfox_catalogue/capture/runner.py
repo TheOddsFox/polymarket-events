@@ -33,6 +33,7 @@ from oddsfox_catalogue.capture.reader import iter_scan_pages, scan_dir_for
 from oddsfox_catalogue.capture.writer import (
     batch_marker_path,
     manifest_path,
+    read_body,
     read_manifest,
     scan_marker_path,
     verify_page,
@@ -215,6 +216,32 @@ def _event_ids_from(
     return ids
 
 
+def _fetch_failed_ids(
+    rt: CaptureRuntime,
+    batch: dict[str, Any],
+    predicate: Callable[[dict[str, Any]], bool],
+) -> set[str]:
+    """Ids a list scan could not read. They must not be fetched again by keyset."""
+    failed: set[str] = set()
+    for scan in rt.ledger.list_scans(batch["batch_id"]):
+        if not predicate(scan):
+            continue
+        directory = scan_dir_for(
+            rt.settings, batch["observation_date"], batch["batch_id"], scan["scan_id"]
+        )
+        for manifest, _records in iter_scan_pages(rt.settings, batch, scan):
+            try:
+                body = json.loads(read_body(directory, manifest))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(body, dict):
+                continue
+            for item in body.get("fetch_failed") or []:
+                if isinstance(item, dict) and "id" in item:
+                    failed.add(str(item["id"]))
+    return failed
+
+
 def _market_stub_ids(rt: CaptureRuntime, batch: dict[str, Any]) -> set[str]:
     """Event IDs referenced by ``market.events`` stubs, in both market shapes."""
     stubs: set[str] = set()
@@ -242,11 +269,11 @@ def _plan_stage0_ids(rt: CaptureRuntime, batch: dict[str, Any]) -> list[str]:
         returned = _event_ids_from(rt, batch, lambda s: s["scan_name"] == "events_keyset_open")
         return sorted(baseline - returned, key=int)
 
-    known = _event_ids_from(
-        rt,
-        batch,
-        lambda s: s["kind"] == "id_range" and s["record_key"] == "events",
-    )
+    def event_scans(scan: dict[str, Any]) -> bool:
+        return scan["kind"] == "id_range" and scan["record_key"] == "events"
+
+    known = _event_ids_from(rt, batch, event_scans)
+    known.update(_fetch_failed_ids(rt, batch, event_scans))
     stubs = _market_stub_ids(rt, batch)
     candidates = {i for i in stubs if i.isdigit()}
     return sorted(candidates - known, key=int)
@@ -502,11 +529,11 @@ def _run_scan(
     summary: CaptureSummary,
     stop: threading.Event | None = None,
 ) -> None:
-    if stop is not None and stop.is_set():
-        return
     scan_id = row["scan_id"]
     if row["status"] == "failed":
         rt.ledger.set_scan_running(scan_id, iso_utc(rt.now()))
+    if stop is not None and stop.is_set():
+        return
     scan = rt.ledger.get_scan(scan_id)
     assert scan is not None
     directory = scan_dir_for(rt.settings, batch["observation_date"], batch["batch_id"], scan_id)
@@ -720,10 +747,23 @@ def _run_ready_scans(
             future.cancel()
         raise
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        # A second SIGTERM raises inside shutdown. Keep joining until the
+        # workers have finished, then surface that signal to the stage row.
+        interrupted: BaseException | None = None
+        while True:
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+                break
+            except BaseException as exc:
+                if exc.__class__.__name__ != "Terminated":
+                    raise
+                stop.set()
+                interrupted = exc
         rt.client._limiter.bind_stop(None)
         for client in spawned:
             client.close()
+        if interrupted is not None:
+            raise interrupted
 
 
 def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:

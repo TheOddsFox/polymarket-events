@@ -98,26 +98,30 @@ class TokenBucket:
             remaining -= step
 
     def acquire(self) -> None:
-        with self._lock:
-            now = self._clock()
-            wait = self._next_at - now
-            if wait > 0:
-                self._pause(wait)
+        while True:
+            with self._lock:
                 now = self._clock()
-            self._next_at = max(now, self._next_at) + self._interval
+                wait = self._next_at - now
+                if wait <= 0:
+                    self._next_at = max(now, self._next_at) + self._interval
+                    return
+            # Sleep outside the lock so another worker can record a penalty
+            # against the same deadline instead of queueing behind this wait.
+            self._pause(wait)
 
     def penalize(self, seconds: float) -> None:
         """Hold every client on this bucket for ``seconds`` after a retryable failure.
 
-        The retrying caller waits here, and the next request any worker takes
-        cannot start until the same pause has elapsed.
+        The next ``acquire`` waits until the pause has elapsed. Overlapping
+        penalties share that deadline instead of stacking.
         """
         if seconds <= 0:
             return
         with self._lock:
             now = self._clock()
+            # Push the schedule out. Do not sleep here: the next acquire waits
+            # until _next_at, and a sleep under this lock would stack penalties.
             self._next_at = max(self._next_at, now + seconds)
-            self._pause(seconds)
 
 
 def parse_retry_after(value: str | None, now: datetime) -> float | None:

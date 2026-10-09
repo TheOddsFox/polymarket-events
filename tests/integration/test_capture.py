@@ -542,3 +542,45 @@ def test_a_single_id_that_keeps_failing_is_marked_fetch_failed(tmp_path: Path) -
         assert failed_ids == ["150"]
     finally:
         runtime.ledger.close()
+
+
+def test_a_referenced_failed_event_is_not_fetched_again(tmp_path: Path) -> None:
+    from fakes.world import World
+
+    world = World()
+    dropped = make_event("150", "Dropped")
+    dropped["markets"] = [make_market("160", "Dropped market", event_stub=event_stub(dropped))]
+    world.add_event(dropped)
+    fake = FakeGamma(world)
+
+    def hits_150(request: httpx.Request) -> bool:
+        if request.url.path == "/events/150":
+            return True
+        return request.url.path == "/events/keyset" and "150" in request.url.params.get_list("id")
+
+    fake.rules.append(
+        Rule(hits_150, lambda request: httpx.Response(500, json={"error": "down"}), remaining=500)
+    )
+    runtime, _ = build_runtime(tmp_path, fake)
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        names = [scan["scan_name"] for scan in runtime.ledger.list_scans(summary.batch_id)]
+        assert not any(name.startswith("events_by_id") for name in names)
+        batch = runtime.ledger.get_batch(summary.batch_id)
+        failed_ids: list[str] = []
+        for scan in runtime.ledger.list_scans(summary.batch_id):
+            if scan["kind"] != "id_range" or scan["record_key"] != "events":
+                continue
+            directory = (
+                runtime.settings.raw_dir
+                / batch["observation_date"]
+                / batch["batch_id"]
+                / scan["scan_id"]
+            )
+            for manifest, _records in iter_scan_pages(runtime.settings, batch, scan):
+                body = json.loads(read_body(directory, manifest))
+                failed_ids.extend(item["id"] for item in body.get("fetch_failed", []))
+        assert failed_ids == ["150"]
+    finally:
+        runtime.ledger.close()
