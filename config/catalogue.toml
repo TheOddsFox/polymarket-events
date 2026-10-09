@@ -7,7 +7,7 @@
 
 [gamma]
 base_url = "https://gamma-api.polymarket.com"
-requests_per_second = 2.0
+requests_per_second = 5.0
 connect_timeout_s = 10.0
 read_timeout_s = 60.0
 max_retries = 12
@@ -54,3 +54,11 @@ retain_releases = 5
 [schedule]
 daily_cron = "0 6 * * 1-6"
 weekly_cron = "0 3 * * 0"
+
+[capture]
+# Ids per id-range scan. Each scan still requests 100 ids at a time.
+id_partition_size = 50000
+# 0 uses the server high-water mark. A positive value caps a smoke run and skips the tail.
+max_id_override = 0
+# Scans from the same plan stage run together. They share the Gamma rate limit.
+workers = 4

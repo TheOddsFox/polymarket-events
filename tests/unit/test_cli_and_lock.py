@@ -62,10 +62,14 @@ def test_sigterm_during_capture_records_failed_stage_and_exits_143(
 ) -> None:
     monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
     monkeypatch.setenv("CATALOGUE_GAMMA_BASE_URL", "http://127.0.0.1:9")
+    # Four workers: the signal has to drain the pool, not only a serial scan.
+    monkeypatch.setenv("CATALOGUE_CAPTURE_WORKERS", "4")
 
     def explode(*_args: object, **_kwargs: object) -> None:
         os.kill(os.getpid(), signal.SIGTERM)
 
+    # Planning reads the high-water mark before any scan. Keep that off the network.
+    monkeypatch.setattr("oddsfox_catalogue.gamma.scans._high_water", lambda *_a, **_k: 1)
     monkeypatch.setattr("oddsfox_catalogue.capture.runner._run_scan", explode)
 
     assert main(["refresh", "--mode", "bootstrap"]) == 143

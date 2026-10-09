@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -39,10 +41,11 @@ from oddsfox_catalogue.capture.writer import (
 )
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.faults import fault_point
-from oddsfox_catalogue.gamma.http import CursorExpired, GammaClient, ScanFailed
+from oddsfox_catalogue.gamma.http import CaptureStopped, CursorExpired, GammaClient, ScanFailed
 from oddsfox_catalogue.gamma.paginators import (
     PageResult,
     PageState,
+    id_range_pages,
     keyset_pages,
     offset_pages,
     single_event_page,
@@ -98,6 +101,17 @@ class CaptureSummary:
     pages_adopted: int = 0
     records: int = 0
     scans: list[str] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def note_scan(self, scan_id: str) -> None:
+        with self._lock:
+            self.scans.append(scan_id)
+
+    def note_pages(self, *, written: int = 0, adopted: int = 0, records: int = 0) -> None:
+        with self._lock:
+            self.pages_written += written
+            self.pages_adopted += adopted
+            self.records += records
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +147,7 @@ def _start_batch(rt: CaptureRuntime, mode: str) -> dict[str, Any]:
     started = iso_utc(now)
     batch_id = make_batch_id(mode, now)
     obs_date = observation_date(now)
-    specs = list_scans_for(mode, rt.settings.gamma)
+    specs = list_scans_for(mode, rt.settings.gamma, capture=rt.settings.capture, client=rt.client)
     rows = [
         _scan_row(batch_id, spec, attempt=1, plan_order=index, started_at=started)
         for index, spec in enumerate(specs, start=1)
@@ -228,10 +242,13 @@ def _plan_stage0_ids(rt: CaptureRuntime, batch: dict[str, Any]) -> list[str]:
         returned = _event_ids_from(rt, batch, lambda s: s["scan_name"] == "events_keyset_open")
         return sorted(baseline - returned, key=int)
 
-    known = _event_ids_from(rt, batch, lambda s: s["scan_name"].startswith("events_keyset_"))
-    archived = _event_ids_from(rt, batch, lambda s: s["scan_name"] == "events_archived_offset")
+    known = _event_ids_from(
+        rt,
+        batch,
+        lambda s: s["kind"] == "id_range" and s["record_key"] == "events",
+    )
     stubs = _market_stub_ids(rt, batch)
-    candidates = {i for i in stubs | archived if i.isdigit()}
+    candidates = {i for i in stubs if i.isdigit()}
     return sorted(candidates - known, key=int)
 
 
@@ -322,6 +339,8 @@ def _iterate(rt: CaptureRuntime, spec: ScanSpec, start: PageState) -> Iterator[P
     client = rt.client
     if spec.kind == "keyset" or spec.kind == "keyset_ids":
         return keyset_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
+    if spec.kind == "id_range":
+        return id_range_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
     if spec.kind == "offset":
         return offset_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
     if spec.kind == "single_ids":
@@ -477,8 +496,14 @@ def _write_scan_marker(
 
 
 def _run_scan(
-    rt: CaptureRuntime, batch: dict[str, Any], row: dict[str, Any], summary: CaptureSummary
+    rt: CaptureRuntime,
+    batch: dict[str, Any],
+    row: dict[str, Any],
+    summary: CaptureSummary,
+    stop: threading.Event | None = None,
 ) -> None:
+    if stop is not None and stop.is_set():
+        return
     scan_id = row["scan_id"]
     if row["status"] == "failed":
         rt.ledger.set_scan_running(scan_id, iso_utc(rt.now()))
@@ -487,7 +512,7 @@ def _run_scan(
     directory = scan_dir_for(rt.settings, batch["observation_date"], batch["batch_id"], scan_id)
     _write_scan_marker(rt, batch, scan, directory, "running")
     spec = scan_spec_from_row(scan)
-    summary.scans.append(scan_id)
+    summary.note_scan(scan_id)
     if scan["fetched_seq"]:
         logger.info(
             "capture scan %s resuming after page %s",
@@ -499,7 +524,7 @@ def _run_scan(
 
     try:
         adopted = _adopt_durable_pages(rt, batch, scan, directory)
-        summary.pages_adopted += adopted
+        summary.note_pages(adopted=adopted)
         scan = rt.ledger.get_scan(scan_id)
         assert scan is not None
         if scan["terminal"]:
@@ -507,10 +532,16 @@ def _run_scan(
             return
 
         state = _state_from_row(rt, scan)
-        for page in _iterate(rt, spec, state):
+        pages = _iterate(rt, spec, state)
+        while True:
+            if stop is not None and stop.is_set():
+                return
+            try:
+                page = next(pages)
+            except StopIteration:
+                break
             _persist_page(rt, batch, scan, directory, page)
-            summary.pages_written += 1
-            summary.records += page.record_count
+            summary.note_pages(written=1, records=page.record_count)
             if page_progress_due(page.seq):
                 logger.info(
                     "capture %s page %s (%s records)",
@@ -521,6 +552,8 @@ def _run_scan(
         scan = rt.ledger.get_scan(scan_id)
         assert scan is not None
         _finish(rt, batch, scan, directory, "complete")
+    except CaptureStopped:
+        return
     except CursorExpired as exc:
         _abandon(rt, batch, scan_id, directory, str(exc))
     except Exception as exc:
@@ -629,6 +662,70 @@ def _record_capture_stage(
     )
 
 
+def _runtime_for(rt: CaptureRuntime, client: GammaClient) -> CaptureRuntime:
+    return CaptureRuntime(
+        settings=rt.settings,
+        client=client,
+        ledger=rt.ledger,
+        now=rt.now,
+        open_event_ids=rt.open_event_ids,
+        git_sha=rt.git_sha,
+        max_scan_attempts=rt.max_scan_attempts,
+    )
+
+
+def _run_ready_scans(
+    rt: CaptureRuntime,
+    batch: dict[str, Any],
+    rows: list[dict[str, Any]],
+    summary: CaptureSummary,
+) -> None:
+    """Run every runnable scan in this stage, up to ``capture.workers`` at once.
+
+    A failure or ``Terminated`` sets the stop event. Scans that have not
+    started are left ``running`` and are not fetched. A scan already on a
+    page finishes that page, then returns still ``running`` so resume continues
+    it. The scan that raised is marked failed by ``_run_scan``.
+    """
+    stop = threading.Event()
+    worker_count = min(rt.settings.capture.workers, len(rows))
+    local = threading.local()
+    spawned: list[GammaClient] = []
+    spawned_lock = threading.Lock()
+
+    def init_worker() -> None:
+        client = rt.client.spawn()
+        local.client = client
+        with spawned_lock:
+            spawned.append(client)
+
+    def run_row(row: dict[str, Any]) -> None:
+        _run_scan(_runtime_for(rt, local.client), batch, row, summary, stop)
+
+    rt.client._limiter.bind_stop(stop)
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix="capture", initializer=init_worker
+    )
+    futures = []
+    try:
+        futures = [executor.submit(run_row, row) for row in rows]
+        pending = set(futures)
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                future.result()
+    except BaseException:
+        stop.set()
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        rt.client._limiter.bind_stop(None)
+        for client in spawned:
+            client.close()
+
+
 def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
     """Start, or resume, a capture batch for ``mode`` until it is captured or a scan fails.
 
@@ -657,7 +754,10 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
                 ]
                 if runnable:
                     runnable.sort(key=lambda s: (s["plan_order"], s["attempt"]))
-                    _run_scan(rt, batch, runnable[0], summary)
+                    if rt.settings.capture.workers <= 1:
+                        _run_scan(rt, batch, runnable[0], summary)
+                    else:
+                        _run_ready_scans(rt, batch, runnable, summary)
                     continue
                 if not progressed:
                     break

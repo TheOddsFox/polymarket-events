@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import httpx
 import pytest
 from dlt.pipeline.exceptions import PipelineStepFailed
 
-from fakes.fake_gamma import FakeGamma
+from fakes.fake_gamma import FakeGamma, Rule
 from fakes.harness import FIXED_NOW, build_runtime, make_settings
-from fakes.world import demo_world, make_event, make_market
+from fakes.world import demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.config import Settings
@@ -230,6 +231,65 @@ def test_quarantined_records_load_without_blocking_the_page(tmp_path: Path) -> N
         )
         >= 1
     ), "the event still loads; only its malformed nested market is quarantined"
+
+
+def _fake_that_drops_event_150() -> FakeGamma:
+    from fakes.world import World
+
+    world = World()
+    kept = make_event("50", "Kept")
+    kept["markets"] = [make_market("60", "Kept market", event_stub=event_stub(kept))]
+    world.add_event(kept)
+    world.add_event(make_event("150", "Dropped"))
+    fake = FakeGamma(world)
+
+    def hits_150(request: httpx.Request) -> bool:
+        if request.url.path == "/events/150":
+            return True
+        return request.url.path == "/events/keyset" and "150" in request.url.params.get_list("id")
+
+    fake.rules.append(
+        Rule(hits_150, lambda request: httpx.Response(500, json={"error": "down"}), remaining=500)
+    )
+    return fake
+
+
+def test_fetch_failed_is_loaded_as_quarantine_and_counts_against_the_gate(
+    tmp_path: Path,
+) -> None:
+    runtime, _ = build_runtime(tmp_path, _fake_that_drops_event_150())
+    try:
+        run_capture(runtime, "bootstrap")
+    finally:
+        runtime.ledger.close()
+
+    permissive = make_settings(tmp_path, {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "0.5"})
+    summary = _load(permissive)
+    assert summary.quarantined >= 1
+    assert (
+        _query(
+            permissive,
+            "SELECT reason FROM bronze.quarantined_records "
+            "WHERE json_extract_string(payload, '$.id') = '150'",
+        )
+        == "fetch_failed"
+    )
+    assert (
+        _query(permissive, "SELECT COUNT(*) FROM bronze.event_observations WHERE entity_id = '150'")
+        == 0
+    )
+
+    blocked_root = tmp_path / "blocked"
+    runtime, _ = build_runtime(blocked_root, _fake_that_drops_event_150())
+    try:
+        blocked_id = run_capture(runtime, "bootstrap").batch_id
+    finally:
+        runtime.ledger.close()
+    blocked_settings = make_settings(blocked_root, {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "0"})
+    with pytest.raises(LoadBlocked, match="quarantine_max_ratio"):
+        _load(blocked_settings)
+    assert _batch_status(blocked_settings, blocked_id) == "captured"
+    assert _registry_rows(blocked_settings) == []
 
 
 def test_batch_over_quarantine_cap_is_blocked_and_not_registered(tmp_path: Path) -> None:

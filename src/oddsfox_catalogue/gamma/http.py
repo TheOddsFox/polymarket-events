@@ -43,6 +43,10 @@ class ScanFailed(GammaError):
     """A pagination invariant was violated (repeated cursor, loop, and so on)."""
 
 
+class CaptureStopped(GammaError):
+    """The worker pool was asked to drain. The scan stays running for resume."""
+
+
 @dataclass(frozen=True)
 class Response:
     endpoint: str
@@ -72,15 +76,48 @@ class TokenBucket:
         self._sleep = sleep
         self._next_at = 0.0
         self._lock = threading.Lock()
+        self._stop: threading.Event | None = None
+
+    def bind_stop(self, stop: threading.Event | None) -> None:
+        """When set, a long pause wakes often enough for the pool to drain."""
+        self._stop = stop
+
+    def _pause(self, seconds: float) -> None:
+        if self._stop is not None and self._stop.is_set():
+            raise CaptureStopped()
+        # Tests use an instant clock. Only a real sleep needs to be sliced.
+        if self._stop is None or self._sleep is not time.sleep or seconds <= 0.25:
+            self._sleep(seconds)
+            return
+        remaining = seconds
+        while remaining > 0:
+            if self._stop is not None and self._stop.is_set():
+                raise CaptureStopped()
+            step = min(0.25, remaining)
+            self._sleep(step)
+            remaining -= step
 
     def acquire(self) -> None:
         with self._lock:
             now = self._clock()
             wait = self._next_at - now
             if wait > 0:
-                self._sleep(wait)
+                self._pause(wait)
                 now = self._clock()
             self._next_at = max(now, self._next_at) + self._interval
+
+    def penalize(self, seconds: float) -> None:
+        """Hold every client on this bucket for ``seconds`` after a retryable failure.
+
+        The retrying caller waits here, and the next request any worker takes
+        cannot start until the same pause has elapsed.
+        """
+        if seconds <= 0:
+            return
+        with self._lock:
+            now = self._clock()
+            self._next_at = max(self._next_at, now + seconds)
+            self._pause(seconds)
 
 
 def parse_retry_after(value: str | None, now: datetime) -> float | None:
@@ -150,7 +187,7 @@ class RequestStats:
 
 
 class GammaClient:
-    """Single pooled client used for every capture request."""
+    """Pooled client for Gamma. ``spawn`` shares the rate limiter and stats."""
 
     def __init__(
         self,
@@ -161,14 +198,21 @@ class GammaClient:
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         rng: random.Random | None = None,
+        limiter: TokenBucket | None = None,
+        stats: RequestStats | None = None,
+        stats_lock: threading.Lock | None = None,
     ) -> None:
         self._settings = settings
         self._now = now
         self._sleep = sleep
-        self._rng = rng or random.Random()
-        self._limiter = TokenBucket(settings.requests_per_second, clock=clock, sleep=sleep)
         self._clock = clock
-        self.stats = RequestStats()
+        self._rng = rng or random.Random()
+        self._transport = transport
+        self._limiter = limiter or TokenBucket(
+            settings.requests_per_second, clock=clock, sleep=sleep
+        )
+        self.stats = stats or RequestStats()
+        self._stats_lock = stats_lock or threading.Lock()
         self._client = httpx.Client(
             base_url=settings.base_url,
             timeout=httpx.Timeout(
@@ -192,60 +236,98 @@ class GammaClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def get(self, endpoint: str, params: Mapping[str, Any] | None = None) -> Response:
-        """GET an endpoint with retries. 404 returns a Response; callers decide what it means."""
+    def now(self) -> datetime:
+        return self._now()
+
+    def spawn(self) -> GammaClient:
+        """A worker client with its own connection and its own backoff RNG.
+
+        The token bucket, request stats, clock, and transport are shared with
+        the parent, so the pool stays inside one rate limit.
+        """
+        return GammaClient(
+            self._settings,
+            transport=self._transport,
+            clock=self._clock,
+            sleep=self._sleep,
+            now=self._now,
+            limiter=self._limiter,
+            stats=self.stats,
+            stats_lock=self._stats_lock,
+        )
+
+    def _add(self, **amounts: float) -> None:
+        with self._stats_lock:
+            for name, amount in amounts.items():
+                setattr(self.stats, name, getattr(self.stats, name) + amount)
+
+    def get(
+        self,
+        endpoint: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        max_retries: int | None = None,
+        backoff_cap_s: float | None = None,
+    ) -> Response:
+        """GET an endpoint with retries. 404 returns a Response; callers decide what it means.
+
+        ``max_retries`` and ``backoff_cap_s`` override the client settings for this call.
+        Id-window fetches use a shorter budget than keyset crawls.
+        """
         clean = encode_params(params or {})
+        retry_budget = self._settings.max_retries if max_retries is None else max_retries
+        backoff_cap = self._settings.backoff_cap_s if backoff_cap_s is None else backoff_cap_s
         retries = 0
         while True:
             self._limiter.acquire()
             started = self._clock()
-            self.stats.requests += 1
+            self._add(requests=1)
             try:
                 raw = self._client.get(endpoint, params=clean)
             except httpx.TransportError as exc:
-                self.stats.transport_errors += 1
-                if retries >= self._settings.max_retries:
+                self._add(transport_errors=1)
+                if retries >= retry_budget:
                     raise RetriesExhausted(f"{endpoint}: transport error: {exc}") from exc
                 retries += 1
-                self.stats.retries += 1
+                self._add(retries=1)
                 logger.warning(
                     "gamma %s transport error, retry %s of %s: %s",
                     endpoint,
                     retries,
-                    self._settings.max_retries,
+                    retry_budget,
                     exc,
                 )
-                self._sleep(self._delay(retries, None))
+                self._limiter.penalize(self._delay(retries, None, backoff_cap))
                 continue
 
             latency = self._clock() - started
-            self.stats.total_latency_s += latency
+            self._add(total_latency_s=latency)
             status = raw.status_code
 
             if status in RETRYABLE_STATUS:
                 if status == 429:
-                    self.stats.rate_limited += 1
+                    self._add(rate_limited=1)
                 else:
-                    self.stats.server_errors += 1
-                if retries >= self._settings.max_retries:
+                    self._add(server_errors=1)
+                if retries >= retry_budget:
                     raise RetriesExhausted(f"{endpoint}: HTTP {status} after {retries} retries")
                 retries += 1
-                self.stats.retries += 1
+                self._add(retries=1)
                 logger.warning(
                     "gamma %s HTTP %s, retry %s of %s",
                     endpoint,
                     status,
                     retries,
-                    self._settings.max_retries,
+                    retry_budget,
                 )
                 retry_after = parse_retry_after(raw.headers.get("Retry-After"), self._now())
-                self._sleep(self._delay(retries, retry_after))
+                self._limiter.penalize(self._delay(retries, retry_after, backoff_cap))
                 continue
 
             if status == 422 and "after_cursor" in clean:
                 raise CursorExpired(f"{endpoint}: cursor rejected: {raw.text[:200]}")
             if status == 404:
-                self.stats.not_found += 1
+                self._add(not_found=1)
                 return Response(
                     endpoint=endpoint,
                     params=clean,
@@ -277,13 +359,13 @@ class GammaClient:
                 headers=dict(raw.headers),
             )
 
-    def _delay(self, retry_number: int, retry_after: float | None) -> float:
+    def _delay(self, retry_number: int, retry_after: float | None, backoff_cap: float) -> float:
         """The server's Retry-After wins when present; otherwise jittered backoff from base."""
         if retry_after is not None:
             return retry_after
         return backoff_delay(
             retry_number - 1,
             self._settings.backoff_base_s,
-            self._settings.backoff_cap_s,
+            backoff_cap,
             self._rng,
         )

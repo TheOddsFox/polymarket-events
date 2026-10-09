@@ -29,7 +29,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 | --- | --- |
 | `make bootstrap` | First run on an empty project: capture everything, load, build, publish. |
 | `make refresh` | Daily incremental run: open events plus recently changed events. |
-| `make reconcile` | Weekly full pass: all events (open and closed), archived events, and all markets, then by-ID fetches for referenced events the lists did not return. |
+| `make reconcile` | Weekly full pass: every event and every closed market by id range, open markets by keyset, then by-ID fetches for referenced events those scans did not return. |
 | `make replay` | Load pending raw pages, build, publish. No Gamma calls. |
 | `make validate` | Run dbt tests against the warehouse. Never builds, so it appends no `catalogue_snapshots` row. |
 | `make publish` | Write a release if the last dbt build passed. |
@@ -120,13 +120,18 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
 
 ## Gamma contract
 
-- Open events are paginated with `after_cursor` (keyset). Archived events use offset, since that
-  is the only supported pagination for them. By-ID lookups fill in events referenced from markets.
+- Daily capture lists open events with `after_cursor`. Bootstrap and reconcile list events and
+  closed markets by explicit id windows of 100, from a high-water mark read once at batch start,
+  then list open markets with the keyset. By-ID lookups fill in events referenced from markets
+  that those scans did not return. An id that still fails after the window is split is quarantined
+  as `fetch_failed`.
 - Nested `market.events` entries are references only. They are never treated as full events.
 - `outcomes`, `outcomePrices`, and `clobTokenIds`/`positionIds` arrive as JSON-encoded strings.
   dbt decodes them and quarantines any market whose lists do not align.
-- Requests are limited to 2 per second, with 10 s connect and 60 s read timeouts, and up to 12
-  retries (`backoff_base_s` 5, `backoff_cap_s` 300) using full-jitter backoff and `Retry-After`.
+- Up to 4 scans in the current plan stage run at once (`capture.workers`). They share a limit of
+  5 requests per second (`gamma.requests_per_second`), with a 10 s connect timeout and a 60 s read
+  timeout. Keyset requests retry up to 12 times (`backoff_base_s` 5, `backoff_cap_s` 300). An id
+  window retries 4 times with backoff capped at 30 s. Both honour `Retry-After`.
 
 ## Status
 

@@ -17,7 +17,7 @@ ENV_PREFIX = "CATALOGUE"
 @dataclass(frozen=True)
 class GammaSettings:
     base_url: str = "https://gamma-api.polymarket.com"
-    requests_per_second: float = 2.0
+    requests_per_second: float = 5.0
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 60.0
     max_retries: int = 12
@@ -66,6 +66,20 @@ class ScheduleSettings:
 
 
 @dataclass(frozen=True)
+class CaptureSettings:
+    """Id-range planning and the capture worker pool.
+
+    ``max_id_override`` of 0 means use the server high-water mark.
+    ``workers`` is how many scans from the current plan stage run at once.
+    They share one rate limiter.
+    """
+
+    id_partition_size: int = 50_000
+    max_id_override: int = 0
+    workers: int = 4
+
+
+@dataclass(frozen=True)
 class Settings:
     root: Path
     gamma: GammaSettings = field(default_factory=GammaSettings)
@@ -74,6 +88,7 @@ class Settings:
     quality: QualitySettings = field(default_factory=QualitySettings)
     publish: PublishSettings = field(default_factory=PublishSettings)
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
+    capture: CaptureSettings = field(default_factory=CaptureSettings)
 
     # Resolved absolute locations -------------------------------------------------
     def _abs(self, value: str) -> Path:
@@ -177,6 +192,7 @@ def load_settings(
         "quality": QualitySettings,
         "publish": PublishSettings,
         "schedule": ScheduleSettings,
+        "capture": CaptureSettings,
     }
     unknown_sections = set(raw) - set(known_sections)
     if unknown_sections:
@@ -206,6 +222,17 @@ def _validate(settings: Settings) -> None:
         raise ValueError(
             "[quality] open_events_drop_warn_pct must not exceed open_events_drop_error_pct"
         )
+    capture = settings.capture
+    if capture.id_partition_size < 1:
+        raise ValueError(
+            f"[capture] id_partition_size must be at least 1, got {capture.id_partition_size}"
+        )
+    if capture.max_id_override < 0:
+        raise ValueError(
+            f"[capture] max_id_override must be 0 or positive, got {capture.max_id_override}"
+        )
+    if capture.workers < 1:
+        raise ValueError(f"[capture] workers must be at least 1, got {capture.workers}")
 
 
 def settings_as_dict(settings: Settings) -> dict[str, Any]:

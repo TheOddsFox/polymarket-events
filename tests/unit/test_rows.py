@@ -98,6 +98,19 @@ def test_duplicate_observation_ids_raise() -> None:
         assert_unique(rows.events)
 
 
+def test_fetch_failed_is_quarantined_with_that_reason() -> None:
+    rows = rows_for_page(
+        _ctx(),
+        [{"id": "202", "title": "ok"}],
+        [{"id": "101", "reason": "fetch_failed"}],
+    )
+    assert [row["entity_id"] for row in rows.events] == ["202"]
+    assert len(rows.quarantine) == 1
+    assert rows.quarantine[0]["reason"] == "fetch_failed"
+    assert rows.quarantine[0]["entity"] == "event"
+    assert rows.quarantine[0]["payload"]["id"] == "101"
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

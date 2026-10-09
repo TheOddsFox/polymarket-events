@@ -1,11 +1,12 @@
 """Scan catalogue: what to request for each capture mode, and in what order.
 
-Plan shape (see the design notes in the plan):
+Plan shape:
 
-* bootstrap / reconcile: four list scans, then reference resolution by ID.
-  ``events_keyset_all`` already returns open and closed events, so no separate
-  open or closed event scan is needed.
-* daily: the open-event scan, then re-fetch previously open IDs missing from it.
+* bootstrap / reconcile: id-range scans for every event and every closed market,
+  a short tail above each high-water mark, then the open-market keyset.
+  Deep keyset cursors and offset lists are not used. Gamma returns HTTP 500
+  on deep cursors and HTTP 422 once an offset passes a few thousand.
+* daily: the open-event keyset, then re-fetch previously open IDs missing from it.
 
 Follow-up scans (ID chunks, then single lookups) are created after their
 inputs are known, so they are persisted with their input ID lists. This keeps
@@ -18,10 +19,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from oddsfox_catalogue.config import GammaSettings
+from oddsfox_catalogue.config import CaptureSettings, GammaSettings
+from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse
+from oddsfox_catalogue.gamma.paginators import unpack
 
-ScanKind = Literal["keyset", "offset", "keyset_ids", "single_ids"]
+ScanKind = Literal["keyset", "offset", "id_range", "keyset_ids", "single_ids"]
 ID_CHUNK = 100
+ID_STEP = 100
+TAIL_EMPTY_WINDOWS = 3
 
 
 @dataclass(frozen=True)
@@ -39,12 +44,7 @@ class ScanSpec:
 
 
 def _event_params(settings: GammaSettings, closed: bool | None) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "limit": settings.page_limit,
-        "order": "id",
-        "ascending": True,
-        "include_children": True,
-    }
+    params: dict[str, Any] = {"limit": settings.page_limit}
     if closed is not None:
         params["closed"] = closed
     if settings.include_chat:
@@ -59,8 +59,6 @@ def _event_params(settings: GammaSettings, closed: bool | None) -> dict[str, Any
 def _market_params(settings: GammaSettings, closed: bool) -> dict[str, Any]:
     return {
         "limit": settings.page_limit,
-        "order": "id",
-        "ascending": True,
         "closed": closed,
         "include_tag": True,
     }
@@ -68,16 +66,6 @@ def _market_params(settings: GammaSettings, closed: bool) -> dict[str, Any]:
 
 def _freeze(params: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
     return tuple(sorted(params.items()))
-
-
-def event_keyset_all(settings: GammaSettings) -> ScanSpec:
-    return ScanSpec(
-        "events_keyset_all",
-        "keyset",
-        "/events/keyset",
-        "events",
-        _freeze(_event_params(settings, None)),
-    )
 
 
 def event_keyset_open(settings: GammaSettings) -> ScanSpec:
@@ -90,16 +78,6 @@ def event_keyset_open(settings: GammaSettings) -> ScanSpec:
     )
 
 
-def events_archived_offset(settings: GammaSettings) -> ScanSpec:
-    params = {
-        "limit": settings.page_limit,
-        "order": "id",
-        "ascending": True,
-        "archived": True,
-    }
-    return ScanSpec("events_archived_offset", "offset", "/events", "events", _freeze(params))
-
-
 def markets_keyset_open(settings: GammaSettings) -> ScanSpec:
     return ScanSpec(
         "markets_keyset_open",
@@ -110,26 +88,143 @@ def markets_keyset_open(settings: GammaSettings) -> ScanSpec:
     )
 
 
-def markets_keyset_closed(settings: GammaSettings) -> ScanSpec:
-    return ScanSpec(
-        "markets_keyset_closed",
-        "keyset",
-        "/markets/keyset",
-        "markets",
-        _freeze(_market_params(settings, True)),
+def id_range_scan(
+    name: str,
+    endpoint: str,
+    record_key: str,
+    *,
+    lo: int,
+    hi: int | None,
+    closed: bool | None,
+    tail: bool,
+) -> ScanSpec:
+    params: dict[str, Any] = {"lo": lo, "step": ID_STEP, "tail": tail}
+    if hi is not None:
+        params["hi"] = hi
+    if closed is not None:
+        params["closed"] = closed
+    if tail:
+        params["empty_stop"] = TAIL_EMPTY_WINDOWS
+    return ScanSpec(name, "id_range", endpoint, record_key, _freeze(params))
+
+
+def _high_water(client: GammaClient, endpoint: str, record_key: str) -> int:
+    """Highest source id, from ``limit=1&order=id&ascending=false``."""
+    response = client.get(endpoint, {"limit": 1, "order": "id", "ascending": False})
+    if response.status != 200:
+        raise MalformedResponse(f"{endpoint}: high-water HTTP {response.status}")
+    records, _ = unpack(response.json, record_key)
+    if not records or not isinstance(records[0], dict) or "id" not in records[0]:
+        raise MalformedResponse(f"{endpoint}: high-water response has no id")
+    return int(records[0]["id"])
+
+
+def _cap(mark: int, override: int) -> tuple[int, bool]:
+    """Return ``(mark, include_tail)``. An override below the server mark drops the tail."""
+    if override > 0 and override < mark:
+        return override, False
+    return mark, True
+
+
+def _partitions(
+    prefix: str,
+    endpoint: str,
+    record_key: str,
+    hi: int,
+    partition: int,
+    closed: bool | None,
+) -> list[ScanSpec]:
+    scans: list[ScanSpec] = []
+    start = 1
+    index = 1
+    while start <= hi:
+        end = min(hi, start + partition - 1)
+        scans.append(
+            id_range_scan(
+                f"{prefix}_{index:04d}",
+                endpoint,
+                record_key,
+                lo=start,
+                hi=end,
+                closed=closed,
+                tail=False,
+            )
+        )
+        start = end + 1
+        index += 1
+    return scans
+
+
+def id_range_plan(
+    gamma: GammaSettings, capture: CaptureSettings, client: GammaClient
+) -> list[ScanSpec]:
+    """Event and closed-market id ranges, optional tails, then the open-market keyset."""
+    event_mark, event_tail = _cap(_high_water(client, "/events", "events"), capture.max_id_override)
+    market_mark, market_tail = _cap(
+        _high_water(client, "/markets", "markets"), capture.max_id_override
     )
+    scans: list[ScanSpec] = []
+    scans.extend(
+        _partitions(
+            "events_ids",
+            "/events/keyset",
+            "events",
+            event_mark,
+            capture.id_partition_size,
+            None,
+        )
+    )
+    if event_tail:
+        scans.append(
+            id_range_scan(
+                "events_ids_tail",
+                "/events/keyset",
+                "events",
+                lo=event_mark + 1,
+                hi=None,
+                closed=None,
+                tail=True,
+            )
+        )
+    scans.extend(
+        _partitions(
+            "markets_closed_ids",
+            "/markets/keyset",
+            "markets",
+            market_mark,
+            capture.id_partition_size,
+            True,
+        )
+    )
+    if market_tail:
+        scans.append(
+            id_range_scan(
+                "markets_closed_ids_tail",
+                "/markets/keyset",
+                "markets",
+                lo=market_mark + 1,
+                hi=None,
+                closed=True,
+                tail=True,
+            )
+        )
+    scans.append(markets_keyset_open(gamma))
+    return scans
 
 
-def list_scans_for(mode: str, settings: GammaSettings) -> list[ScanSpec]:
-    if mode in {"bootstrap", "reconcile"}:
-        return [
-            event_keyset_all(settings),
-            events_archived_offset(settings),
-            markets_keyset_open(settings),
-            markets_keyset_closed(settings),
-        ]
+def list_scans_for(
+    mode: str,
+    gamma: GammaSettings,
+    *,
+    capture: CaptureSettings | None = None,
+    client: GammaClient | None = None,
+) -> list[ScanSpec]:
     if mode == "daily":
-        return [event_keyset_open(settings)]
+        return [event_keyset_open(gamma)]
+    if mode in {"bootstrap", "reconcile"}:
+        if capture is None or client is None:
+            raise ValueError(f"{mode} planning needs capture settings and a Gamma client")
+        return id_range_plan(gamma, capture, client)
     raise ValueError(f"unknown mode {mode!r}")
 
 
@@ -140,9 +235,6 @@ def chunk(ids: list[str], size: int = ID_CHUNK) -> list[list[str]]:
 def id_chunk_scan(index: int, ids: list[str]) -> ScanSpec:
     params = {
         "limit": ID_CHUNK,
-        "order": "id",
-        "ascending": True,
-        "include_children": True,
         "id": [int(i) for i in ids],
     }
     return ScanSpec(

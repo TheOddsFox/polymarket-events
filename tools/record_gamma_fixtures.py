@@ -27,39 +27,22 @@ REQUESTS: list[tuple[str, str, dict[str, object]]] = [
     (
         "events_keyset_open",
         "/events/keyset",
-        {
-            "limit": 3,
-            "order": "id",
-            "ascending": "true",
-            "include_children": "true",
-            "closed": "false",
-        },
+        {"limit": 3, "closed": "false"},
     ),
     (
         "events_closed_sample",
         "/events/keyset",
-        {
-            "limit": 3,
-            "order": "id",
-            "ascending": "true",
-            "include_children": "true",
-            "closed": "true",
-        },
-    ),
-    (
-        "events_archived_offset",
-        "/events",
-        {"limit": 3, "order": "id", "ascending": "true", "archived": "true", "offset": 0},
+        {"limit": 3, "closed": "true"},
     ),
     (
         "markets_keyset_open",
         "/markets/keyset",
-        {"limit": 3, "order": "id", "ascending": "true", "closed": "false", "include_tag": "true"},
+        {"limit": 3, "closed": "false", "include_tag": "true"},
     ),
     (
-        "markets_keyset_closed",
+        "markets_closed_sample",
         "/markets/keyset",
-        {"limit": 3, "order": "id", "ascending": "true", "closed": "true", "include_tag": "true"},
+        {"limit": 3, "closed": "true", "include_tag": "true"},
     ),
 ]
 

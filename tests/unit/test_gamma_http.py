@@ -78,6 +78,30 @@ def test_encode_params_uses_gamma_query_conventions() -> None:
     assert encoded == {"closed": "false", "limit": 100, "id": ["1", "2"]}
 
 
+def test_penalize_pauses_a_spawned_client_once() -> None:
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "4"})
+        return httpx.Response(200, json={"events": []})
+
+    client, clock = _client(handler)
+    child = client.spawn()
+    try:
+        assert client.get("/events/keyset", {"limit": 1}).status == 200
+        assert clock.sleeps == [4.0]
+        assert child.get("/events/keyset", {"limit": 1}).status == 200
+        assert clock.sleeps[0] == 4.0
+        assert all(pause < 1 for pause in clock.sleeps[1:])
+        assert client.stats.requests == 3
+        assert child.stats is client.stats
+    finally:
+        child.close()
+        client.close()
+
+
 def test_429_honours_retry_after_then_succeeds() -> None:
     calls = {"n": 0}
 

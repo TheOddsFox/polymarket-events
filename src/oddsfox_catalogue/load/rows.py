@@ -135,8 +135,16 @@ def _market_rows(
     out.markets.append(row)
 
 
-def rows_for_page(ctx: PageContext, records: list[Any]) -> RowSet:
-    """Envelope rows for every record on one page. Records are already envelope-checked."""
+def rows_for_page(
+    ctx: PageContext,
+    records: list[Any],
+    fetch_failed: list[Any] | None = None,
+) -> RowSet:
+    """Envelope rows for every record on one page. Records are already envelope-checked.
+
+    ``fetch_failed`` entries are ids the capture could not read. They become
+    quarantine rows with reason ``fetch_failed`` and count toward the load gate.
+    """
     out = RowSet()
     for index, record in enumerate(records):
         if ctx.record_key == "markets":
@@ -166,6 +174,11 @@ def rows_for_page(ctx: PageContext, records: list[Any]) -> RowSet:
                 SOURCE_EVENT_EMBEDDED,
                 out,
             )
+    entity = "market" if ctx.record_key == "markets" else "event"
+    for index, failed in enumerate(fetch_failed or []):
+        out.quarantine.append(
+            _quarantine(ctx, entity, f"/fetch_failed/{index}", "fetch_failed", failed)
+        )
     return out
 
 

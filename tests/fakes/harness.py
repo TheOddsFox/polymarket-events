@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,13 +23,16 @@ class FakeClock:
 
     t: float = 0.0
     sleeps: list[float] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def __call__(self) -> float:
-        return self.t
+        with self._lock:
+            return self.t
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self.t += seconds
+        with self._lock:
+            self.sleeps.append(seconds)
+            self.t += seconds
 
 
 def make_settings(root: Path, overrides: dict[str, str] | None = None) -> Settings:

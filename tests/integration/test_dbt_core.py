@@ -143,7 +143,7 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(built, tmp_path:
         settings.warehouse_path,
         "SELECT observation_count FROM core.events_current WHERE event_id = '202'",
     )
-    # One bootstrap observation (events_keyset_all, which already includes open events) plus
+    # One bootstrap observation (id-range events, which include open events) plus
     # one from the daily batch. Bootstrap no longer fetches open events a second time.
     assert observations == 2
 

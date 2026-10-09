@@ -9,6 +9,7 @@ parent test observes a real abrupt termination.
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,11 @@ def main() -> int:
     mode = sys.argv[2]
     now = datetime.fromisoformat(sys.argv[3])
     fake = FakeGamma(demo_world())
-    runtime, _ = build_runtime(root, fake, now=now)
+    # The harness builds its own env, so only the knobs a crash test sets are forwarded.
+    overrides = {}
+    if "CATALOGUE_CAPTURE_WORKERS" in os.environ:
+        overrides["CATALOGUE_CAPTURE_WORKERS"] = os.environ["CATALOGUE_CAPTURE_WORKERS"]
+    runtime, _ = build_runtime(root, fake, now=now, env=overrides or None)
     try:
         summary = run_capture(runtime, mode)
         print(f"captured {summary.batch_id} status={summary.status}")

@@ -113,6 +113,9 @@ def _rows_for_chunk(
 
         body = json.loads(read_body(directory, manifest))
         records, _ = unpack(body, page["record_key"])
+        fetch_failed = body.get("fetch_failed") if isinstance(body, dict) else None
+        if fetch_failed is not None and not isinstance(fetch_failed, list):
+            raise LoadBlocked(f"page {page['page_id']} has a non-list fetch_failed")
         observed_at = parse_timestamp(page["observed_at"])
         if observed_at is None:
             raise LoadBlocked(f"page {page['page_id']} has an unparseable observed_at")
@@ -123,7 +126,7 @@ def _rows_for_chunk(
             observed_at=observed_at,
             record_key=page["record_key"],
         )
-        page_rows = rows_for_page(ctx, records)
+        page_rows = rows_for_page(ctx, records, fetch_failed)
         counts[page["page_id"]] = (
             len(page_rows.events),
             len(page_rows.markets),

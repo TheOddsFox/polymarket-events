@@ -11,8 +11,17 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse, Response, ScanFailed
-from oddsfox_catalogue.ids import ids_hash
+from oddsfox_catalogue.gamma.http import (
+    GammaClient,
+    MalformedResponse,
+    Response,
+    RetriesExhausted,
+    ScanFailed,
+)
+from oddsfox_catalogue.ids import canonical_json, ids_hash
+
+ID_WINDOW_MAX_RETRIES = 4
+ID_WINDOW_BACKOFF_CAP_S = 30.0
 
 RECORD_KEYS = ("events", "markets")
 
@@ -187,6 +196,188 @@ def offset_pages(
             return
         previous_hash = current_hash
         offset = next_offset
+
+
+def _window_params(ids: list[int], record_key: str, closed: bool | None) -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": len(ids), "id": ids}
+    if closed is not None:
+        params["closed"] = closed
+    if record_key == "markets":
+        params["include_tag"] = True
+    return params
+
+
+def _single_path(endpoint: str, entity_id: int) -> str:
+    if endpoint.startswith("/events"):
+        return f"/events/{entity_id}"
+    if endpoint.startswith("/markets"):
+        return f"/markets/{entity_id}"
+    raise ValueError(f"no single-id route for {endpoint}")
+
+
+def _synthetic_response(
+    client: GammaClient,
+    endpoint: str,
+    params: Mapping[str, Any],
+    record_key: str,
+    records: list[Any],
+    failed: list[int],
+    parts: list[Response],
+) -> Response:
+    """One page body covering a window that took more than one HTTP call."""
+    if len(parts) == 1 and not failed:
+        return parts[0]
+    body: dict[str, Any] = {record_key: records}
+    if failed:
+        body["fetch_failed"] = [
+            {"id": str(entity_id), "reason": "fetch_failed"} for entity_id in failed
+        ]
+    raw = canonical_json(body).encode("utf-8")
+    return Response(
+        endpoint=endpoint,
+        params=params,
+        status=200,
+        body=raw,
+        json=body,
+        retries=sum(part.retries for part in parts),
+        latency_s=sum(part.latency_s for part in parts),
+        received_at=parts[-1].received_at if parts else client.now(),
+    )
+
+
+def _fetch_id_window(
+    client: GammaClient,
+    endpoint: str,
+    record_key: str,
+    ids: list[int],
+    closed: bool | None,
+) -> tuple[list[Any], list[int], Response]:
+    """Fetch one id window. A window that keeps failing is split down to one id.
+
+    A single id that still fails after ``/events/{id}`` or ``/markets/{id}`` is
+    returned in the failed list. A 404 means the id does not exist.
+    """
+    params = _window_params(ids, record_key, closed)
+
+    def fetch(wanted: list[int]) -> tuple[list[Any], list[int], list[Response]]:
+        if not wanted:
+            return [], [], []
+        request = _window_params(wanted, record_key, closed)
+        try:
+            response = client.get(
+                endpoint,
+                request,
+                max_retries=ID_WINDOW_MAX_RETRIES,
+                backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
+            )
+        except RetriesExhausted:
+            if len(wanted) == 1:
+                return _fetch_single(wanted[0])
+            mid = len(wanted) // 2
+            left_records, left_failed, left_parts = fetch(wanted[:mid])
+            right_records, right_failed, right_parts = fetch(wanted[mid:])
+            return (
+                left_records + right_records,
+                left_failed + right_failed,
+                left_parts + right_parts,
+            )
+        if response.status != 200:
+            raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
+        records, _ = unpack(response.json, record_key)
+        return records, [], [response]
+
+    def _fetch_single(entity_id: int) -> tuple[list[Any], list[int], list[Response]]:
+        path = _single_path(endpoint, entity_id)
+        try:
+            response = client.get(
+                path,
+                {},
+                max_retries=ID_WINDOW_MAX_RETRIES,
+                backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
+            )
+        except RetriesExhausted:
+            return [], [entity_id], []
+        if response.status == 404:
+            return [], [], [response]
+        if response.status != 200:
+            raise MalformedResponse(f"{path}: unexpected HTTP {response.status}")
+        records, _ = unpack(response.json, record_key)
+        return records, [], [response]
+
+    records, failed, parts = fetch(ids)
+    return (
+        records,
+        failed,
+        _synthetic_response(client, endpoint, params, record_key, records, failed, parts),
+    )
+
+
+def id_range_pages(
+    client: GammaClient,
+    endpoint: str,
+    base_params: Mapping[str, Any],
+    record_key: str,
+    start: PageState | None = None,
+) -> Iterator[PageResult]:
+    """Request explicit id windows. Page ``seq`` covers ``[lo+(seq-1)*step, ...)``.
+
+    An empty window is stored. A tail scan (no ``hi``) stops after
+    ``empty_stop`` consecutive empty windows. Resume uses ``start.seq`` and
+    does not repeat durable pages.
+    """
+    if record_key not in RECORD_KEYS:
+        raise ValueError(f"unknown record key {record_key!r}")
+    start = start or PageState()
+    lo = int(base_params["lo"])
+    step = int(base_params["step"])
+    if step < 1 or step > 100:
+        raise ValueError(f"id window step must be 1..100, got {step}")
+    hi = None if base_params.get("hi") is None else int(base_params["hi"])
+    tail = bool(base_params.get("tail"))
+    empty_stop = int(base_params.get("empty_stop", 3))
+    closed = base_params.get("closed")
+    if isinstance(closed, str):
+        closed = closed == "true"
+    seq = start.seq
+    index = start.seq
+    empty_run = 0
+
+    while True:
+        window_lo = lo + index * step
+        if hi is not None and window_lo > hi:
+            return
+        window_hi = window_lo + step - 1
+        if hi is not None:
+            window_hi = min(window_hi, hi)
+        ids = list(range(window_lo, window_hi + 1))
+        records, failed, response = _fetch_id_window(client, endpoint, record_key, ids, closed)
+        seq += 1
+        index += 1
+        if tail:
+            if records or failed:
+                empty_run = 0
+                terminal = False
+            else:
+                empty_run += 1
+                terminal = empty_run >= empty_stop
+        else:
+            terminal = hi is not None and window_hi >= hi
+        yield PageResult(
+            seq=seq,
+            endpoint=endpoint,
+            params=_window_params(ids, record_key, closed),
+            record_key=record_key,
+            input_cursor=None,
+            output_cursor=None,
+            offset=window_lo,
+            output_offset=window_hi,
+            records=records,
+            response=response,
+            terminal=terminal,
+            ids_hash=ids_hash(_ids(records)),
+        )
+        if terminal:
+            return
 
 
 def single_event_page(client: GammaClient, event_id: str, seq: int) -> PageResult:

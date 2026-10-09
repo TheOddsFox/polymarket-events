@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -109,14 +110,20 @@ class Ledger:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._conn = sqlite3.connect(path, isolation_level=None, timeout=30.0)
+        # One connection shared by the capture workers. The lock serialises
+        # every use; WAL lets a reader proceed while a writer commits.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(
+            path, isolation_level=None, timeout=30.0, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(SCHEMA)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> Ledger:
         return self
@@ -126,21 +133,24 @@ class Ledger:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._conn
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
-        else:
-            self._conn.execute("COMMIT")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
 
     def _one(self, sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
-        row = self._conn.execute(sql, args).fetchone()
-        return dict(row) if row is not None else None
+        with self._lock:
+            row = self._conn.execute(sql, args).fetchone()
+            return dict(row) if row is not None else None
 
     def _all(self, sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
 
     # Batches ---------------------------------------------------------------------
     def create_batch(
