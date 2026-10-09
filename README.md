@@ -29,7 +29,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 | --- | --- |
 | `make bootstrap` | First run on an empty project: capture everything, load, build, publish. |
 | `make refresh` | Daily incremental run: open events plus recently changed events. |
-| `make reconcile` | Weekly full pass: archived events and by-ID checks for open events. |
+| `make reconcile` | Weekly full pass: all events (open and closed), archived events, and all markets, then by-ID fetches for referenced events the lists did not return. |
 | `make replay` | Load pending raw pages, build, publish. No Gamma calls. |
 | `make validate` | Run dbt tests against the warehouse. Never builds, so it appends no `catalogue_snapshots` row. |
 | `make publish` | Write a release if the last dbt build passed. |
