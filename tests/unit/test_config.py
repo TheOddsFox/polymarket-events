@@ -11,7 +11,9 @@ def test_defaults_match_committed_file() -> None:
     assert settings.gamma.base_url == "https://gamma-api.polymarket.com"
     assert settings.gamma.requests_per_second == 2.0
     assert settings.gamma.read_timeout_s == 60.0
-    assert settings.gamma.max_retries == 5
+    assert settings.gamma.max_retries == 12
+    assert settings.gamma.backoff_base_s == 5.0
+    assert settings.gamma.backoff_cap_s == 300.0
     assert settings.gamma.include_chat is False
     assert settings.load.max_pages_per_run == 200
     assert settings.warehouse_path == root / "data" / "warehouse" / "catalogue.duckdb"

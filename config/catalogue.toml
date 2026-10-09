@@ -10,9 +10,9 @@ base_url = "https://gamma-api.polymarket.com"
 requests_per_second = 2.0
 connect_timeout_s = 10.0
 read_timeout_s = 60.0
-max_retries = 5
-backoff_base_s = 1.0
-backoff_cap_s = 60.0
+max_retries = 12
+backoff_base_s = 5.0
+backoff_cap_s = 300.0
 page_limit = 100
 # Optional expansions. Off by default because they enlarge payloads.
 include_chat = false

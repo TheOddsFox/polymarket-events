@@ -20,9 +20,9 @@ class GammaSettings:
     requests_per_second: float = 2.0
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 60.0
-    max_retries: int = 5
-    backoff_base_s: float = 1.0
-    backoff_cap_s: float = 60.0
+    max_retries: int = 12
+    backoff_base_s: float = 5.0
+    backoff_cap_s: float = 300.0
     page_limit: int = 100
     include_chat: bool = False
     include_template: bool = False

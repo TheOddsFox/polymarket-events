@@ -1,0 +1,56 @@
+#!/bin/sh
+# Re-run bootstrap only when the command crashes (exit 1). Gamma retries exhausted raise out of
+# the CLI, so the process exits 1 and the capturing batch can be resumed. Exit 0 is success.
+# Exit 2 is a handled failure after capture (dbt or publish); retrying would open a new full
+# crawl. Exit 3 is the run lock or a blocked stage. Anything other than 1 stops immediately.
+# Each attempt appends its output and one "attempt N/M exit=RC" line to a timestamped log under
+# .state/logs. BOOTSTRAP_LOG_DIR overrides that directory so tests can stay out of the
+# repository's .state. Relative paths resolve from the repository root.
+set -eu
+cd "$(dirname "$0")/.."
+
+COMMAND=${BOOTSTRAP_COMMAND:-"uv run --locked catalogue refresh --mode bootstrap"}
+MAX_ATTEMPTS=${BOOTSTRAP_MAX_ATTEMPTS:-20}
+RETRY_SLEEP_S=${BOOTSTRAP_RETRY_SLEEP_S:-30}
+LOG_DIR=${BOOTSTRAP_LOG_DIR:-.state/logs}
+
+case "$MAX_ATTEMPTS" in
+  [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+  *)
+    echo "BOOTSTRAP_MAX_ATTEMPTS must be an integer from 1 to 999, got '$MAX_ATTEMPTS'" >&2
+    exit 2
+    ;;
+esac
+
+case "$RETRY_SLEEP_S" in
+  0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+  *)
+    echo "BOOTSTRAP_RETRY_SLEEP_S must be an integer from 0 to 999, got '$RETRY_SLEEP_S'" >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/bootstrap-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+
+attempt=1
+while :; do
+  rc=0
+  sh -c "$COMMAND" >>"$LOG" 2>&1 || rc=$?
+  printf '%s attempt %s/%s exit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$attempt" "$MAX_ATTEMPTS" "$rc" >>"$LOG"
+
+  if [ "$rc" -eq 0 ]; then
+    exit 0
+  fi
+  # Only an uncaught crash is worth another capture. Exit 2 would recrawl Gamma after dbt
+  # or publish already failed. Exit 3 is the lock or a blocked stage.
+  if [ "$rc" -ne 1 ]; then
+    exit "$rc"
+  fi
+  if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+    exit "$rc"
+  fi
+  sleep "$RETRY_SLEEP_S"
+  attempt=$((attempt + 1))
+done
