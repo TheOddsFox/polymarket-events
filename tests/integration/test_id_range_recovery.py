@@ -16,7 +16,8 @@ import pytest
 
 from fakes.fake_gamma import FakeGamma, Rule
 from fakes.harness import FIXED_NOW, build_runtime
-from fakes.world import demo_world
+from fakes.world import demo_world, event_stub, make_event, make_market
+from oddsfox_catalogue.capture import runner
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.reader import iter_scan_pages
 from oddsfox_catalogue.capture.runner import (
@@ -269,3 +270,60 @@ def test_resumed_state_carries_the_trailing_empty_run(tmp_path: Path) -> None:
 
     assert state.seq == 3
     assert state.empty_run == 2
+
+
+class _Crash(RuntimeError):
+    """Stands in for a crash just before a scan starts, after its plan is committed."""
+
+
+def _world_with_missing_event() -> object:
+    """Demo world with one event hidden from the id scans and one market whose event is gone.
+
+    The hidden event needs a stage-1 id fetch. The ghost id is missing after stage 1, so
+    it needs a stage-2 single-id fetch.
+    """
+    world = demo_world()
+    hidden = make_event("909", "Hidden referenced event")
+    hidden["markets"] = [make_market("9001", "Hidden market?", event_stub=event_stub(hidden))]
+    world.add_event(hidden)
+    ghost = {"id": "999999", "ticker": None, "slug": None, "title": "gone"}
+    world.add_direct_market(make_market("9002", "Ghost market?", event_stub=ghost))
+    return world
+
+
+@pytest.mark.parametrize("crash_at", ["events_by_id_0001", "events_by_id_single_0001"])
+def test_rebuild_restores_each_follow_up_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_at: str
+) -> None:
+    """A follow-up stage planned before the crash is restored even if none of its scans ran."""
+    crash_root = tmp_path / "crash"
+    runtime, _ = build_runtime(crash_root, FakeGamma(_world_with_missing_event()), env=SERIAL)
+    real_run_scan = runner._run_scan
+
+    def crash_before_scan(rt, batch, row, *args, **kwargs):
+        if row["scan_name"] == crash_at:
+            raise _Crash(crash_at)
+        return real_run_scan(rt, batch, row, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_run_scan", crash_before_scan)
+    try:
+        with pytest.raises(_Crash):
+            run_capture(runtime, "bootstrap")
+        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
+        planned = {scan["scan_name"] for scan in runtime.ledger.list_scans(batch_id)}
+        settings = runtime.settings
+    finally:
+        runtime.ledger.close()
+    assert crash_at in planned
+
+    for suffix in ("", "-wal", "-shm"):
+        (crash_root / ".state" / f"ledger.sqlite{suffix}").unlink(missing_ok=True)
+    fresh = Ledger(crash_root / ".state" / "ledger.sqlite")
+    try:
+        rebuild_from_raw(settings, fresh)
+        restored = {
+            scan["scan_name"] for scan in fresh.list_scans(fresh.list_batches()[0]["batch_id"])
+        }
+    finally:
+        fresh.close()
+    assert restored == planned
