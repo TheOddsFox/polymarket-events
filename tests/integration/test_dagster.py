@@ -7,15 +7,16 @@ import shutil
 from pathlib import Path
 
 import duckdb
+import pytest
 from dagster import DagsterInstance, job, op
 from dagster._core.run_coordinator import QueuedRunCoordinator
 
-from fakes.built_warehouse import capture_and_load
+from fakes.built_warehouse import build_warehouse, copy_built
 from fakes.fake_gamma import FakeGamma
 from fakes.harness import make_settings
 from fakes.world import demo_world
 from oddsfox_catalogue.orchestration.definitions import build_definitions
-from oddsfox_catalogue.pipeline import dbt_stage, open_event_drop_warning
+from oddsfox_catalogue.pipeline import open_event_drop_warning
 from oddsfox_catalogue.publish import current_release
 
 REPO = Path(__file__).resolve().parents[2]
@@ -55,9 +56,16 @@ def _snapshot_count(warehouse: Path) -> int:
         con.close()
 
 
-def test_validate_job_runs_dbt_test_and_appends_no_snapshot(tmp_path: Path) -> None:
-    settings = capture_and_load(tmp_path)
-    assert dbt_stage(settings, ["build"]).returncode == 0
+@pytest.fixture(scope="module")
+def built_root(tmp_path_factory) -> Path:
+    """One built warehouse for the module. Tests that need one copy it first."""
+    root = tmp_path_factory.mktemp("dagster_built")
+    build_warehouse(root)
+    return root
+
+
+def test_validate_job_runs_dbt_test_and_appends_no_snapshot(built_root, tmp_path: Path) -> None:
+    settings = copy_built(built_root, tmp_path)
     before = _snapshot_count(settings.warehouse_path)
     assert before >= 1
 

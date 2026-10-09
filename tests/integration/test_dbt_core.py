@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from fakes.built_warehouse import capture_and_load
+from fakes.built_warehouse import capture_and_load, copy_built
 from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
 from fakes.harness import FIXED_NOW, build_runtime
@@ -119,9 +119,9 @@ def _state(settings: Settings) -> dict[str, list[tuple]]:
     return {t: _snapshot(settings.warehouse_path, t, k) for t, k in STATE_TABLES.items()}
 
 
-def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) -> None:
-    settings = capture_and_load(tmp_path)
-    assert run_dbt(["build"], settings.warehouse_path, tmp_path).returncode == 0
+def test_incremental_build_matches_full_rebuild_after_a_closure(built, tmp_path: Path) -> None:
+    # The built copy already holds the bootstrap build, the baseline for the incremental runs.
+    settings = copy_built(built[0], tmp_path)
 
     # Event 202 closes between batches. Daily capture must fetch it by ID and reflect it.
     closed_world = demo_world()
@@ -183,10 +183,9 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(tmp_path: Path) 
     assert after_incremental == _state(settings), "incremental state must equal a full rebuild"
 
 
-def test_count_regression_blocks_the_build(tmp_path: Path) -> None:
+def test_count_regression_blocks_the_build(built, tmp_path: Path) -> None:
     """A sudden drop in open events must fail the build, so publication never runs on it."""
-    settings = capture_and_load(tmp_path)
-    assert run_dbt(["build"], settings.warehouse_path, tmp_path).returncode == 0
+    settings = copy_built(built[0], tmp_path)
 
     closed_world = demo_world()
     closed_world.events["202"]["closed"] = True
@@ -225,8 +224,8 @@ def test_unresolved_event_reference_blocks_the_build(tmp_path: Path) -> None:
     assert "assert_unresolved_event_refs_within_limit" in result.stdout
 
 
-def test_demo_world_resolves_every_event_reference(tmp_path: Path) -> None:
+def test_demo_world_resolves_every_event_reference(built, tmp_path: Path) -> None:
     """Control for the test above: the unmodified demo world builds cleanly."""
-    settings = capture_and_load(tmp_path)
+    settings = copy_built(built[0], tmp_path)
     result = run_dbt(["build"], settings.warehouse_path, tmp_path)
     assert result.returncode == 0, result.stdout[-3000:]

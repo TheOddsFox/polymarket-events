@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from fakes.dbt_run import run_dbt
@@ -34,3 +35,13 @@ def build_warehouse(root: Path) -> Settings:
     result = run_dbt(["build"], settings.warehouse_path, root)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     return settings
+
+
+def copy_built(built_root: Path, dest: Path) -> Settings:
+    """Copy a built project root (raw pages, ledger, dlt state, warehouse, dbt work dir) to dest.
+
+    Modules build once in a module-scoped fixture. A test that mutates state works on its own
+    copy, so a tamper or closure in one test cannot change the input of the next.
+    """
+    shutil.copytree(built_root, dest, dirs_exist_ok=True)
+    return make_settings(dest)

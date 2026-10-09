@@ -12,7 +12,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from fakes.built_warehouse import build_warehouse, capture_and_load
+from fakes.built_warehouse import build_warehouse, capture_and_load, copy_built
 from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
 from fakes.harness import FIXED_NOW, build_runtime, make_settings
@@ -34,16 +34,24 @@ REPO = Path(__file__).resolve().parents[2]
 THRESHOLD = '{"max_open_events_drop_pct": 0.9}'
 
 
-def test_rebuild_from_raw_reproduces_the_live_warehouse(tmp_path: Path) -> None:
-    settings = build_warehouse(tmp_path)
+@pytest.fixture(scope="module")
+def built_root(tmp_path_factory) -> Path:
+    """One built warehouse for the module. Each test copies it before it changes anything."""
+    root = tmp_path_factory.mktemp("ops_built")
+    build_warehouse(root)
+    return root
+
+
+def test_rebuild_from_raw_reproduces_the_live_warehouse(built_root, tmp_path: Path) -> None:
+    settings = copy_built(built_root, tmp_path)
     report = rebuild_and_verify(settings)
     assert report.matched, report.mismatches
     for table in VERIFIED_TABLES:
         assert report.tables[table]["live"] is not None, f"{table} missing from live warehouse"
 
 
-def test_rebuild_detects_a_tampered_live_warehouse(tmp_path: Path) -> None:
-    settings = build_warehouse(tmp_path)
+def test_rebuild_detects_a_tampered_live_warehouse(built_root, tmp_path: Path) -> None:
+    settings = copy_built(built_root, tmp_path)
     con = duckdb.connect(str(settings.warehouse_path))
     try:
         con.execute("UPDATE core.events_current SET title = 'tampered' WHERE event_id = '101'")
@@ -54,9 +62,9 @@ def test_rebuild_detects_a_tampered_live_warehouse(tmp_path: Path) -> None:
     assert any(m.startswith("core.events_current") for m in report.mismatches)
 
 
-def test_replay_order_does_not_change_the_result(tmp_path: Path) -> None:
+def test_replay_order_does_not_change_the_result(built_root, tmp_path: Path) -> None:
     """Two batches loaded in reverse order must give the same tables as the normal order."""
-    settings = build_warehouse(tmp_path)
+    settings = copy_built(built_root, tmp_path)
     closed_world = demo_world()
     closed_world.events["202"]["closed"] = True
     closed_world.events["202"]["updatedAt"] = "2026-10-08T07:00:00Z"
@@ -195,10 +203,10 @@ def _close_event_202_and_load(settings) -> None:
     load_stage(settings)
 
 
-def test_open_event_drop_in_warn_band_builds_and_is_recorded(tmp_path: Path) -> None:
+def test_open_event_drop_in_warn_band_builds_and_is_recorded(built_root, tmp_path: Path) -> None:
     """A 50% drop sits between warn (40%) and error (60%): the build passes and says so."""
-    settings = capture_and_load(tmp_path)
-    assert dbt_stage(settings, ["build"]).returncode == 0  # first snapshot, nothing to compare
+    # The built copy already holds the first snapshot (two open events), the baseline to compare.
+    copy_built(built_root, tmp_path)
 
     tolerant = make_settings(
         tmp_path,
@@ -220,10 +228,9 @@ def test_open_event_drop_in_warn_band_builds_and_is_recorded(tmp_path: Path) -> 
     assert counts["open_events_drop_pct"] == 50.0
 
 
-def test_open_event_drop_above_error_fails_the_stage(tmp_path: Path) -> None:
+def test_open_event_drop_above_error_fails_the_stage(built_root, tmp_path: Path) -> None:
     """With the default 10% error cap, the same 50% drop fails the build and is recorded."""
-    settings = capture_and_load(tmp_path)
-    assert dbt_stage(settings, ["build"]).returncode == 0
+    settings = copy_built(built_root, tmp_path)
     _close_event_202_and_load(settings)
 
     failed = dbt_stage(settings, ["build"])
