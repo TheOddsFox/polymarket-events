@@ -44,6 +44,9 @@ jobs:
       - name: Capture and crash recovery (after_page_rename, after_ledger_commit, expired cursor)
         run: uv run pytest -q tests/integration/test_capture.py
 
+      - name: Capture worker pool (shared rate limit, sibling drain)
+        run: uv run pytest -q tests/integration/test_capture_pool.py
+
       - name: Loader (duplicates, closures, schema drift, mid_dlt_load, before_registry)
         run: uv run pytest -q tests/integration/test_load.py
 
