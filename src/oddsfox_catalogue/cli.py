@@ -40,12 +40,18 @@ Handler = Callable[[argparse.Namespace], int]
 
 
 def configure_logging() -> None:
-    """Send INFO and above to stderr. Library calls stay quiet until the CLI starts."""
+    """Send INFO and above to stderr. Library calls stay quiet until the CLI starts.
+
+    httpx logs the full request URL at INFO, and a keyset URL contains the page cursor.
+    Keep that logger at WARNING so cursors stay out of the operator log.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @contextmanager

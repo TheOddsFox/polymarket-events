@@ -1,10 +1,17 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
-from oddsfox_catalogue.cli import main
+from oddsfox_catalogue.cli import configure_logging, main
 from oddsfox_catalogue.runlock import RunBusy, run_lock
+
+
+def test_http_client_does_not_log_request_urls() -> None:
+    configure_logging()
+    assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
 
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
