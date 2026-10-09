@@ -134,15 +134,13 @@ class Ledger:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            started = False
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                started = True
                 yield self._conn
                 self._conn.execute("COMMIT")
-                started = False
             except BaseException:
-                if started:
+                # Ask SQLite, not a flag: a signal can land after BEGIN or after COMMIT.
+                if self._conn.in_transaction:
                     self._conn.execute("ROLLBACK")
                 raise
 

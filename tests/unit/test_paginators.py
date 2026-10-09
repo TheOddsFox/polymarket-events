@@ -9,6 +9,7 @@ from fakes.harness import FakeClock
 from oddsfox_catalogue.config import GammaSettings
 from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse, ScanFailed
 from oddsfox_catalogue.gamma.paginators import (
+    ID_WINDOW_MAX_RETRIES,
     PageState,
     keyset_pages,
     offset_pages,
@@ -169,10 +170,26 @@ def test_single_event_404_is_an_empty_terminal_page() -> None:
     assert page.record_count == 0 and page.terminal and page.http_status == 404
 
 
-def test_single_event_must_describe_the_requested_id() -> None:
+def test_single_event_that_describes_another_id_is_quarantined() -> None:
+    """A 200 for another record does not answer the question. The id is quarantined."""
     client = _client(lambda r: httpx.Response(200, json={"id": "78", "title": "wrong"}))
-    with pytest.raises(MalformedResponse):
-        single_event_page(client, "77", seq=1)
+    page = single_event_page(client, "77", seq=1)
+    assert page.terminal and page.records == []
+    assert page.response.json["fetch_failed"] == [{"id": "77", "reason": "fetch_failed"}]
+
+
+def test_single_event_that_keeps_failing_uses_the_id_window_policy() -> None:
+    """Retries stop at the id-window budget, then the id is quarantined. Nothing raises."""
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, json={"error": "down"})
+
+    page = single_event_page(_client(handler), "77", seq=1)
+    assert calls["n"] == ID_WINDOW_MAX_RETRIES + 1
+    assert page.terminal and page.records == []
+    assert page.response.json["fetch_failed"] == [{"id": "77", "reason": "fetch_failed"}]
 
 
 def test_single_event_ids_must_be_numeric() -> None:

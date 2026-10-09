@@ -188,6 +188,23 @@ def _all_complete(scans: list[dict[str, Any]]) -> bool:
     return all(s["status"] == "complete" for s in scans)
 
 
+OPEN_MARKETS_SCAN = "markets_keyset_open"
+CLOSED_MARKET_WINDOW_PREFIX = "markets_closed_ids_"
+
+
+def _held_closed_windows(scans: list[dict[str, Any]]) -> set[str]:
+    """Scan IDs of closed-market windows that must wait for the open-market crawl.
+
+    A market that closes during the batch is missed if a closed window passes it before it
+    closes and the open crawl passes it after it closes. While the open crawl is incomplete,
+    the closed windows are held, so each market is seen while open or after it has closed.
+    """
+    open_scan = _latest_by_name(scans).get(OPEN_MARKETS_SCAN)
+    if open_scan is None or open_scan["status"] == "complete":
+        return set()
+    return {s["scan_id"] for s in scans if s["scan_name"].startswith(CLOSED_MARKET_WINDOW_PREFIX)}
+
+
 def _durable_records(
     rt: CaptureRuntime,
     batch: dict[str, Any],
@@ -784,19 +801,24 @@ def _run_ready_scans(
         # A second SIGTERM raises inside shutdown. Keep joining until the
         # workers have finished, then surface that signal to the stage row.
         interrupted: BaseException | None = None
-        while True:
-            try:
-                executor.shutdown(wait=True, cancel_futures=True)
-                break
-            except BaseException as exc:
-                if exc.__class__.__name__ != "Terminated":
-                    raise
-                stop.set()
-                interrupted = exc
-        rt.client._limiter.bind_stop(None)
-        for client in spawned:
-            client.close()
-        _reopen_unstarted(rt, rows, started)
+        try:
+            while True:
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    break
+                except BaseException as exc:
+                    if exc.__class__.__name__ != "Terminated":
+                        raise
+                    stop.set()
+                    interrupted = exc
+        finally:
+            # Cleanup also runs when shutdown fails with something other than Terminated.
+            rt.client._limiter.bind_stop(None)
+            for client in spawned:
+                client.close()
+            with started_lock:
+                ran = set(started)
+            _reopen_unstarted(rt, rows, ran)
         if interrupted is not None:
             raise interrupted
 
@@ -822,10 +844,12 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
                 progressed = _advance_plan(rt, batch_id)
                 batch = rt.ledger.get_batch(batch_id)
                 assert batch is not None
+                listed = rt.ledger.list_scans(batch_id)
+                held = _held_closed_windows(listed)
                 runnable = [
                     s
-                    for s in rt.ledger.list_scans(batch_id)
-                    if s["status"] in {"running", "failed"}
+                    for s in listed
+                    if s["status"] in {"running", "failed"} and s["scan_id"] not in held
                 ]
                 if runnable:
                     runnable.sort(key=lambda s: (s["plan_order"], s["attempt"]))

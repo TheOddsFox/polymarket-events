@@ -31,11 +31,11 @@ from oddsfox_catalogue.gamma.scans import list_scans_for
 TESTS_DIR = Path(__file__).resolve().parents[1]
 CHILD = TESTS_DIR / "fakes" / "capture_child.py"
 BOOTSTRAP_LIST_SCANS = [
+    "markets_keyset_open",
     "events_ids_0001",
     "events_ids_tail",
     "markets_closed_ids_0001",
     "markets_closed_ids_tail",
-    "markets_keyset_open",
 ]
 ONE_PER_PAGE = {"CATALOGUE_GAMMA_PAGE_LIMIT": "1"}
 

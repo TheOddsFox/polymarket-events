@@ -170,12 +170,17 @@ def _partitions(
 def id_range_plan(
     gamma: GammaSettings, capture: CaptureSettings, client: GammaClient
 ) -> list[ScanSpec]:
-    """Event and closed-market id ranges, optional tails, then the open-market keyset."""
+    """Open-market keyset first, then event and closed-market id ranges and their tails.
+
+    The open crawl is first in plan order, and the runner holds the closed-market windows until
+    it completes. A market is then seen by the open crawl while it is open, or by a closed window
+    once it has closed. A closed window that ran earlier could miss a market that closed mid-batch.
+    """
     event_mark, event_tail = _cap(_high_water(client, "/events", "events"), capture.max_id_override)
     market_mark, market_tail = _cap(
         _high_water(client, "/markets", "markets"), capture.max_id_override
     )
-    scans: list[ScanSpec] = []
+    scans: list[ScanSpec] = [markets_keyset_open(gamma)]
     event_flags = _event_flags(gamma)
     scans.extend(
         _partitions(
@@ -223,7 +228,6 @@ def id_range_plan(
                 tail=True,
             )
         )
-    scans.append(markets_keyset_open(gamma))
     return scans
 
 

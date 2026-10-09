@@ -96,6 +96,15 @@ def _ids(records: list[Any]) -> list[str]:
     return [str(r["id"]) for r in records if isinstance(r, dict) and "id" in r]
 
 
+def _describes(records: list[Any], entity_id: str) -> bool:
+    """True when a single-entity body holds exactly one record, and it is ``entity_id``."""
+    return (
+        len(records) == 1
+        and isinstance(records[0], dict)
+        and str(records[0].get("id")) == entity_id
+    )
+
+
 def keyset_pages(
     client: GammaClient,
     endpoint: str,
@@ -333,6 +342,8 @@ def _fetch_id_window(
             if response.status != 200:
                 raise MalformedResponse(f"{path}: unexpected HTTP {response.status}")
             records, _ = unpack(response.json, record_key)
+            if not _describes(records, str(entity_id)):
+                raise MalformedResponse(f"{path}: body does not describe {entity_id}")
         except (RetriesExhausted, MalformedResponse):
             # Still failing for this id alone: quarantine it so the window can finish.
             return [], [entity_id], []
@@ -419,19 +430,31 @@ def id_range_pages(
 
 
 def single_event_page(client: GammaClient, event_id: str, seq: int) -> PageResult:
-    """Fetch ``/events/{id}``. A 404 becomes a terminal, empty, recorded page."""
+    """Fetch ``/events/{id}``. A 404 is a terminal, empty page. A failing id is quarantined.
+
+    Retries use the id-window policy, so a bad id cannot stall the batch on the global
+    retry budget. An id that still fails becomes a ``fetch_failed`` body, as a window does.
+    """
     if not event_id.isdigit():
         raise ValueError(f"event ids are numeric: {event_id!r}")
     endpoint = f"/events/{event_id}"
-    response = client.get(endpoint, {})
-    if response.status == 404:
-        records: list[Any] = []
-    elif response.status == 200:
-        records, _ = unpack(response.json, "events")
-        if len(records) != 1 or str(records[0].get("id")) != event_id:
-            raise MalformedResponse(f"{endpoint}: body does not describe event {event_id}")
-    else:
-        raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
+    records: list[Any] = []
+    try:
+        response = client.get(
+            endpoint,
+            {},
+            max_retries=ID_WINDOW_MAX_RETRIES,
+            backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
+        )
+        if response.status == 200:
+            records, _ = unpack(response.json, "events")
+            if not _describes(records, event_id):
+                raise MalformedResponse(f"{endpoint}: body does not describe event {event_id}")
+        elif response.status != 404:
+            raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
+    except (RetriesExhausted, MalformedResponse):
+        records = []
+        response = _synthetic_response(client, endpoint, {}, "events", [], [int(event_id)], [])
     return PageResult(
         seq=seq,
         endpoint=endpoint,

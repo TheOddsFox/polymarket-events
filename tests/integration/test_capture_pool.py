@@ -12,6 +12,7 @@ import pytest
 from fakes.fake_gamma import FakeGamma, Rule
 from fakes.harness import build_runtime
 from fakes.world import World, demo_world, event_stub, make_event, make_market
+from oddsfox_catalogue.capture import runner
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.gamma.http import MalformedResponse
@@ -152,3 +153,31 @@ def test_two_threads_commit_on_one_ledger(tmp_path: Path) -> None:
         thread.join()
     ledger.close()
     assert errors == []
+
+
+def test_pool_runs_two_scans_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two scans must be in flight together. A serial run breaks the barrier and fails."""
+    barrier = threading.Barrier(2, timeout=5)
+    lock = threading.Lock()
+    entered = 0
+    real_run_scan = runner._run_scan
+
+    def gated(rt, batch, row, *args, **kwargs):
+        nonlocal entered
+        with lock:
+            entered += 1
+            first_two = entered <= 2
+        if first_two:
+            barrier.wait()
+        return real_run_scan(rt, batch, row, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_run_scan", gated)
+    runtime, _ = build_runtime(
+        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "4"}
+    )
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        assert not barrier.broken
+    finally:
+        runtime.ledger.close()

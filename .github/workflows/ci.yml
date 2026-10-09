@@ -44,7 +44,13 @@ jobs:
       - name: Capture and crash recovery (after_page_rename, after_ledger_commit, expired cursor)
         run: uv run pytest -q tests/integration/test_capture.py
 
-      - name: Capture worker pool (shared rate limit, sibling drain)
+      - name: Id-range recovery (rebuild keeps planned scans, tails end, pool reopens, quarantine)
+        run: uv run pytest -q tests/integration/test_id_range_recovery.py
+
+      - name: Bootstrap wrapper (retries only exit 1, signals stop, attempt cap)
+        run: uv run pytest -q tests/integration/test_bootstrap_until_done.py
+
+      - name: Capture worker pool (shared rate limit, sibling drain, concurrency)
         run: uv run pytest -q tests/integration/test_capture_pool.py
 
       - name: Loader (duplicates, closures, schema drift, mid_dlt_load, before_registry)

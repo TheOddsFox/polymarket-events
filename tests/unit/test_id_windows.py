@@ -136,3 +136,21 @@ def test_id_window_retry_after_is_capped_at_the_window_cap() -> None:
 
     assert response.status == 200
     assert clock.sleeps == [30.0]
+
+
+def test_single_id_that_returns_another_record_is_quarantined() -> None:
+    """A 200 for id 7 that describes record 8 does not answer for 7. It is quarantined."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/events/keyset":
+            return httpx.Response(500, json={"error": "down"})
+        return httpx.Response(200, json={"id": "8", "title": "other"})
+
+    client, _ = _client(handler)
+    try:
+        (page,) = id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events")
+    finally:
+        client.close()
+
+    assert page.records == []
+    assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]
