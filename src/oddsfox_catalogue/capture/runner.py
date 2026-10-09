@@ -190,19 +190,45 @@ def _all_complete(scans: list[dict[str, Any]]) -> bool:
 
 OPEN_MARKETS_SCAN = "markets_keyset_open"
 CLOSED_MARKET_WINDOW_PREFIX = "markets_closed_ids_"
+ID_RANGE_MODES = frozenset({"bootstrap", "reconcile"})
+
+
+def _open_crawl_complete(latest: dict[str, dict[str, Any]]) -> bool:
+    open_scan = latest.get(OPEN_MARKETS_SCAN)
+    return open_scan is not None and open_scan["status"] == "complete"
 
 
 def _held_closed_windows(scans: list[dict[str, Any]]) -> set[str]:
     """Scan IDs of closed-market windows that must wait for the open-market crawl.
 
     A market that closes during the batch is missed if a closed window passes it before it
-    closes and the open crawl passes it after it closes. While the open crawl is incomplete,
+    closes and the open crawl passes it after it closes. While the open crawl is not complete,
     the closed windows are held, so each market is seen while open or after it has closed.
+    A batch with no open crawl holds its closed windows too: nothing else covers them.
     """
-    open_scan = _latest_by_name(scans).get(OPEN_MARKETS_SCAN)
-    if open_scan is None or open_scan["status"] == "complete":
+    if _open_crawl_complete(_latest_by_name(scans)):
         return set()
     return {s["scan_id"] for s in scans if s["scan_name"].startswith(CLOSED_MARKET_WINDOW_PREFIX)}
+
+
+def _unsafe_to_resume(scans: list[dict[str, Any]]) -> bool:
+    """True when an id-range batch's plan cannot show that every market will be seen.
+
+    Two shapes qualify. A batch planned before the market-race fix runs its closed windows ahead
+    of the open crawl, and a closed window that finished first can pass a market the crawl never
+    returns. A batch with scans but no open crawl has nothing to cover its closed windows. A batch
+    with no scans yet is planned on resume as usual.
+    """
+    if not scans:
+        return False
+    latest = _latest_by_name(scans)
+    open_scan = latest.get(OPEN_MARKETS_SCAN)
+    if open_scan is None:
+        return True
+    return any(
+        name.startswith(CLOSED_MARKET_WINDOW_PREFIX) and s["plan_order"] < open_scan["plan_order"]
+        for name, s in latest.items()
+    )
 
 
 def _durable_records(
@@ -352,13 +378,36 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
     return False
 
 
+def _resume_orphaned_attempts(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
+    """Start the successor of an attempt that was abandoned but never replaced.
+
+    _abandon writes the abandoned status and the successor in two commits. A signal between
+    them leaves an abandoned latest attempt. It is never runnable, so it would hold its stage.
+    """
+    for row in _latest_by_name(rt.ledger.list_scans(batch["batch_id"])).values():
+        if row["status"] != "abandoned":
+            continue
+        successor = _scan_row(
+            batch["batch_id"],
+            scan_spec_from_row(row),
+            attempt=row["attempt"] + 1,
+            plan_order=row["plan_order"],
+            started_at=iso_utc(rt.now()),
+        )
+        rt.ledger.add_scan_attempt(successor)
+        _mark_planned(rt, batch, [successor])
+        logger.info("capture scan %s resumed as attempt %s", row["scan_name"], successor["attempt"])
+
+
 def _finalise_if_complete(rt: CaptureRuntime, batch_id: str) -> str:
     batch = rt.ledger.get_batch(batch_id)
     assert batch is not None
     if batch["status"] != "capturing":
         return batch["status"]
     latest = _latest_by_name(rt.ledger.list_scans(batch_id))
-    if batch["plan_stage"] == 2 and _all_complete(list(latest.values())):
+    # A market-list batch is captured only once its open-market crawl has completed.
+    crawl_ok = batch["mode"] not in ID_RANGE_MODES or _open_crawl_complete(latest)
+    if batch["plan_stage"] == 2 and _all_complete(list(latest.values())) and crawl_ok:
         finished = iso_utc(rt.now())
         rt.ledger.set_batch_status(batch_id, "captured", finished)
         write_marker(
@@ -755,11 +804,12 @@ def _run_ready_scans(
 ) -> None:
     """Run every runnable scan in this stage, up to ``capture.workers`` at once.
 
-    A failure or ``Terminated`` sets the stop event. Scans that have not
-    started are left ``running`` and are not fetched, and a previously failed
-    scan the pool never started is reopened as ``running``. A scan already on a
-    page finishes that page, then returns still ``running`` so resume continues
-    it. The scan that raised is marked failed by ``_run_scan``.
+    A failure or a signal sets the stop event. Scans that have not started are
+    left ``running`` and are not fetched, and a previously failed scan the pool
+    never started is reopened as ``running``. A scan already on a page finishes
+    that page, then returns still ``running`` so resume continues it. The scan
+    that raised is marked failed by ``_run_scan``. The drain waits for every
+    worker, even if more signals arrive, and then re-raises the first signal.
     """
     stop = threading.Event()
     worker_count = min(rt.settings.capture.workers, len(rows))
@@ -798,8 +848,9 @@ def _run_ready_scans(
             future.cancel()
         raise
     finally:
-        # A second SIGTERM raises inside shutdown. Keep joining until the
-        # workers have finished, then surface that signal to the stage row.
+        # Keep joining until every worker has stopped, whatever signal arrives. Releasing the
+        # ledger or the run lock while a worker still runs would let a second run write beside
+        # it. The first signal is re-raised once the drain is complete.
         interrupted: BaseException | None = None
         try:
             while True:
@@ -807,18 +858,23 @@ def _run_ready_scans(
                     executor.shutdown(wait=True, cancel_futures=True)
                     break
                 except BaseException as exc:
-                    if exc.__class__.__name__ != "Terminated":
-                        raise
                     stop.set()
-                    interrupted = exc
+                    if interrupted is None:
+                        interrupted = exc
         finally:
-            # Cleanup also runs when shutdown fails with something other than Terminated.
             rt.client._limiter.bind_stop(None)
             for client in spawned:
-                client.close()
+                try:
+                    client.close()
+                except Exception:
+                    # A failing close must not skip the other clients or the reopen below.
+                    logger.warning("closing a capture worker client failed", exc_info=True)
             with started_lock:
                 ran = set(started)
-            _reopen_unstarted(rt, rows, ran)
+            try:
+                _reopen_unstarted(rt, rows, ran)
+            except Exception:
+                logger.warning("reopening unstarted scans failed; resume runs them", exc_info=True)
         if interrupted is not None:
             raise interrupted
 
@@ -834,6 +890,15 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
     summary: CaptureSummary | None = None
     try:
         resumable = rt.ledger.find_resumable_batch(mode)
+        if (
+            resumable is not None
+            and mode in ID_RANGE_MODES
+            and _unsafe_to_resume(rt.ledger.list_scans(resumable["batch_id"]))
+        ):
+            reason = "not resumed: its plan cannot show that every market will be seen"
+            logger.warning("abandoning batch %s: %s", resumable["batch_id"], reason)
+            abandon_batch(rt.ledger, resumable["batch_id"], rt.now(), reason)
+            resumable = None
         resumed = resumable is not None
         batch = resumable if resumable is not None else _start_batch(rt, mode)
         batch_id = batch["batch_id"]
@@ -844,6 +909,7 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
                 progressed = _advance_plan(rt, batch_id)
                 batch = rt.ledger.get_batch(batch_id)
                 assert batch is not None
+                _resume_orphaned_attempts(rt, batch)
                 listed = rt.ledger.list_scans(batch_id)
                 held = _held_closed_windows(listed)
                 runnable = [

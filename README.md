@@ -41,7 +41,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 
 Each stage takes the run lock. A second writer fails immediately (exit 3) instead of racing.
 Refresh commands log scan progress and Gamma retries to stderr. The JSON result is still printed to stdout when the command finishes.
-A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. SIGHUP, SIGTERM, and SIGINT also stop immediately: the wrapper logs the signal and exits 128 plus the signal number. A SIGHUP or SIGTERM that arrives while a catalogue stage is running is recorded on that stage's row, and the process exits the same way. A pooled capture stops waiting on a rate-limit pause and leaves unfinished scans to resume. Logs are written under `.state/logs/`.
+A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. SIGHUP, SIGTERM, and SIGINT also stop immediately: the wrapper logs the signal and exits 128 plus the signal number. A SIGHUP or SIGTERM that arrives while a catalogue stage is running is recorded on that stage's row, and the process exits the same way. A pooled capture stops waiting on a rate-limit pause. Unstarted scans are not fetched, and each running scan finishes its current page and stays `running` for resume. Repeated signals do not cut the drain short: the first signal is re-raised once every worker has stopped. On resume, a market batch whose plan does not put the open-market crawl first, or that has no open-market crawl, is abandoned rather than resumed, and its raw pages are kept. Logs are written under `.state/logs/`.
 Every stage writes a row to `stage_runs` in the ledger (status, counts, error).
 
 Lower-level commands: `uv run catalogue --help`.
@@ -125,8 +125,8 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
   a high-water mark read once at batch start. Closed-market windows wait until the open crawl
   completes, so a market that closes mid-batch is captured by one of them. By-ID lookups fill in
   events referenced from markets that those scans did not return. A window that exhausts its
-  retries is split in half until single ids remain. A single id that still fails is quarantined as
-  `fetch_failed`. The same applies to a by-ID lookup, and a 200 that describes a different record
+  retries is split in half until single ids remain. A one-id window that fails in any other way is
+  answered by ID instead. A single id that still fails is quarantined as `fetch_failed`. The same applies to a by-ID lookup, and a 200 that describes a different record
   counts as a failure. A 404 is recorded as absent, not failed. A non-retryable error on a
   multi-id window fails the scan.
 - Nested `market.events` entries are references only. They are never treated as full events.

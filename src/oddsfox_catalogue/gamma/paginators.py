@@ -311,9 +311,16 @@ def _fetch_id_window(
                 max_retries=ID_WINDOW_MAX_RETRIES,
                 backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
             )
-        except RetriesExhausted:
+            if response.status != 200:
+                raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
+            records, cursor = unpack(response.json, record_key)
+            _reject_window_mismatch(endpoint, wanted, records, cursor)
+        except (RetriesExhausted, MalformedResponse) as exc:
             if len(wanted) == 1:
+                # A one-id window that cannot answer is answered by ID, as after bisection.
                 return _fetch_single(wanted[0])
+            if isinstance(exc, MalformedResponse):
+                raise
             mid = len(wanted) // 2
             left_records, left_failed, left_parts = fetch(wanted[:mid])
             right_records, right_failed, right_parts = fetch(wanted[mid:])
@@ -322,10 +329,6 @@ def _fetch_id_window(
                 left_failed + right_failed,
                 left_parts + right_parts,
             )
-        if response.status != 200:
-            raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
-        records, cursor = unpack(response.json, record_key)
-        _reject_window_mismatch(endpoint, wanted, records, cursor)
         return records, [], [response]
 
     def _fetch_single(entity_id: int) -> tuple[list[Any], list[int], list[Response]]:

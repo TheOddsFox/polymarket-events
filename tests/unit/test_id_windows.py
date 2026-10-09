@@ -154,3 +154,21 @@ def test_single_id_that_returns_another_record_is_quarantined() -> None:
 
     assert page.records == []
     assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]
+
+
+def test_a_single_id_window_with_a_hard_error_is_quarantined() -> None:
+    """A one-id window answered with a hard error gets the by-ID answer, not a failed scan."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/events/keyset":
+            return httpx.Response(400, json={"error": "bad request"})
+        return httpx.Response(500, json={"error": "down"})
+
+    client, _ = _client(handler)
+    try:
+        (page,) = id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events")
+    finally:
+        client.close()
+
+    assert page.records == []
+    assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]

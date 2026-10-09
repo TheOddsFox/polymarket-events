@@ -114,8 +114,21 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
         runtime.ledger.close()
 
 
+def _two_event_world() -> World:
+    world = World()
+    for event_id in ("1", "2"):
+        event = make_event(event_id, f"Event {event_id}")
+        event["markets"] = [
+            make_market(event_id, f"Market {event_id}", event_stub=event_stub(event))
+        ]
+        world.add_event(event)
+    return world
+
+
 def test_a_scan_that_has_not_started_is_not_fetched(tmp_path: Path) -> None:
-    fake = FakeGamma(_tiny_world())
+    # Two events, so the first events window covers two ids. A one-id window that fails is
+    # answered by ID rather than failing the scan, which this test is not about.
+    fake = FakeGamma(_two_event_world())
     fake.fail_status("/events/keyset", 422, times=1)
     runtime, _ = build_runtime(tmp_path, fake, env={"CATALOGUE_CAPTURE_WORKERS": "2"})
     try:

@@ -24,6 +24,7 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.reader import iter_scan_pages
 from oddsfox_catalogue.capture.runner import (
     CaptureSummary,
+    _finalise_if_complete,
     _reopen_unstarted,
     _run_ready_scans,
     _scan_row,
@@ -34,7 +35,7 @@ from oddsfox_catalogue.capture.runner import (
 )
 from oddsfox_catalogue.capture.writer import read_body
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
-from oddsfox_catalogue.gamma.scans import id_chunk_scan
+from oddsfox_catalogue.gamma.scans import id_chunk_scan, id_range_scan, markets_keyset_open
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
 CHILD = TESTS_DIR / "fakes" / "capture_child.py"
@@ -331,6 +332,216 @@ def test_rebuild_restores_each_follow_up_plan(
     assert restored == planned
 
 
+def test_an_abandoned_attempt_with_no_successor_is_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A signal between the two commits of _abandon leaves an abandoned attempt. Resume starts it."""
+    fake = FakeGamma(demo_world())
+    fake.expire_cursor("/markets/keyset", times=1)
+    runtime, _ = build_runtime(tmp_path, fake, env={**SERIAL, "CATALOGUE_GAMMA_PAGE_LIMIT": "1"})
+    add_scan_attempt = runtime.ledger.add_scan_attempt
+    calls = {"n": 0}
+
+    def crash_before_the_successor(scan: dict[str, Any]) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _Crash("signal between the abandoned status and its successor")
+        add_scan_attempt(scan)
+
+    monkeypatch.setattr(runtime.ledger, "add_scan_attempt", crash_before_the_successor)
+    try:
+        with pytest.raises(_Crash):
+            run_capture(runtime, "bootstrap")
+        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
+        latest = runtime.ledger.latest_attempt(batch_id, "markets_keyset_open")
+        assert latest is not None and latest["status"] == "abandoned"
+
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        attempts = [
+            s
+            for s in runtime.ledger.list_scans(batch_id)
+            if s["scan_name"] == "markets_keyset_open"
+        ]
+        assert [(a["attempt"], a["status"]) for a in attempts] == [
+            (1, "abandoned"),
+            (2, "complete"),
+        ]
+    finally:
+        runtime.ledger.close()
+
+
+@pytest.mark.parametrize("shape", ["legacy_order", "no_open_crawl"])
+def test_a_market_batch_that_cannot_prove_coverage_is_abandoned_not_resumed(
+    tmp_path: Path, shape: str
+) -> None:
+    """Resume only plans that put the open crawl first. Any other batch is abandoned, raw kept."""
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
+    old_id = "20261007T000000Z-bootstrap"
+    stamp = "2026-10-07T00:00:00Z"
+    closed = id_range_scan(
+        "markets_closed_ids_0001",
+        "/markets/keyset",
+        "markets",
+        lo=1,
+        hi=100,
+        closed=True,
+        tail=False,
+    )
+    rows = [_scan_row(old_id, closed, attempt=1, plan_order=1, started_at=stamp)]
+    if shape == "legacy_order":
+        crawl = markets_keyset_open(runtime.settings.gamma)
+        rows.append(_scan_row(old_id, crawl, attempt=1, plan_order=2, started_at=stamp))
+    try:
+        runtime.ledger.create_batch(old_id, "bootstrap", "2026-10-07", stamp, None, rows)
+        # This closed window finished before the open crawl, so it may have passed a market that
+        # closed later and that the open crawl will never return.
+        runtime.ledger.set_scan_status(rows[0]["scan_id"], "complete", stamp)
+
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.resumed is False
+        assert summary.status == "captured"
+        assert summary.batch_id != old_id
+        assert runtime.ledger.get_batch(old_id)["status"] == "abandoned"
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_market_batch_without_the_open_crawl_is_never_captured(tmp_path: Path) -> None:
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
+    batch_id = "20261008T100000Z-bootstrap"
+    stamp = "2026-10-08T10:00:00Z"
+    events = id_range_scan(
+        "events_ids_0001", "/events/keyset", "events", lo=1, hi=100, closed=None, tail=False
+    )
+    row = _scan_row(batch_id, events, attempt=1, plan_order=1, started_at=stamp)
+    try:
+        runtime.ledger.create_batch(batch_id, "bootstrap", "2026-10-08", stamp, None, [row])
+        runtime.ledger.set_scan_status(row["scan_id"], "complete", stamp)
+        runtime.ledger.restore_batch_state(batch_id, "capturing", 2, stamp)
+
+        assert _finalise_if_complete(runtime, batch_id) == "capturing"
+        assert runtime.ledger.get_batch(batch_id)["status"] == "capturing"
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_second_interrupt_during_the_drain_waits_for_running_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second Ctrl-C while the drain waits must not return while a worker still runs.
+
+    Returning early would release the ledger and the run lock beside a live worker.
+    """
+    runtime, _ = build_runtime(
+        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "2"}
+    )
+    batch_id = "20261008T090000Z-bootstrap"
+    stamp = "2026-10-08T09:00:00Z"
+    running = threading.Event()
+    release = threading.Event()
+    worker_done = threading.Event()
+
+    def slow_scan(rt, batch, row, *args, **kwargs) -> None:
+        running.set()
+        release.wait(5)
+        worker_done.set()
+
+    real_wait = runner.wait
+    real_shutdown = ThreadPoolExecutor.shutdown
+    waits = {"n": 0}
+    shutdowns = {"n": 0}
+
+    def interrupted_wait(*args, **kwargs):
+        waits["n"] += 1
+        if waits["n"] == 1:
+            # The first Ctrl-C lands while a worker is busy. Cancelling before a worker starts
+            # would drop the scan, and the test would prove nothing.
+            running.wait(5)
+            raise KeyboardInterrupt
+        return real_wait(*args, **kwargs)
+
+    def interrupted_shutdown(self, wait=True, *, cancel_futures=False):
+        shutdowns["n"] += 1
+        if shutdowns["n"] == 1:
+            # The second Ctrl-C lands during the drain. The worker is released 0.3 s later.
+            threading.Timer(0.3, release.set).start()
+            raise KeyboardInterrupt
+        return real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
+
+    monkeypatch.setattr(runner, "_run_scan", slow_scan)
+    monkeypatch.setattr(runner, "wait", interrupted_wait)
+    monkeypatch.setattr(ThreadPoolExecutor, "shutdown", interrupted_shutdown)
+    rows = [
+        _scan_row(
+            batch_id, id_chunk_scan(index, ["1"]), attempt=1, plan_order=index, started_at=stamp
+        )
+        for index in (1, 2)
+    ]
+    try:
+        runtime.ledger.create_batch(batch_id, "bootstrap", "2026-10-08", stamp, None, rows)
+        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=True)
+        with pytest.raises(KeyboardInterrupt):
+            _run_ready_scans(
+                runtime,
+                runtime.ledger.get_batch(batch_id),
+                runtime.ledger.list_scans(batch_id),
+                summary,
+            )
+        assert running.is_set(), "no worker started, so the drain was not exercised"
+        assert worker_done.is_set(), "the drain returned while a worker was still running"
+    finally:
+        release.set()
+        runtime.ledger.close()
+
+
+def test_a_failing_worker_close_does_not_fail_the_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every worker client is closed even when one close fails, and the drain completes."""
+    runtime, _ = build_runtime(
+        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "2"}
+    )
+    batch_id = "20261008T095000Z-bootstrap"
+    stamp = "2026-10-08T09:50:00Z"
+    closes: list[int] = []
+    spawned = {"n": 0}
+
+    class _BrokenClose:
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+        def close(self) -> None:
+            closes.append(self.number)
+            raise RuntimeError("socket already closed")
+
+    def spawn() -> _BrokenClose:
+        spawned["n"] += 1
+        return _BrokenClose(spawned["n"])
+
+    monkeypatch.setattr(runner, "_run_scan", lambda rt, batch, row, *args, **kwargs: None)
+    monkeypatch.setattr(runtime.client, "spawn", spawn)
+    rows = [
+        _scan_row(
+            batch_id, id_chunk_scan(index, ["1"]), attempt=1, plan_order=index, started_at=stamp
+        )
+        for index in (1, 2)
+    ]
+    try:
+        runtime.ledger.create_batch(batch_id, "bootstrap", "2026-10-08", stamp, None, rows)
+        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=True)
+        _run_ready_scans(
+            runtime,
+            runtime.ledger.get_batch(batch_id),
+            runtime.ledger.list_scans(batch_id),
+            summary,
+        )
+        assert spawned["n"] >= 1
+        assert sorted(closes) == list(range(1, spawned["n"] + 1))
+    finally:
+        runtime.ledger.close()
+
+
 def test_closed_market_windows_wait_for_the_open_crawl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -426,10 +637,13 @@ def test_a_non_terminated_error_during_shutdown_still_reopens_unstarted_scans(
             raise RuntimeError("worker client unavailable")
 
         real_shutdown = ThreadPoolExecutor.shutdown
+        shutdowns = {"n": 0}
 
         def interrupted_shutdown(self, wait=True, *, cancel_futures=False):
+            shutdowns["n"] += 1
             real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
-            raise KeyboardInterrupt
+            if shutdowns["n"] == 1:
+                raise KeyboardInterrupt
 
         monkeypatch.setattr(runtime.client, "spawn", no_worker_client)
         monkeypatch.setattr(ThreadPoolExecutor, "shutdown", interrupted_shutdown)
