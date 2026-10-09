@@ -43,16 +43,23 @@ class ScanSpec:
         return dict(self.params)
 
 
+def _event_flags(settings: GammaSettings) -> dict[str, Any]:
+    """Payload flags that daily keyset and bootstrap id-range event requests share."""
+    flags: dict[str, Any] = {}
+    if settings.include_chat:
+        flags["include_chat"] = True
+    if settings.include_template:
+        flags["include_template"] = True
+    if settings.include_best_lines:
+        flags["include_best_lines"] = True
+    return flags
+
+
 def _event_params(settings: GammaSettings, closed: bool | None) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": settings.page_limit}
     if closed is not None:
         params["closed"] = closed
-    if settings.include_chat:
-        params["include_chat"] = True
-    if settings.include_template:
-        params["include_template"] = True
-    if settings.include_best_lines:
-        params["include_best_lines"] = True
+    params.update(_event_flags(settings))
     return params
 
 
@@ -97,6 +104,7 @@ def id_range_scan(
     hi: int | None,
     closed: bool | None,
     tail: bool,
+    extra: dict[str, Any] | None = None,
 ) -> ScanSpec:
     params: dict[str, Any] = {"lo": lo, "step": ID_STEP, "tail": tail}
     if hi is not None:
@@ -105,6 +113,8 @@ def id_range_scan(
         params["closed"] = closed
     if tail:
         params["empty_stop"] = TAIL_EMPTY_WINDOWS
+    if extra:
+        params.update(extra)
     return ScanSpec(name, "id_range", endpoint, record_key, _freeze(params))
 
 
@@ -133,6 +143,7 @@ def _partitions(
     hi: int,
     partition: int,
     closed: bool | None,
+    extra: dict[str, Any] | None = None,
 ) -> list[ScanSpec]:
     scans: list[ScanSpec] = []
     start = 1
@@ -148,6 +159,7 @@ def _partitions(
                 hi=end,
                 closed=closed,
                 tail=False,
+                extra=extra,
             )
         )
         start = end + 1
@@ -164,6 +176,7 @@ def id_range_plan(
         _high_water(client, "/markets", "markets"), capture.max_id_override
     )
     scans: list[ScanSpec] = []
+    event_flags = _event_flags(gamma)
     scans.extend(
         _partitions(
             "events_ids",
@@ -172,6 +185,7 @@ def id_range_plan(
             event_mark,
             capture.id_partition_size,
             None,
+            event_flags,
         )
     )
     if event_tail:
@@ -184,6 +198,7 @@ def id_range_plan(
                 hi=None,
                 closed=None,
                 tail=True,
+                extra=event_flags,
             )
         )
     scans.extend(

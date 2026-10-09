@@ -123,15 +123,17 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
 - Daily capture lists open events with `after_cursor`. Bootstrap and reconcile list events and
   closed markets by explicit id windows of 100, from a high-water mark read once at batch start,
   then list open markets with the keyset. By-ID lookups fill in events referenced from markets
-  that those scans did not return. An id that still fails after the window is split is quarantined
-  as `fetch_failed`.
+  that those scans did not return. A window that exhausts its retries is split in half until single
+  ids remain. A single id that still fails is quarantined as `fetch_failed`. A 404 is recorded as
+  absent, not failed. A non-retryable error on a multi-id window fails the scan.
 - Nested `market.events` entries are references only. They are never treated as full events.
 - `outcomes`, `outcomePrices`, and `clobTokenIds`/`positionIds` arrive as JSON-encoded strings.
   dbt decodes them and quarantines any market whose lists do not align.
 - Up to 4 scans in the current plan stage run at once (`capture.workers`). They share a limit of
   5 requests per second (`gamma.requests_per_second`), with a 10 s connect timeout and a 60 s read
   timeout. Keyset requests retry up to 12 times (`backoff_base_s` 5, `backoff_cap_s` 300). An id
-  window retries 4 times with backoff capped at 30 s. Both honour `Retry-After`.
+  window retries 4 times with backoff capped at 30 s. Both honour `Retry-After`, but never wait
+  longer than their own cap.
 
 ## Status
 

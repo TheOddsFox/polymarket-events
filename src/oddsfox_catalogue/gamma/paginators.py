@@ -24,6 +24,8 @@ ID_WINDOW_MAX_RETRIES = 4
 ID_WINDOW_BACKOFF_CAP_S = 30.0
 
 RECORD_KEYS = ("events", "markets")
+# Event payload flags that keyset daily scans send. Id windows must send the same ones.
+_INCLUDE_FLAGS = ("include_chat", "include_template", "include_best_lines")
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,8 @@ class PageState:
     offset: int = 0
     seen_cursors: frozenset[str] = frozenset()
     last_ids_hash: str | None = None
+    # Consecutive record-less windows at the end of a tail scan. Resume keeps the count.
+    empty_run: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,12 +220,19 @@ def _reject_window_mismatch(
         raise MalformedResponse(f"{endpoint}: id window returned a short page with a cursor")
 
 
-def _window_params(ids: list[int], record_key: str, closed: bool | None) -> dict[str, Any]:
+def _window_params(
+    ids: list[int],
+    record_key: str,
+    closed: bool | None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": len(ids), "id": ids}
     if closed is not None:
         params["closed"] = closed
     if record_key == "markets":
         params["include_tag"] = True
+    if extra:
+        params.update(extra)
     return params
 
 
@@ -269,18 +280,21 @@ def _fetch_id_window(
     record_key: str,
     ids: list[int],
     closed: bool | None,
+    extra: Mapping[str, Any] | None = None,
 ) -> tuple[list[Any], list[int], Response]:
     """Fetch one id window. A window that keeps failing is split down to one id.
 
     A single id that still fails after ``/events/{id}`` or ``/markets/{id}`` is
-    returned in the failed list. A 404 means the id does not exist.
+    returned in the failed list, whatever the hard error. A 404 means the id does
+    not exist. A non-retryable error on a multi-id window still fails the scan,
+    so a systematic contract problem stops the crawl instead of quarantining it.
     """
-    params = _window_params(ids, record_key, closed)
+    params = _window_params(ids, record_key, closed, extra)
 
     def fetch(wanted: list[int]) -> tuple[list[Any], list[int], list[Response]]:
         if not wanted:
             return [], [], []
-        request = _window_params(wanted, record_key, closed)
+        request = _window_params(wanted, record_key, closed, extra)
         try:
             response = client.get(
                 endpoint,
@@ -314,13 +328,14 @@ def _fetch_id_window(
                 max_retries=ID_WINDOW_MAX_RETRIES,
                 backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
             )
-        except RetriesExhausted:
+            if response.status == 404:
+                return [], [], [response]
+            if response.status != 200:
+                raise MalformedResponse(f"{path}: unexpected HTTP {response.status}")
+            records, _ = unpack(response.json, record_key)
+        except (RetriesExhausted, MalformedResponse):
+            # Still failing for this id alone: quarantine it so the window can finish.
             return [], [entity_id], []
-        if response.status == 404:
-            return [], [], [response]
-        if response.status != 200:
-            raise MalformedResponse(f"{path}: unexpected HTTP {response.status}")
-        records, _ = unpack(response.json, record_key)
         return records, [], [response]
 
     records, failed, parts = fetch(ids)
@@ -341,8 +356,9 @@ def id_range_pages(
     """Request explicit id windows. Page ``seq`` covers ``[lo+(seq-1)*step, ...)``.
 
     An empty window is stored. A tail scan (no ``hi``) stops after
-    ``empty_stop`` consecutive empty windows. Resume uses ``start.seq`` and
-    does not repeat durable pages.
+    ``empty_stop`` consecutive windows with no records. A window whose ids all
+    failed counts as empty, so a persistent outage above the mark still ends.
+    Resume uses ``start.seq`` and ``start.empty_run`` and does not repeat durable pages.
     """
     if record_key not in RECORD_KEYS:
         raise ValueError(f"unknown record key {record_key!r}")
@@ -357,9 +373,10 @@ def id_range_pages(
     closed = base_params.get("closed")
     if isinstance(closed, str):
         closed = closed == "true"
+    extra = {key: True for key in _INCLUDE_FLAGS if base_params.get(key)}
     seq = start.seq
     index = start.seq
-    empty_run = 0
+    empty_run = start.empty_run
 
     while True:
         window_lo = lo + index * step
@@ -369,11 +386,13 @@ def id_range_pages(
         if hi is not None:
             window_hi = min(window_hi, hi)
         ids = list(range(window_lo, window_hi + 1))
-        records, failed, response = _fetch_id_window(client, endpoint, record_key, ids, closed)
+        records, _failed, response = _fetch_id_window(
+            client, endpoint, record_key, ids, closed, extra
+        )
         seq += 1
         index += 1
         if tail:
-            if records or failed:
+            if records:
                 empty_run = 0
                 terminal = False
             else:
@@ -384,7 +403,7 @@ def id_range_pages(
         yield PageResult(
             seq=seq,
             endpoint=endpoint,
-            params=_window_params(ids, record_key, closed),
+            params=_window_params(ids, record_key, closed, extra),
             record_key=record_key,
             input_cursor=None,
             output_cursor=None,

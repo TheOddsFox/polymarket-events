@@ -167,6 +167,7 @@ def _start_batch(rt: CaptureRuntime, mode: str) -> dict[str, Any]:
     )
     batch = rt.ledger.get_batch(batch_id)
     assert batch is not None
+    _mark_planned(rt, batch, rows)
     return batch
 
 
@@ -289,7 +290,8 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
 
     if stage == 0:
         list_scans = [s for s in latest.values() if s["kind"] not in FOLLOW_UP_KINDS]
-        if not _all_complete(list_scans):
+        # A batch with no list scans is corrupt. Planning from it would "capture" nothing.
+        if not list_scans or not _all_complete(list_scans):
             return False
         ids = _plan_stage0_ids(rt, batch)
         start = rt.ledger.max_plan_order(batch_id)
@@ -304,6 +306,7 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
             for index, ids_chunk in enumerate(chunk(ids), start=1)
         ]
         rt.ledger.add_plan(batch_id, 1, rows, now)
+        _mark_planned(rt, batch, rows)
         return True
 
     if stage == 1:
@@ -327,6 +330,7 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
             for index, ids_chunk in enumerate(chunk(missing), start=1)
         ]
         rt.ledger.add_plan(batch_id, 2, rows, now)
+        _mark_planned(rt, batch, rows)
         return True
     return False
 
@@ -389,7 +393,16 @@ def _state_from_row(rt: CaptureRuntime, scan: dict[str, Any]) -> PageState:
         offset=int(scan["fetched_offset"] or 0),
         seen_cursors=seen,
         last_ids_hash=scan["last_ids_hash"],
+        empty_run=_trailing_empty(pages),
     )
+
+
+def _trailing_empty(pages: list[dict[str, Any]]) -> int:
+    """Consecutive record-less pages at the end of a scan, so a resumed tail keeps its stop count."""
+    run = 0
+    for page in pages:
+        run = run + 1 if int(page["record_count"]) == 0 else 0
+    return run
 
 
 def _row_from_manifest(manifest: dict[str, Any], batch_id: str, scan_id: str) -> dict[str, Any]:
@@ -520,6 +533,22 @@ def _write_scan_marker(
             "finished_at": iso_utc(rt.now()) if status != "running" else None,
         },
     )
+
+
+def _mark_planned(rt: CaptureRuntime, batch: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    """Write a marker for each planned scan, so a raw-store rebuild restores scans that never ran."""
+    for row in rows:
+        directory = scan_dir_for(
+            rt.settings, batch["observation_date"], batch["batch_id"], row["scan_id"]
+        )
+        _write_scan_marker(rt, batch, row, directory, "running")
+
+
+def _reopen_unstarted(rt: CaptureRuntime, rows: list[dict[str, Any]], started: set[str]) -> None:
+    """A failed scan the pool never started keeps its resume state: reopen it as running."""
+    for row in rows:
+        if row["status"] == "failed" and row["scan_id"] not in started:
+            rt.ledger.set_scan_running(row["scan_id"], iso_utc(rt.now()))
 
 
 def _run_scan(
@@ -710,7 +739,8 @@ def _run_ready_scans(
     """Run every runnable scan in this stage, up to ``capture.workers`` at once.
 
     A failure or ``Terminated`` sets the stop event. Scans that have not
-    started are left ``running`` and are not fetched. A scan already on a
+    started are left ``running`` and are not fetched, and a previously failed
+    scan the pool never started is reopened as ``running``. A scan already on a
     page finishes that page, then returns still ``running`` so resume continues
     it. The scan that raised is marked failed by ``_run_scan``.
     """
@@ -719,6 +749,8 @@ def _run_ready_scans(
     local = threading.local()
     spawned: list[GammaClient] = []
     spawned_lock = threading.Lock()
+    started: set[str] = set()
+    started_lock = threading.Lock()
 
     def init_worker() -> None:
         client = rt.client.spawn()
@@ -727,6 +759,8 @@ def _run_ready_scans(
             spawned.append(client)
 
     def run_row(row: dict[str, Any]) -> None:
+        with started_lock:
+            started.add(row["scan_id"])
         _run_scan(_runtime_for(rt, local.client), batch, row, summary, stop)
 
     rt.client._limiter.bind_stop(stop)
@@ -762,6 +796,7 @@ def _run_ready_scans(
         rt.client._limiter.bind_stop(None)
         for client in spawned:
             client.close()
+        _reopen_unstarted(rt, rows, started)
         if interrupted is not None:
             raise interrupted
 

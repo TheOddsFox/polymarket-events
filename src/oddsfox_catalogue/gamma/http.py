@@ -364,9 +364,13 @@ class GammaClient:
             )
 
     def _delay(self, retry_number: int, retry_after: float | None, backoff_cap: float) -> float:
-        """The server's Retry-After wins when present; otherwise jittered backoff from base."""
+        """Retry-After when the server sends one, otherwise jittered backoff from base.
+
+        Either way the wait never exceeds ``backoff_cap``. One long Retry-After
+        penalises the shared bucket, so it cannot stall every worker for an hour.
+        """
         if retry_after is not None:
-            return retry_after
+            return min(retry_after, backoff_cap)
         return backoff_delay(
             retry_number - 1,
             self._settings.backoff_base_s,
