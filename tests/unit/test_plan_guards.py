@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from oddsfox_catalogue.capture.runner import _held_closed_windows, _unsafe_to_resume
 
 OPEN = "markets_keyset_open"
@@ -61,6 +63,33 @@ def test_closed_windows_planned_before_the_open_crawl_are_unsafe_to_resume() -> 
     assert _unsafe_to_resume(scans)
 
 
-def test_a_batch_without_an_open_crawl_is_unsafe_but_an_empty_one_is_not() -> None:
+def test_a_batch_without_an_open_crawl_or_any_scans_is_unsafe() -> None:
     assert _unsafe_to_resume([_row(EVENTS, plan_order=1)])
-    assert not _unsafe_to_resume([])
+    assert _unsafe_to_resume([])
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["events_keyset_all", "events_archived_offset", "markets_keyset_closed", "events_keyset_open"],
+)
+def test_a_deep_keyset_or_offset_scan_name_is_unsafe_even_with_the_open_crawl_first(
+    name: str,
+) -> None:
+    scans = [_row(OPEN, plan_order=1), _row(name, plan_order=2)]
+    assert _unsafe_to_resume(scans)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "events_ids_0001",
+        "events_ids_tail",
+        "markets_closed_ids_0001",
+        "markets_closed_ids_tail",
+        "events_by_id_0001",
+        "events_by_id_single_0001",
+    ],
+)
+def test_every_scan_name_the_id_range_plan_produces_is_safe(name: str) -> None:
+    scans = [_row(OPEN, plan_order=1), _row(name, plan_order=2)]
+    assert not _unsafe_to_resume(scans)

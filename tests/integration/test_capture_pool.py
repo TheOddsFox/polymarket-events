@@ -14,7 +14,7 @@ from fakes.harness import build_runtime
 from fakes.world import World, demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture import runner
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.runner import run_capture
+from oddsfox_catalogue.capture.runner import CaptureSummary, run_capture
 from oddsfox_catalogue.gamma.http import MalformedResponse
 
 
@@ -46,19 +46,59 @@ def _manifests(runtime, batch_id: str) -> dict[str, list[dict]]:
     return found
 
 
-def test_parallel_manifests_match_a_serial_run(tmp_path: Path) -> None:
-    def capture(root: Path, workers: str) -> dict[str, list[dict]]:
-        runtime, _ = build_runtime(
-            root, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": workers}
-        )
-        try:
-            summary = run_capture(runtime, "bootstrap")
-            assert summary.status == "captured"
-            return _manifests(runtime, summary.batch_id)
-        finally:
-            runtime.ledger.close()
+CONTENT_FIELDS = (
+    "seq",
+    "http_status",
+    "record_count",
+    "terminal",
+    "body_sha256",
+    "ids_hash",
+    "output_cursor",
+)
 
-    assert capture(tmp_path / "serial", "1") == capture(tmp_path / "pool", "4")
+
+def _content(found: dict[str, list[dict]]) -> dict[str, list[tuple]]:
+    """Strip the attempt, id, and clock fields that a resumed run legitimately changes."""
+    return {
+        name: [tuple(page[field] for field in CONTENT_FIELDS) for page in pages]
+        for name, pages in found.items()
+    }
+
+
+def _capture(root: Path, workers: str) -> dict[str, list[dict]]:
+    runtime, _ = build_runtime(
+        root, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": workers}
+    )
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        return _manifests(runtime, summary.batch_id)
+    finally:
+        runtime.ledger.close()
+
+
+@pytest.mark.parametrize("workers", ["2", "4"])
+def test_parallel_manifests_match_a_serial_run(tmp_path: Path, workers: str) -> None:
+    assert _capture(tmp_path / "pool", workers) == _capture(tmp_path / "serial", "1")
+
+
+@pytest.mark.parametrize("workers", ["2", "4"])
+def test_a_pooled_failure_then_resume_matches_a_clean_serial_run(
+    tmp_path: Path, workers: str
+) -> None:
+    clean = _capture(tmp_path / "clean", "1")
+    fake = FakeGamma(demo_world())
+    fake.fail_status("/events/keyset", 422, times=1)  # a multi-id window: the scan fails
+    runtime, _ = build_runtime(tmp_path / "pool", fake, env={"CATALOGUE_CAPTURE_WORKERS": workers})
+    try:
+        with pytest.raises(MalformedResponse):
+            run_capture(runtime, "bootstrap")
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        assert summary.resumed is True
+        assert _content(_manifests(runtime, summary.batch_id)) == _content(clean)
+    finally:
+        runtime.ledger.close()
 
 
 def test_shared_bucket_keeps_the_pool_inside_the_rate(tmp_path: Path) -> None:
@@ -110,6 +150,37 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
         sibling = scans["events_ids_0001"]
         assert sibling["fetched_seq"] >= 1
         assert runtime.ledger.pages_for_scan(sibling["scan_id"])
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_scan_stopped_after_a_page_keeps_that_page_and_stays_running(tmp_path: Path) -> None:
+    """A stop that lands mid-scan lets the page in flight finish. The scan then stays running."""
+    runtime, _ = build_runtime(
+        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "1"}
+    )
+    stop = threading.Event()
+    original = runtime.ledger.record_page
+
+    def record_then_stop(*args, **kwargs):
+        original(*args, **kwargs)
+        stop.set()  # a signal arrives once the first page is durable
+
+    try:
+        batch = runner._start_batch(runtime, "bootstrap")
+        tail = next(
+            scan
+            for scan in runtime.ledger.list_scans(batch["batch_id"])
+            if scan["scan_name"] == "events_ids_tail"
+        )
+        runtime.ledger.record_page = record_then_stop
+        summary = CaptureSummary(batch_id=batch["batch_id"], status="capturing", resumed=False)
+        runner._run_scan(runtime, batch, tail, summary, stop)
+
+        scan = runtime.ledger.get_scan(tail["scan_id"])
+        assert scan is not None
+        assert scan["status"] == "running"
+        assert len(runtime.ledger.pages_for_scan(tail["scan_id"])) == 1
     finally:
         runtime.ledger.close()
 

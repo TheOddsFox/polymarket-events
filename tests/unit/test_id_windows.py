@@ -10,7 +10,7 @@ import pytest
 
 from fakes.harness import FakeClock
 from oddsfox_catalogue.config import GammaSettings
-from oddsfox_catalogue.gamma.http import GammaClient
+from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse
 from oddsfox_catalogue.gamma.paginators import PageState, id_range_pages
 
 NOW = datetime(2026, 10, 8, 6, 0, tzinfo=UTC)
@@ -154,6 +154,51 @@ def test_single_id_that_returns_another_record_is_quarantined() -> None:
 
     assert page.records == []
     assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]
+
+
+def test_a_transient_window_error_is_retried_before_any_bisection() -> None:
+    """Four 500s fit the retry budget: the same window is retried, and it is never split."""
+    seen: list[tuple[str, ...]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ids = tuple(request.url.params.get_list("id"))
+        seen.append(ids)
+        if len(seen) <= 4:
+            return httpx.Response(500, json={"error": "down"})
+        return httpx.Response(200, json={"events": [{"id": i} for i in ids]})
+
+    client, _ = _client(handler)
+    try:
+        pages = list(
+            id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        )
+    finally:
+        client.close()
+
+    assert len(seen) == 5
+    assert len(seen[0]) >= 2
+    assert len(set(seen)) == 1
+    assert not any("fetch_failed" in page.response.json for page in pages)
+    assert sum(len(page.records) for page in pages) == len(seen[0])
+
+
+def test_a_multi_id_window_rejected_with_422_fails_without_bisecting() -> None:
+    """A systematic contract error on a multi-id window stops the crawl. It is not quarantined."""
+    seen: list[tuple[str, ...]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(tuple(request.url.params.get_list("id")))
+        return httpx.Response(422, json={"error": "bad window"})
+
+    client, _ = _client(handler)
+    try:
+        with pytest.raises(MalformedResponse):
+            list(id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events"))
+    finally:
+        client.close()
+
+    assert len(seen) == 1
+    assert len(seen[0]) >= 2
 
 
 def test_a_single_id_window_with_a_hard_error_is_quarantined() -> None:

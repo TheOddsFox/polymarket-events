@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -191,6 +192,15 @@ def _all_complete(scans: list[dict[str, Any]]) -> bool:
 OPEN_MARKETS_SCAN = "markets_keyset_open"
 CLOSED_MARKET_WINDOW_PREFIX = "markets_closed_ids_"
 ID_RANGE_MODES = frozenset({"bootstrap", "reconcile"})
+# Scan names the id-range plan produces. A deep-keyset or offset plan uses other names, and its
+# coverage cannot be shown, so a batch with any other name is not resumed.
+ID_RANGE_SCAN_NAME = re.compile(
+    r"markets_keyset_open|events_ids_(\d{4}|tail)|markets_closed_ids_(\d{4}|tail)"
+    r"|events_by_id_(single_)?\d{4}"
+)
+# Seconds the pool waits before it looks again. The main thread runs signal handlers only
+# between waits, so a bounded wait keeps a signal from sitting behind a busy worker.
+POOL_POLL_S = 1.0
 
 
 def _open_crawl_complete(latest: dict[str, dict[str, Any]]) -> bool:
@@ -212,15 +222,18 @@ def _held_closed_windows(scans: list[dict[str, Any]]) -> set[str]:
 
 
 def _unsafe_to_resume(scans: list[dict[str, Any]]) -> bool:
-    """True when an id-range batch's plan cannot show that every market will be seen.
+    """True when an id-range batch cannot be resumed on a plan that shows every market is seen.
 
-    Two shapes qualify. A batch planned before the market-race fix runs its closed windows ahead
-    of the open crawl, and a closed window that finished first can pass a market the crawl never
-    returns. A batch with scans but no open crawl has nothing to cover its closed windows. A batch
-    with no scans yet is planned on resume as usual.
+    Four shapes qualify. A batch with no list scans was never planned, and the planner refuses
+    to plan from it. A batch holding a scan name the id-range plan does not produce came from a
+    deep-keyset or offset plan. A batch planned before the market-race fix runs its closed windows
+    ahead of the open crawl, and a closed window that finished first can pass a market the crawl
+    never returns. A batch with scans but no open crawl has nothing to cover its closed windows.
     """
     if not scans:
-        return False
+        return True
+    if any(ID_RANGE_SCAN_NAME.fullmatch(s["scan_name"]) is None for s in scans):
+        return True
     latest = _latest_by_name(scans)
     open_scan = latest.get(OPEN_MARKETS_SCAN)
     if open_scan is None:
@@ -835,23 +848,26 @@ def _run_ready_scans(
         max_workers=worker_count, thread_name_prefix="capture", initializer=init_worker
     )
     futures = []
+    body_signal: BaseException | None = None
     try:
         futures = [executor.submit(run_row, row) for row in rows]
         pending = set(futures)
         while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            done, pending = wait(pending, timeout=POOL_POLL_S, return_when=FIRST_COMPLETED)
             for future in done:
                 future.result()
-    except BaseException:
+    except BaseException as exc:
         stop.set()
         for future in futures:
             future.cancel()
+        if not isinstance(exc, Exception):
+            body_signal = exc
         raise
     finally:
         # Keep joining until every worker has stopped, whatever signal arrives. Releasing the
         # ledger or the run lock while a worker still runs would let a second run write beside
-        # it. The first signal is re-raised once the drain is complete.
-        interrupted: BaseException | None = None
+        # it. The first signal, even one raised above, is re-raised once the drain is complete.
+        interrupted: BaseException | None = body_signal
         try:
             while True:
                 try:
@@ -895,7 +911,7 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
             and mode in ID_RANGE_MODES
             and _unsafe_to_resume(rt.ledger.list_scans(resumable["batch_id"]))
         ):
-            reason = "not resumed: its plan cannot show that every market will be seen"
+            reason = "not resumed: its plan is not the current id-range plan"
             logger.warning("abandoning batch %s: %s", resumable["batch_id"], reason)
             abandon_batch(rt.ledger, resumable["batch_id"], rt.now(), reason)
             resumable = None

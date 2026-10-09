@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -34,8 +35,14 @@ from oddsfox_catalogue.capture.runner import (
     run_capture,
 )
 from oddsfox_catalogue.capture.writer import read_body
+from oddsfox_catalogue.cli import Terminated
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
-from oddsfox_catalogue.gamma.scans import id_chunk_scan, id_range_scan, markets_keyset_open
+from oddsfox_catalogue.gamma.scans import (
+    ScanSpec,
+    id_chunk_scan,
+    id_range_scan,
+    markets_keyset_open,
+)
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
 CHILD = TESTS_DIR / "fakes" / "capture_child.py"
@@ -141,21 +148,6 @@ def test_tail_above_the_mark_ends_when_every_id_fails(tmp_path: Path) -> None:
             body = json.loads(read_body(directory / tail["scan_id"], manifest))
             failed.extend(item["id"] for item in body.get("fetch_failed", []))
         assert len(failed) == 300
-    finally:
-        runtime.ledger.close()
-
-
-def test_a_batch_with_no_list_scans_is_never_captured(tmp_path: Path) -> None:
-    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()))
-    batch_id = "20261008T000000Z-bootstrap"
-    try:
-        runtime.ledger.create_batch(
-            batch_id, "bootstrap", "2026-10-08", "2026-10-08T00:00:00Z", None, []
-        )
-        summary = run_capture(runtime, "bootstrap")
-        assert summary.status == "capturing"
-        assert runtime.ledger.get_batch(batch_id)["status"] == "capturing"
-        assert runtime.ledger.list_scans(batch_id) == []
     finally:
         runtime.ledger.close()
 
@@ -538,6 +530,192 @@ def test_a_failing_worker_close_does_not_fail_the_drain(
         )
         assert spawned["n"] >= 1
         assert sorted(closes) == list(range(1, spawned["n"] + 1))
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_batch_on_a_deep_keyset_plan_is_abandoned_not_resumed(tmp_path: Path) -> None:
+    """A bootstrap planned on the deep keyset is never resumed, even with the open crawl first."""
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
+    old_id = "20261007T010000Z-bootstrap"
+    stamp = "2026-10-07T01:00:00Z"
+    crawl = markets_keyset_open(runtime.settings.gamma)
+    deep = ScanSpec("events_keyset_all", "keyset", "/events/keyset", "events")
+    rows = [
+        _scan_row(old_id, crawl, attempt=1, plan_order=1, started_at=stamp),
+        _scan_row(old_id, deep, attempt=1, plan_order=2, started_at=stamp),
+    ]
+    try:
+        runtime.ledger.create_batch(old_id, "bootstrap", "2026-10-07", stamp, None, rows)
+        runtime.ledger.set_scan_status(rows[0]["scan_id"], "complete", stamp)
+
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.resumed is False
+        assert summary.status == "captured"
+        assert runtime.ledger.get_batch(old_id)["status"] == "abandoned"
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_batch_with_no_list_scans_is_abandoned_not_resumed(tmp_path: Path) -> None:
+    """A batch with no scans was never planned. Resuming it would stay capturing forever."""
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
+    old_id = "20261007T020000Z-bootstrap"
+    stamp = "2026-10-07T02:00:00Z"
+    try:
+        runtime.ledger.create_batch(old_id, "bootstrap", "2026-10-07", stamp, None, [])
+
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.resumed is False
+        assert summary.status == "captured"
+        assert runtime.ledger.get_batch(old_id)["status"] == "abandoned"
+    finally:
+        runtime.ledger.close()
+
+
+def test_small_id_partitions_capture_every_event_once(tmp_path: Path) -> None:
+    """Several event partitions cover the same events as one, and each event is captured once."""
+    world = demo_world()  # event ids 101 to 303, so width 100 gives several partitions
+    env = {**SERIAL, "CATALOGUE_CAPTURE_ID_PARTITION_SIZE": "100"}
+    runtime, _ = build_runtime(tmp_path, FakeGamma(world), env=env)
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        event_scans = [
+            s
+            for s in runtime.ledger.list_scans(summary.batch_id)
+            if s["scan_name"].startswith("events_ids_")
+        ]
+        partitions = [s for s in event_scans if s["scan_name"] != "events_ids_tail"]
+        assert len(partitions) >= 2
+        assert sum(s["record_count"] for s in event_scans) == len(world.events)
+    finally:
+        runtime.ledger.close()
+
+
+def test_high_water_is_read_once_per_batch_even_across_a_resume(tmp_path: Path) -> None:
+    """The plan stores each high-water mark, so a resumed batch does not read them again."""
+    fake = FakeGamma(demo_world())
+    fake.crash_on("/markets/keyset", times=1)  # after the plan is written, mid-batch
+    runtime, _ = build_runtime(tmp_path, fake, env=SERIAL)
+    try:
+        with pytest.raises(SystemExit):
+            run_capture(runtime, "bootstrap")
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        assert summary.resumed is True
+        assert fake.calls_to("/events") == 1
+        assert fake.calls_to("/markets") == 1
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_signal_during_the_drain_still_closes_every_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A signal in the drain re-raises, and a failing client close does not stop the others."""
+    runtime, _ = build_runtime(
+        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "2"}
+    )
+    batch_id = "20261008T095500Z-bootstrap"
+    stamp = "2026-10-08T09:55:00Z"
+    closes: list[int] = []
+    spawned = {"n": 0}
+    shutdowns = {"n": 0}
+    real_shutdown = ThreadPoolExecutor.shutdown
+
+    class _BrokenClose:
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+        def close(self) -> None:
+            closes.append(self.number)
+            raise RuntimeError("socket already closed")
+
+    def spawn() -> _BrokenClose:
+        spawned["n"] += 1
+        return _BrokenClose(spawned["n"])
+
+    def signalled_shutdown(self, wait=True, *, cancel_futures=False):
+        shutdowns["n"] += 1
+        if shutdowns["n"] == 1:
+            raise Terminated(signal.SIGHUP)  # a signal lands while the pool drains
+        return real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
+
+    monkeypatch.setattr(runner, "_run_scan", lambda rt, batch, row, *args, **kwargs: None)
+    monkeypatch.setattr(runtime.client, "spawn", spawn)
+    monkeypatch.setattr(ThreadPoolExecutor, "shutdown", signalled_shutdown)
+    rows = [
+        _scan_row(
+            batch_id, id_chunk_scan(index, ["1"]), attempt=1, plan_order=index, started_at=stamp
+        )
+        for index in (1, 2)
+    ]
+    try:
+        runtime.ledger.create_batch(batch_id, "bootstrap", "2026-10-08", stamp, None, rows)
+        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=True)
+        with pytest.raises(Terminated) as info:
+            _run_ready_scans(
+                runtime,
+                runtime.ledger.get_batch(batch_id),
+                runtime.ledger.list_scans(batch_id),
+                summary,
+            )
+        assert info.value.signum == signal.SIGHUP
+        assert spawned["n"] >= 1
+        assert sorted(closes) == list(range(1, spawned["n"] + 1))
+        # The drain joined every worker before it re-raised: no capture thread outlives it.
+        assert not [t for t in threading.enumerate() if t.name.startswith("capture")]
+    finally:
+        runtime.ledger.close()
+
+
+def test_the_first_signal_is_the_one_that_is_reraised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM in the wait loop, then SIGHUP in the drain: the stage exits as SIGTERM."""
+    runtime, _ = build_runtime(
+        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "2"}
+    )
+    batch_id = "20261008T100500Z-bootstrap"
+    stamp = "2026-10-08T10:05:00Z"
+    real_wait = runner.wait
+    real_shutdown = ThreadPoolExecutor.shutdown
+    waits = {"n": 0}
+    shutdowns = {"n": 0}
+
+    def sigterm_wait(*args, **kwargs):
+        waits["n"] += 1
+        if waits["n"] == 1:
+            raise Terminated(signal.SIGTERM)
+        return real_wait(*args, **kwargs)
+
+    def sighup_shutdown(self, wait=True, *, cancel_futures=False):
+        shutdowns["n"] += 1
+        if shutdowns["n"] == 1:
+            raise Terminated(signal.SIGHUP)
+        return real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
+
+    monkeypatch.setattr(runner, "_run_scan", lambda rt, batch, row, *args, **kwargs: None)
+    monkeypatch.setattr(runner, "wait", sigterm_wait)
+    monkeypatch.setattr(ThreadPoolExecutor, "shutdown", sighup_shutdown)
+    rows = [
+        _scan_row(
+            batch_id, id_chunk_scan(index, ["1"]), attempt=1, plan_order=index, started_at=stamp
+        )
+        for index in (1, 2)
+    ]
+    try:
+        runtime.ledger.create_batch(batch_id, "bootstrap", "2026-10-08", stamp, None, rows)
+        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=True)
+        with pytest.raises(Terminated) as info:
+            _run_ready_scans(
+                runtime,
+                runtime.ledger.get_batch(batch_id),
+                runtime.ledger.list_scans(batch_id),
+                summary,
+            )
+        assert info.value.signum == signal.SIGTERM
     finally:
         runtime.ledger.close()
 

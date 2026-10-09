@@ -126,9 +126,15 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
   completes, so a market that closes mid-batch is captured by one of them. By-ID lookups fill in
   events referenced from markets that those scans did not return. A window that exhausts its
   retries is split in half until single ids remain. A one-id window that fails in any other way is
-  answered by ID instead. A single id that still fails is quarantined as `fetch_failed`. The same applies to a by-ID lookup, and a 200 that describes a different record
-  counts as a failure. A 404 is recorded as absent, not failed. A non-retryable error on a
-  multi-id window fails the scan.
+  answered by ID instead. A single id that still fails is quarantined as `fetch_failed`. The same
+  applies to a by-ID lookup, and a 200 that describes a different record counts as a failure. A 404
+  is recorded as absent, not failed. A non-retryable error on a multi-id window fails the scan.
+- Gamma's list and id-window endpoints return only active events. Inactive events are reached only
+  by ID, and only when a captured market references them. Known gap: an inactive event that no
+  captured market references is not captured. Event 5364 is one example. In a sample of ids 1 to
+  6000, 8 of the 98 ids that the windows did not return exist, and all 8 are inactive. Closing the
+  gap means a by-ID pass over about 450k ids, roughly 25 hours at 5 requests per second. The
+  `archived` filter is ignored by Gamma, and no archived events were observed in ids 1 to 6000.
 - Nested `market.events` entries are references only. They are never treated as full events.
 - `outcomes`, `outcomePrices`, and `clobTokenIds`/`positionIds` arrive as JSON-encoded strings.
   dbt decodes them and quarantines any market whose lists do not align.
