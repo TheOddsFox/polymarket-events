@@ -18,6 +18,7 @@ replays do not create duplicate observations.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -64,8 +65,16 @@ from oddsfox_catalogue.ids import (
     utc_now,
 )
 
+logger = logging.getLogger(__name__)
+
 MAX_SCAN_ATTEMPTS = 3
 FOLLOW_UP_KINDS = frozenset({"keyset_ids", "single_ids"})
+PROGRESS_EVERY_PAGES = 100
+
+
+def page_progress_due(seq: int) -> bool:
+    """Page 1 and every 100th page are the progress lines an operator sees."""
+    return seq == 1 or seq % PROGRESS_EVERY_PAGES == 0
 
 
 @dataclass
@@ -479,6 +488,14 @@ def _run_scan(
     _write_scan_marker(rt, batch, scan, directory, "running")
     spec = scan_spec_from_row(scan)
     summary.scans.append(scan_id)
+    if scan["fetched_seq"]:
+        logger.info(
+            "capture scan %s resuming after page %s",
+            scan["scan_name"],
+            scan["fetched_seq"],
+        )
+    else:
+        logger.info("capture scan %s starting", scan["scan_name"])
 
     try:
         adopted = _adopt_durable_pages(rt, batch, scan, directory)
@@ -494,6 +511,13 @@ def _run_scan(
             _persist_page(rt, batch, scan, directory, page)
             summary.pages_written += 1
             summary.records += page.record_count
+            if page_progress_due(page.seq):
+                logger.info(
+                    "capture %s page %s (%s records)",
+                    scan["scan_name"],
+                    page.seq,
+                    page.record_count,
+                )
         scan = rt.ledger.get_scan(scan_id)
         assert scan is not None
         _finish(rt, batch, scan, directory, "complete")
@@ -518,6 +542,13 @@ def _finish(
     rt.ledger.set_scan_status(scan["scan_id"], status, iso_utc(rt.now()), None)
     refreshed = rt.ledger.get_scan(scan["scan_id"])
     assert refreshed is not None
+    logger.info(
+        "capture scan %s %s, %s pages, %s records",
+        refreshed["scan_name"],
+        status,
+        refreshed["fetched_seq"],
+        refreshed["record_count"],
+    )
     _write_scan_marker(rt, batch, refreshed, directory, status)
 
 

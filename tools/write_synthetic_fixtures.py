@@ -31,7 +31,7 @@ def main() -> None:
         "events_keyset_open_p2.json": {
             "events": [e for e in events if not e["closed"]][1:],
         },
-        "events_keyset_closed.json": {
+        "events_closed_sample.json": {
             "events": [e for e in events if e["closed"]],
         },
         "events_archived_offset.json": [

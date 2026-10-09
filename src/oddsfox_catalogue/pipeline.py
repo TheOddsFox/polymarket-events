@@ -192,13 +192,17 @@ def publish_stage(
 
 def refresh(settings: Settings, mode: str) -> dict[str, Any]:
     """Capture, load, build, and publish, in that order. Stops at the first failure."""
+    logger.info("refresh %s: capture", mode)
     capture = capture_stage(settings, mode)
     if capture.status != "captured":
         return {"stage": "capture", "status": capture.status, "batch_id": capture.batch_id}
+    logger.info("refresh %s: load", mode)
     load = load_stage(settings)
+    logger.info("refresh %s: dbt build", mode)
     built = dbt_stage(settings, ["build"])
     if built.returncode != 0:
         return {"stage": "dbt", "status": "failed", "stderr": built.stdout[-4000:]}
+    logger.info("refresh %s: publish", mode)
     release = publish_stage(settings)
     return {
         "stage": "publish",

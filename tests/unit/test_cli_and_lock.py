@@ -18,7 +18,9 @@ def test_config_show_reads_root_from_environment(
     monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
     monkeypatch.setenv("CATALOGUE_GAMMA_PAGE_LIMIT", "25")
     assert main(["config", "show"]) == 0
-    shown = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    shown = json.loads(captured.out)
+    assert " INFO " not in captured.out
     assert shown["gamma"]["page_limit"] == 25
     assert shown["root"] == str(tmp_path.resolve())
 

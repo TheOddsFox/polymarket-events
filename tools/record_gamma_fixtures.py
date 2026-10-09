@@ -36,7 +36,7 @@ REQUESTS: list[tuple[str, str, dict[str, object]]] = [
         },
     ),
     (
-        "events_keyset_closed",
+        "events_closed_sample",
         "/events/keyset",
         {
             "limit": 3,

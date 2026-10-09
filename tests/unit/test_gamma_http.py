@@ -2,12 +2,13 @@ import json
 import random
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from pathlib import Path
 
 import httpx
 import pytest
 
 from fakes.harness import FakeClock
-from oddsfox_catalogue.config import GammaSettings
+from oddsfox_catalogue.config import GammaSettings, load_settings
 from oddsfox_catalogue.gamma.http import (
     CursorExpired,
     GammaClient,
@@ -20,6 +21,7 @@ from oddsfox_catalogue.gamma.http import (
 )
 
 NOW = datetime(2026, 10, 8, 6, 0, tzinfo=UTC)
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _client(
@@ -93,18 +95,26 @@ def test_429_honours_retry_after_then_succeeds() -> None:
     assert client.stats.rate_limited == 1
 
 
-def test_5xx_is_retried_with_backoff_and_counted() -> None:
+def test_5xx_is_retried_with_backoff_and_counted(caplog: pytest.LogCaptureFixture) -> None:
     statuses = iter([503, 502, 200])
 
     def handler(_: httpx.Request) -> httpx.Response:
         status = next(statuses)
-        return httpx.Response(status, json={"events": []})
+        return httpx.Response(status, json={"events": [], "after_cursor": "secret-cursor"})
 
     client, clock = _client(handler)
-    response = client.get("/events/keyset", {})
+    budget = client._settings.max_retries  # the budget this client actually enforces
+    with caplog.at_level("WARNING", logger="oddsfox_catalogue.gamma.http"):
+        response = client.get("/events/keyset", {"after_cursor": "secret-cursor"})
     assert response.retries == 2
     assert len(clock.sleeps) == 2
     assert client.stats.server_errors == 2
+    warnings = [record.getMessage() for record in caplog.records]
+    assert warnings == [
+        f"gamma /events/keyset HTTP 503, retry 1 of {budget}",
+        f"gamma /events/keyset HTTP 502, retry 2 of {budget}",
+    ]
+    assert all("secret-cursor" not in message for message in warnings)
 
 
 def test_retry_budget_is_finite() -> None:
@@ -173,3 +183,51 @@ def test_requests_carry_gamma_params_and_user_agent() -> None:
     url = str(seen[0].url)
     assert "closed=false" in url and "id=10" in url and "id=11" in url
     assert seen[0].headers["user-agent"].startswith("oddsfox-catalogue")
+
+
+def _committed_client(handler) -> tuple[GammaClient, FakeClock]:
+    """A client built exactly as production builds it: committed TOML defaults, no env overrides."""
+    settings = load_settings(root=REPO_ROOT, env={}).gamma
+    clock = FakeClock()
+    client = GammaClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+        sleep=clock.sleep,
+        now=lambda: NOW,
+        rng=random.Random(7),
+    )
+    return client, clock
+
+
+def test_committed_budget_survives_six_server_errors() -> None:
+    responses = iter([500, 500, 500, 500, 500, 500, 200])
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        status = next(responses)
+        return httpx.Response(status, json={"events": []})
+
+    client, clock = _committed_client(handler)
+    response = client.get("/events/keyset", {})
+    assert response.status == 200
+    assert response.retries == 6
+    assert client.stats.server_errors == 6
+    assert client.stats.requests == 7
+    assert len(clock.sleeps) == 6
+
+
+def test_committed_budget_is_exhausted_on_the_thirteenth_response() -> None:
+    client, clock = _committed_client(lambda r: httpx.Response(500, json={"error": "down"}))
+    with pytest.raises(RetriesExhausted):
+        client.get("/events/keyset", {})
+    assert client.stats.requests == 13
+    assert client.stats.server_errors == 13
+    assert len(clock.sleeps) == 12
+
+
+def test_committed_settings_fail_400_on_first_response() -> None:
+    client, clock = _committed_client(lambda r: httpx.Response(400, text="bad"))
+    with pytest.raises(MalformedResponse):
+        client.get("/events/keyset", {})
+    assert client.stats.requests == 1
+    assert clock.sleeps == []

@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
-from fakes.fake_gamma import FakeGamma
+from fakes.fake_gamma import FakeGamma, Rule
 from fakes.harness import FIXED_NOW, build_runtime, make_settings
 from fakes.world import demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.reader import iter_scan_pages
-from oddsfox_catalogue.capture.runner import abandon_batch, rebuild_from_raw, run_capture
+from oddsfox_catalogue.capture.runner import (
+    abandon_batch,
+    page_progress_due,
+    rebuild_from_raw,
+    run_capture,
+)
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
 from oddsfox_catalogue.gamma.http import RetriesExhausted
 from oddsfox_catalogue.gamma.scans import list_scans_for
@@ -54,6 +61,72 @@ def _scans_by_name(ledger: Ledger, batch_id: str) -> dict[str, list[dict]]:
     for scan in ledger.list_scans(batch_id):
         grouped.setdefault(scan["scan_name"], []).append(scan)
     return grouped
+
+
+def test_page_progress_is_the_first_page_and_every_hundredth() -> None:
+    assert page_progress_due(1)
+    assert not page_progress_due(2)
+    assert not page_progress_due(99)
+    assert page_progress_due(100)
+    assert page_progress_due(200)
+
+
+def test_bootstrap_logs_scan_start_progress_and_completion(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()))
+    try:
+        with caplog.at_level(logging.INFO, logger="oddsfox_catalogue.capture.runner"):
+            summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+    finally:
+        runtime.ledger.close()
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "oddsfox_catalogue.capture.runner"
+    ]
+    assert "capture scan events_keyset_all starting" in messages
+    assert any(message.startswith("capture events_keyset_all page 1 (") for message in messages)
+    assert any(
+        message.startswith("capture scan events_keyset_all complete, ") for message in messages
+    )
+    assert not any(" page 2 " in message for message in messages)
+
+
+def test_resume_logs_the_saved_page(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fake = FakeGamma(demo_world())
+    fake.rules.append(
+        Rule(
+            lambda request: (
+                request.url.path == "/events/keyset" and "after_cursor" in request.url.params
+            ),
+            lambda request: httpx.Response(500, json={"error": "injected"}),
+            remaining=6,
+        )
+    )
+    runtime, _ = build_runtime(
+        tmp_path,
+        fake,
+        env={**ONE_PER_PAGE, "CATALOGUE_GAMMA_MAX_RETRIES": "5"},
+    )
+    try:
+        with pytest.raises(RetriesExhausted):
+            run_capture(runtime, "bootstrap")
+        failed = runtime.ledger.latest_attempt(
+            runtime.ledger.list_batches()[0]["batch_id"], "events_keyset_all"
+        )
+        saved = failed["fetched_seq"]
+        assert saved >= 1
+        fake.rules.clear()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="oddsfox_catalogue.capture.runner"):
+            summary = run_capture(runtime, "bootstrap")
+        assert summary.resumed is True
+    finally:
+        runtime.ledger.close()
+    messages = [record.getMessage() for record in caplog.records]
+    assert f"capture scan events_keyset_all resuming after page {saved}" in messages
 
 
 def test_bootstrap_captures_list_scans_and_resolves_references(tmp_path: Path) -> None:

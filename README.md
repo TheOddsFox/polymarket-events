@@ -40,6 +40,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 | `make rebuild` | Rebuild from raw in a scratch area and compare table fingerprints with the live warehouse. Exit 4 on mismatch. |
 
 Each stage takes the run lock. A second writer fails immediately (exit 3) instead of racing.
+Refresh commands log scan progress and Gamma retries to stderr. The JSON result is still printed to stdout when the command finishes.
 Every stage writes a row to `stage_runs` in the ledger (status, counts, error).
 
 Lower-level commands: `uv run catalogue --help`.

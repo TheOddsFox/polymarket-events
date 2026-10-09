@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import threading
 import time
@@ -15,6 +16,8 @@ from typing import Any
 import httpx
 
 from oddsfox_catalogue.config import GammaSettings
+
+logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 DEFAULT_USER_AGENT = "oddsfox-catalogue/0.1 (+local batch pipeline)"
@@ -205,6 +208,13 @@ class GammaClient:
                     raise RetriesExhausted(f"{endpoint}: transport error: {exc}") from exc
                 retries += 1
                 self.stats.retries += 1
+                logger.warning(
+                    "gamma %s transport error, retry %s of %s: %s",
+                    endpoint,
+                    retries,
+                    self._settings.max_retries,
+                    exc,
+                )
                 self._sleep(self._delay(retries, None))
                 continue
 
@@ -221,6 +231,13 @@ class GammaClient:
                     raise RetriesExhausted(f"{endpoint}: HTTP {status} after {retries} retries")
                 retries += 1
                 self.stats.retries += 1
+                logger.warning(
+                    "gamma %s HTTP %s, retry %s of %s",
+                    endpoint,
+                    status,
+                    retries,
+                    self._settings.max_retries,
+                )
                 retry_after = parse_retry_after(raw.headers.get("Retry-After"), self._now())
                 self._sleep(self._delay(retries, retry_after))
                 continue

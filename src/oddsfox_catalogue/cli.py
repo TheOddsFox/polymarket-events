@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -36,6 +37,15 @@ from oddsfox_catalogue.runlock import RunBusy, current_git_sha, run_lock
 from oddsfox_catalogue.warehouse import BaselineMissing, read_open_event_ids
 
 Handler = Callable[[argparse.Namespace], int]
+
+
+def configure_logging() -> None:
+    """Send INFO and above to stderr. Library calls stay quiet until the CLI starts."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
 
 
 @contextmanager
@@ -319,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     handler: Handler = args.handler
