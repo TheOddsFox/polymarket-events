@@ -121,11 +121,20 @@ def test_exit_2_does_not_recrawl(tmp_path: Path) -> None:
     assert "attempt 2/" not in text
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def test_sigterm_logs_interrupt_and_does_not_retry(tmp_path: Path) -> None:
     stub = tmp_path / "stub.py"
     stub.write_text(
-        "import pathlib, sys, time\n"
-        "counter = pathlib.Path(sys.argv[1])\n"
+        "import os, pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "counter = pathlib.Path(sys.argv[2])\n"
         "calls = int(counter.read_text()) if counter.exists() else 0\n"
         "counter.write_text(str(calls + 1))\n"
         "print(f'stub attempt {calls + 1}', flush=True)\n"
@@ -133,9 +142,10 @@ def test_sigterm_logs_interrupt_and_does_not_retry(tmp_path: Path) -> None:
         "sys.exit(0)\n",
         encoding="utf-8",
     )
+    pid_file = tmp_path / "stub.pid"
     counter = tmp_path / "calls.txt"
     log_dir = tmp_path / "logs"
-    command = shlex.join([sys.executable, str(stub), str(counter)])
+    command = shlex.join([sys.executable, str(stub), str(pid_file), str(counter)])
     env = {key: value for key, value in os.environ.items() if not key.startswith("BOOTSTRAP_")}
     env.update(
         {
@@ -176,6 +186,11 @@ def test_sigterm_logs_interrupt_and_does_not_retry(tmp_path: Path) -> None:
     text = sorted(log_dir.glob("bootstrap-*.log"))[0].read_text(encoding="utf-8")
     assert "wrapper interrupted by SIGTERM" in text
     assert "attempt 2/" not in text
+    stub_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _alive(stub_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(stub_pid)
 
 
 def test_attempt_cap_is_inclusive_and_exits_nonzero(tmp_path: Path) -> None:

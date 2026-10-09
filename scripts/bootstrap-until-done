@@ -35,15 +35,15 @@ esac
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/bootstrap-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 
-# sh -c does not replace itself, so the command's process is a child of child_pid.
+# sh -c does not replace itself, so the command's process is a child of $1.
+# Kill with the function's own positional parameters. A variable copied from them
+# is global, and the recursive call would overwrite it before this frame's kill.
 signal_tree() {
-  pid=$1
-  name=$2
-  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  kids=$(pgrep -P "$1" 2>/dev/null || true)
   for kid in $kids; do
-    signal_tree "$kid" "$name"
+    signal_tree "$kid" "$2"
   done
-  kill -s "$name" "$pid" 2>/dev/null || true
+  kill -s "$2" "$1" 2>/dev/null || true
 }
 
 forward_signal() {

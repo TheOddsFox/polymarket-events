@@ -1,12 +1,13 @@
 import json
 import logging
+import os
 import signal
 from pathlib import Path
 
 import pytest
 
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.cli import Terminated, configure_logging, main
+from oddsfox_catalogue.cli import configure_logging, main
 from oddsfox_catalogue.config import load_settings
 from oddsfox_catalogue.runlock import RunBusy, run_lock
 
@@ -63,7 +64,7 @@ def test_sigterm_during_capture_records_failed_stage_and_exits_143(
     monkeypatch.setenv("CATALOGUE_GAMMA_BASE_URL", "http://127.0.0.1:9")
 
     def explode(*_args: object, **_kwargs: object) -> None:
-        raise Terminated(signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     monkeypatch.setattr("oddsfox_catalogue.capture.runner._run_scan", explode)
 
@@ -79,3 +80,14 @@ def test_sigterm_during_capture_records_failed_stage_and_exits_143(
     assert runs[0]["stage"] == "capture:bootstrap"
     assert runs[0]["status"] == "failed"
     assert runs[0]["error"] == "Terminated: SIGTERM"
+
+
+def test_sigterm_during_argument_parsing_exits_143(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("SIGTERM was not turned into Terminated")
+
+    monkeypatch.setattr("oddsfox_catalogue.cli.argparse.ArgumentParser.parse_args", boom)
+    assert main(["status"]) == 143

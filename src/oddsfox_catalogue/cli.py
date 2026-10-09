@@ -366,13 +366,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     restore_signals = _install_termination_handlers()
     try:
-        parser = build_parser()
-        args = parser.parse_args(argv)
-        handler: Handler = args.handler
         try:
+            parser = build_parser()
+            args = parser.parse_args(argv)
+            handler: Handler = args.handler
             return handler(args)
         except Terminated as exc:
             # 128 plus the signal number, so a resume wrapper does not treat a kill as exit 1.
+            # This covers a signal during argument parsing as well as during a stage.
             print(f"error: terminated by {exc}", file=sys.stderr)
             return 128 + exc.signum
         except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked) as exc:
