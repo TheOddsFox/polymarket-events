@@ -12,8 +12,8 @@ Operator targets: `make bootstrap` (first run), `make refresh` (daily), `make re
 
 ## Verification
 
-- Fast: `git diff --check`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest -q`
-- Completion: both diff checks, `uv lock --check`, `uv sync --locked`, the same Ruff checks, `uv run catalogue dbt -- parse`, and `uv run pytest -q`
+- Fast: `git diff --check`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest -q -n auto --dist loadscope`
+- Completion: both diff checks, `uv lock --check`, `uv sync --locked`, the same Ruff checks, `uv run catalogue dbt -- parse`, and `uv run pytest -q` (one process; CI matches this)
 
 These commands are wrapped by `scripts/verify-fast` and `scripts/verify`. Hosted CI runs the same lint, dbt parse, and test steps and never contacts Pad.
 

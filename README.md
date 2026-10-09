@@ -41,6 +41,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 
 Each stage takes the run lock. A second writer fails immediately (exit 3) instead of racing.
 Refresh commands log scan progress and Gamma retries to stderr. The JSON result is still printed to stdout when the command finishes.
+A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. Logs are written under `.state/logs/`.
 Every stage writes a row to `stage_runs` in the ledger (status, counts, error).
 
 Lower-level commands: `uv run catalogue --help`.
@@ -97,7 +98,8 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
 ## Recovery
 
 - **Crash during capture**: the next capture resumes the same batch. Page IDs and content are
-  deterministic, so a resumed page matches what was written before the crash.
+  deterministic, so a resumed page matches what was written before the crash. `scripts/bootstrap-until-done`
+  repeats that resume until the refresh exits 0, and it does not start a new crawl after dbt or publish fails.
 - **Crash during load**: rerunning the load is a no-op for rows already present. Observation IDs
   are unique and the load is insert-only, so nothing duplicates.
 - **Crash during publish**: `current.json` is replaced atomically, so readers keep the previous
@@ -123,10 +125,10 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
 - Nested `market.events` entries are references only. They are never treated as full events.
 - `outcomes`, `outcomePrices`, and `clobTokenIds`/`positionIds` arrive as JSON-encoded strings.
   dbt decodes them and quarantines any market whose lists do not align.
-- Requests are limited to 2 per second, with 10 s connect and 60 s read timeouts, and up to 5
-  retries using full-jitter backoff and `Retry-After`.
+- Requests are limited to 2 per second, with 10 s connect and 60 s read timeouts, and up to 12
+  retries (`backoff_base_s` 5, `backoff_cap_s` 300) using full-jitter backoff and `Retry-After`.
 
 ## Status
 
-The live Gamma API was not reachable from the development machine, so every test runs against
-synthetic fixtures. Run `tools/record_gamma_fixtures.py` from a machine with access to refresh them.
+Every test runs against synthetic fixtures and never calls the live Gamma API. Run
+`tools/record_gamma_fixtures.py` from a machine with access to refresh the optional live samples.
