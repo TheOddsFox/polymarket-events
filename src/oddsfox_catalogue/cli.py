@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -37,6 +38,33 @@ from oddsfox_catalogue.runlock import RunBusy, current_git_sha, run_lock
 from oddsfox_catalogue.warehouse import BaselineMissing, read_open_event_ids
 
 Handler = Callable[[argparse.Namespace], int]
+
+
+class Terminated(BaseException):
+    """The operator stopped the process with SIGHUP or SIGTERM.
+
+    A ``BaseException`` so the capture recorder still writes its ``stage_runs`` row,
+    and so ``except Exception`` does not treat an intentional stop as a crash worth retrying.
+    """
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(signal.Signals(signum).name)
+
+
+def _install_termination_handlers() -> Callable[[], None]:
+    """Turn SIGHUP and SIGTERM into ``Terminated``. Returns a restore function."""
+
+    def handle(signum: int, _frame: object) -> None:
+        raise Terminated(signum)
+
+    previous = {signum: signal.signal(signum, handle) for signum in (signal.SIGHUP, signal.SIGTERM)}
+
+    def restore() -> None:
+        for signum, previous_handler in previous.items():
+            signal.signal(signum, previous_handler)
+
+    return restore
 
 
 def configure_logging() -> None:
@@ -336,14 +364,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    handler: Handler = args.handler
+    restore_signals = _install_termination_handlers()
     try:
-        return handler(args)
-    except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 3
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        handler: Handler = args.handler
+        try:
+            return handler(args)
+        except Terminated as exc:
+            # 128 plus the signal number, so a resume wrapper does not treat a kill as exit 1.
+            print(f"error: terminated by {exc}", file=sys.stderr)
+            return 128 + exc.signum
+        except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
+    finally:
+        restore_signals()
 
 
 if __name__ == "__main__":

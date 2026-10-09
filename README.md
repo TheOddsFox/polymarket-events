@@ -41,7 +41,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 
 Each stage takes the run lock. A second writer fails immediately (exit 3) instead of racing.
 Refresh commands log scan progress and Gamma retries to stderr. The JSON result is still printed to stdout when the command finishes.
-A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. Logs are written under `.state/logs/`.
+A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. SIGHUP, SIGTERM, and SIGINT also stop immediately: the wrapper logs the signal and exits 128 plus the signal number, and the CLI records a failed `capture:<mode>` row before exiting the same way. Logs are written under `.state/logs/`.
 Every stage writes a row to `stage_runs` in the ledger (status, counts, error).
 
 Lower-level commands: `uv run catalogue --help`.

@@ -1,10 +1,13 @@
 import json
 import logging
+import signal
 from pathlib import Path
 
 import pytest
 
-from oddsfox_catalogue.cli import configure_logging, main
+from oddsfox_catalogue.capture.ledger import Ledger
+from oddsfox_catalogue.cli import Terminated, configure_logging, main
+from oddsfox_catalogue.config import load_settings
 from oddsfox_catalogue.runlock import RunBusy, run_lock
 
 
@@ -51,3 +54,28 @@ def test_run_lock_is_exclusive(tmp_path: Path) -> None:
 def test_capture_rejects_unknown_mode() -> None:
     with pytest.raises(SystemExit):
         main(["capture", "--mode", "hourly"])
+
+
+def test_sigterm_during_capture_records_failed_stage_and_exits_143(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
+    monkeypatch.setenv("CATALOGUE_GAMMA_BASE_URL", "http://127.0.0.1:9")
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise Terminated(signal.SIGTERM)
+
+    monkeypatch.setattr("oddsfox_catalogue.capture.runner._run_scan", explode)
+
+    assert main(["refresh", "--mode", "bootstrap"]) == 143
+
+    settings = load_settings()
+    ledger = Ledger(settings.ledger_path)
+    try:
+        runs = ledger.stage_runs()
+    finally:
+        ledger.close()
+    assert len(runs) == 1
+    assert runs[0]["stage"] == "capture:bootstrap"
+    assert runs[0]["status"] == "failed"
+    assert runs[0]["error"] == "Terminated: SIGTERM"

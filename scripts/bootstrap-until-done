@@ -2,7 +2,9 @@
 # Re-run bootstrap only when the command crashes (exit 1). Gamma retries exhausted raise out of
 # the CLI, so the process exits 1 and the capturing batch can be resumed. Exit 0 is success.
 # Exit 2 is a handled failure after capture (dbt or publish); retrying would open a new full
-# crawl. Exit 3 is the run lock or a blocked stage. Anything other than 1 stops immediately.
+# crawl. Exit 3 is the run lock or a blocked stage. SIGHUP, SIGTERM, and SIGINT stop
+# immediately too: the wrapper logs the signal, forwards it to the child, and exits
+# 128 plus the signal number so a kill is not retried. Anything other than 1 stops immediately.
 # Each attempt appends its output and one "attempt N/M exit=RC" line to a timestamped log under
 # .state/logs. BOOTSTRAP_LOG_DIR overrides that directory so tests can stay out of the
 # repository's .state. Relative paths resolve from the repository root.
@@ -33,10 +35,39 @@ esac
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/bootstrap-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 
+# sh -c does not replace itself, so the command's process is a child of child_pid.
+signal_tree() {
+  pid=$1
+  name=$2
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  for kid in $kids; do
+    signal_tree "$kid" "$name"
+  done
+  kill -s "$name" "$pid" 2>/dev/null || true
+}
+
+forward_signal() {
+  name=$1
+  code=$2
+  printf '%s wrapper interrupted by SIG%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" >>"$LOG"
+  if [ -n "${child_pid:-}" ]; then
+    signal_tree "$child_pid" "$name"
+  fi
+  exit "$code"
+}
+
+trap 'forward_signal HUP 129' HUP
+trap 'forward_signal TERM 143' TERM
+trap 'forward_signal INT 130' INT
+
 attempt=1
+child_pid=
 while :; do
   rc=0
-  sh -c "$COMMAND" >>"$LOG" 2>&1 || rc=$?
+  sh -c "$COMMAND" >>"$LOG" 2>&1 &
+  child_pid=$!
+  wait "$child_pid" || rc=$?
+  child_pid=
   printf '%s attempt %s/%s exit=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$attempt" "$MAX_ATTEMPTS" "$rc" >>"$LOG"
 

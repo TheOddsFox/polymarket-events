@@ -8,8 +8,10 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -116,6 +118,63 @@ def test_exit_2_does_not_recrawl(tmp_path: Path) -> None:
     assert sleeps == []
     text = logs[0].read_text(encoding="utf-8")
     assert "attempt 1/20 exit=2" in text
+    assert "attempt 2/" not in text
+
+
+def test_sigterm_logs_interrupt_and_does_not_retry(tmp_path: Path) -> None:
+    stub = tmp_path / "stub.py"
+    stub.write_text(
+        "import pathlib, sys, time\n"
+        "counter = pathlib.Path(sys.argv[1])\n"
+        "calls = int(counter.read_text()) if counter.exists() else 0\n"
+        "counter.write_text(str(calls + 1))\n"
+        "print(f'stub attempt {calls + 1}', flush=True)\n"
+        "time.sleep(30)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    counter = tmp_path / "calls.txt"
+    log_dir = tmp_path / "logs"
+    command = shlex.join([sys.executable, str(stub), str(counter)])
+    env = {key: value for key, value in os.environ.items() if not key.startswith("BOOTSTRAP_")}
+    env.update(
+        {
+            "BOOTSTRAP_COMMAND": command,
+            "BOOTSTRAP_RETRY_SLEEP_S": "0",
+            "BOOTSTRAP_LOG_DIR": str(log_dir),
+            "CATALOGUE_GAMMA_BASE_URL": "http://127.0.0.1:9",
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+
+    proc = subprocess.Popen(
+        [str(SCRIPT)],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    text = ""
+    while time.monotonic() < deadline:
+        logs = sorted(log_dir.glob("bootstrap-*.log"))
+        text = logs[0].read_text(encoding="utf-8") if logs else ""
+        if "stub attempt 1" in text:
+            break
+        time.sleep(0.05)
+    else:
+        proc.kill()
+        err = proc.stderr.read() if proc.stderr is not None else ""
+        raise AssertionError(f"stub never started: {text!r} stderr={err}")
+
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=10)
+
+    assert proc.returncode == 143, stderr or stdout
+    assert int(counter.read_text()) == 1
+    text = sorted(log_dir.glob("bootstrap-*.log"))[0].read_text(encoding="utf-8")
+    assert "wrapper interrupted by SIGTERM" in text
     assert "attempt 2/" not in text
 
 
