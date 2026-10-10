@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: int_event_semantic
+    description: Fields that define an event's meaning, hashed under the projection version. Volatile fields are excluded.
+    columns:
+      - name: semantic_hash
+        tests: [not_null]
+
+  - name: int_market_semantic
+    description: Fields that define a market's meaning, hashed under the projection version. Prices and volume are excluded.
+    columns:
+      - name: semantic_hash
+        tests: [not_null]
+
+  - name: event_history
+    description: Immutable event observations with receipt provenance; no validity intervals.
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]
+      - name: event_id
+        tests: [not_null]
+      - name: observed_at
+        tests: [not_null]
+
+  - name: market_history
+    description: Immutable market observations, native identity and label evidence.
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]
+      - name: market_id
+        tests: [not_null]
+      - name: observed_at
+        tests: [not_null]
+
+  - name: event_metrics
+    description: Volatile event measurements, one row per observation. Append-only; never rewritten.
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]
+
+  - name: market_metrics
+    description: Volatile market measurements, one row per observation. Append-only; never rewritten.
+    columns:
+      - name: observation_id
+        tests: [unique, not_null]

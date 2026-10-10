@@ -4,10 +4,11 @@
 UV ?= uv
 RUN := $(UV) run --locked
 CATALOGUE := $(RUN) catalogue
-export DAGSTER_HOME := $(CURDIR)/.state/dagster_home
+export CATALOGUE_ROOT ?= $(CURDIR)
+export DAGSTER_HOME ?= $(CATALOGUE_ROOT)/.state/dagster_home
 
 .PHONY: sync lint test test-dev dagster-home bootstrap refresh reconcile replay validate publish \
-	current status dbt-parse backup verify-backup rebuild
+	current status verify dbt-parse backup verify-backup restore-backup rebuild
 
 sync:
 	$(UV) sync --locked
@@ -27,15 +28,15 @@ dagster-home:
 	cp ops/dagster.yaml "$(DAGSTER_HOME)/dagster.yaml"
 
 # First run on an empty project: captures every bootstrap page, loads, builds, publishes.
-bootstrap: dagster-home
+bootstrap:
 	$(CATALOGUE) refresh --mode bootstrap
 
-# Daily incremental refresh: open events plus recently changed events.
-refresh: dagster-home
+# Daily refresh: direct open markets/events and missing previously open or unknown records.
+refresh:
 	$(CATALOGUE) refresh --mode daily
 
 # Weekly full pass: every event and every closed market by id range, open markets by keyset, then by-ID fetches for referenced events those scans did not return.
-reconcile: dagster-home
+reconcile:
 	$(CATALOGUE) refresh --mode reconcile
 
 # Load pending raw pages, build, and publish without calling Gamma.
@@ -54,6 +55,9 @@ current:
 status:
 	$(CATALOGUE) status
 
+verify:
+	$(CATALOGUE) verify
+
 dbt-parse:
 	$(CATALOGUE) dbt -- parse
 
@@ -64,6 +68,10 @@ backup:
 # Usage: make verify-backup BACKUP=data/backups/20261008T060000Z
 verify-backup:
 	$(CATALOGUE) backup verify "$(BACKUP)"
+
+# Usage: make restore-backup BACKUP=... DESTINATION=/absolute/path/to/fresh/root
+restore-backup:
+	$(CATALOGUE) backup restore "$(BACKUP)" --destination "$(DESTINATION)"
 
 # Rebuild from raw in a scratch area and compare table fingerprints with the live warehouse.
 rebuild:

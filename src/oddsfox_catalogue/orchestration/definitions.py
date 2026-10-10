@@ -17,7 +17,9 @@ The ``validate`` job runs ``dbt test`` only and never appends a catalogue_snapsh
 
 import json
 import os
+import subprocess
 import sys
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,19 +50,21 @@ from dagster import (
 from dagster_dbt import DbtCliResource, DbtProject, dbt_assets
 
 from oddsfox_catalogue.capture.ledger import Ledger
+from oddsfox_catalogue.certification import certify_build, prepare_dbt_execution
 from oddsfox_catalogue.config import Settings, load_settings
 from oddsfox_catalogue.dbt_runner import (
-    DBT_DIR,
     assert_warehouse_released,
+    dbt_environment,
     run_dbt_at,
     with_quality_vars,
 )
 from oddsfox_catalogue.ids import utc_now
+from oddsfox_catalogue.limits import remaining_temp_bytes
 from oddsfox_catalogue.pipeline import (
     capture_stage,
+    dbt_execution,
     dbt_stage,
     load_stage,
-    open_event_drop_warning,
     publish_stage,
 )
 from oddsfox_catalogue.publish import PublishBlocked
@@ -94,16 +98,20 @@ def _dbt_project(settings: Settings) -> DbtProject:
     target = settings.state_dir / "dbt" / "target"
     result = run_dbt_at(
         ["parse"],
-        project_dir=DBT_DIR,
-        profiles_dir=DBT_DIR,
+        project_dir=settings.dbt_project_dir,
+        profiles_dir=settings.dbt_profiles_dir,
         warehouse=settings.warehouse_path,
         work_dir=settings.state_dir / "dbt",
+        memory_limit=settings.load.duckdb_memory_limit,
+        max_temp_bytes=remaining_temp_bytes(settings),
+        threads=settings.load.duckdb_threads,
+        temporary_dir=settings.temporary_dir,
     )
     if result.returncode != 0:
         raise RuntimeError(f"dbt parse failed:\n{result.stdout[-2000:]}")
     return DbtProject(
-        project_dir=DBT_DIR,
-        profiles_dir=DBT_DIR,
+        project_dir=settings.dbt_project_dir,
+        profiles_dir=settings.dbt_profiles_dir,
         target_path=target,
     )
 
@@ -116,7 +124,9 @@ def build_definitions(
     """Build the Dagster definitions for one project root. ``transport`` is for tests only."""
     # dbt reads the warehouse location from the environment. Dagster runs in this process,
     # so the variable is set once here and inherited by every dbt subprocess.
-    os.environ["CATALOGUE_WAREHOUSE"] = str(settings.warehouse_path)
+    os.environ.update(dbt_environment(settings))
+    os.environ["DBT_LOG_PATH"] = str(settings.state_dir / "dbt" / "logs")
+    os.environ["DBT_SEND_ANONYMOUS_USAGE_STATS"] = "false"
     project = _dbt_project(settings)
 
     @asset(
@@ -163,19 +173,38 @@ def build_definitions(
 
     @dbt_assets(manifest=project.manifest_path, project=project)
     def catalogue_dbt(context: AssetExecutionContext, dbt: DbtCliResource) -> Iterator[Any]:
-        assert_warehouse_released(settings.warehouse_path)
-        yield from dbt.cli(
-            with_quality_vars(settings, ["build"]), context=context.op_execution_context
-        ).stream()
-        # Reached only after a passing build. Same check as the CLI stage, logged to the run.
-        warning = open_event_drop_warning(settings, warn=context.log.warning)
-        if warning is not None:
-            context.log.warning(
-                "open events dropped %.2f%% (%s to %s), inside the warn band",
-                warning["open_events_drop_pct"],
-                warning["open_events_previous"],
-                warning["open_events_latest"],
+        with dbt_execution(settings, ["build"]) as run:
+            assert_warehouse_released(settings.warehouse_path)
+            os.environ.update(dbt_environment(settings))
+            target = settings.state_dir / "dbt" / "dagster" / uuid.uuid4().hex
+            args = with_quality_vars(settings, ["build"])
+            prepare_dbt_execution(settings, target, args=args)
+            invocation = dbt.cli(
+                args,
+                context=context.op_execution_context,
+                target_path=target,
             )
+            try:
+                yield from invocation.stream()
+                receipt = certify_build(settings, invocation.target_path)
+                run.counts["certified"] = True
+                warning = receipt["warning"]
+                if warning is not None:
+                    run.counts.update(warning)
+                    context.log.warning(
+                        "open events dropped %.2f%% (%s to %s), inside the warn band",
+                        warning["open_events_drop_pct"],
+                        warning["open_events_previous"],
+                        warning["open_events_latest"],
+                    )
+            finally:
+                if invocation.process.poll() is None:
+                    invocation.process.terminate()
+                    try:
+                        invocation.process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        invocation.process.kill()
+                        invocation.process.wait()
 
     @asset(
         key=PUBLISHED_KEY,
@@ -193,9 +222,8 @@ def build_definitions(
         )
 
     dbt_resource = DbtCliResource(
-        project_dir=DBT_DIR,
-        profiles_dir=DBT_DIR,
-        target_path=settings.state_dir / "dbt" / "target",
+        project_dir=settings.dbt_project_dir,
+        profiles_dir=settings.dbt_profiles_dir,
         dbt_executable=str(Path(sys.executable).with_name("dbt")),
     )
 

@@ -30,6 +30,7 @@ NOW = datetime(2026, 10, 10, tzinfo=UTC)
 def market(market_id: str = "123", **extra):
     return {
         "id": market_id,
+        "version": "v1",
         "conditionId": CONDITION,
         "outcomes": '["Above", "Below"]',
         "clobTokenIds": '["100", "200"]',
@@ -86,7 +87,7 @@ def test_identity_is_independent_of_prices_and_preserves_exact_native_values():
     projected, outcomes = project(observation(raw))
     assert projected["usable"]
     assert projected["active"] is None and projected["closed"] is False
-    assert projected["tick_size"] == "1E-18"
+    assert projected["tick_size"] == "0.000000000000000001"
     assert projected["start_at"] == "2026-01-01T00:00:00.000Z"
     assert [row["outcome_index"] for row in outcomes] == [1, 2]
     assert [row["asset_id"] for row in outcomes] == ["100", "200"]
@@ -118,8 +119,11 @@ def test_multi_outcome_and_position_only_identities():
         {"clobTokenIds": '["01", "200"]'},
         {"clobTokenIds": [str(2**256), "200"]},
         {"version": "v2"},
-        {"version": "v1", "positionIds": ["100", "200"]},
+        {"version": None},
         {"version": "v3"},
+        {"version": 1},
+        {"version": True},
+        {"version": "2"},
         {"conditionId": "invalid"},
     ],
 )
@@ -186,7 +190,7 @@ def test_native_identity_with_multiple_owners_is_unusable(tmp_path):
     output = tmp_path / "bundle"
     export_metadata(settings, ["123", "124"], output)
     assert all(not row["usable"] for row in relations(output)["markets"])
-    assert all(not row["usable"] for row in relations(output)["outcomes"])
+    assert relations(output)["outcomes"] == []
 
 
 def test_refresh_only_selected_ids_accounts_failures_and_does_not_load_or_publish(tmp_path):
@@ -474,3 +478,42 @@ def test_export_output_budget_does_not_commit_partial_bundle(tmp_path):
         export_metadata(settings, ["123"], tmp_path / "bundle", max_output_bytes=20)
     assert not (tmp_path / "bundle").exists()
     assert not list(tmp_path.glob(".metadata-*"))
+
+
+def test_source_timestamp_precision_matches_shared_warehouse_projection():
+    from oddsfox_catalogue.normalization import normalize_market
+
+    raw = market(
+        updatedAt="2026-10-10T01:02:03.139795+02:00", endDate="2026-10-11T01:02:03.001234Z"
+    )
+    observed = observation(raw)
+    projected, _ = project(observed)
+    normalized = normalize_market(raw, observed.provenance)
+    assert (
+        projected["source_updated_at"]
+        == normalized["source_updated_at"]
+        == "2026-10-09T23:02:03.139795Z"
+    )
+    assert projected["end_at"] == normalized["end_at"] == "2026-10-11T01:02:03.001234Z"
+
+
+def test_absurd_decimal_exponent_is_rejected_before_expansion():
+    from oddsfox_catalogue.normalization import NormalizationError, decimal_string
+
+    with pytest.raises(NormalizationError, match="expansion exceeds"):
+        decimal_string(Decimal("1e100000000"))
+    with pytest.raises(NormalizationError, match="expansion exceeds"):
+        decimal_string(Decimal("1e-100000000"))
+
+
+def test_receipt_authority_compares_instants_across_timezone_offsets(tmp_path):
+    settings = Settings(tmp_path)
+    raw_page(settings, [market(question="Later")], name="later", stamp="2026-10-10T00:00:00.001Z")
+    raw_page(
+        settings,
+        [market(question="Earlier")],
+        name="earlier",
+        stamp="2026-10-10T02:00:00.000+02:00",
+    )
+    export_metadata(settings, ["123"], tmp_path / "bundle")
+    assert relations(tmp_path / "bundle")["markets"][0]["question"] == "Later"

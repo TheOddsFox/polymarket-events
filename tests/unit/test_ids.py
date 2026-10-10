@@ -82,3 +82,22 @@ def test_ids_hash_is_order_independent() -> None:
 def test_observation_date_is_utc_calendar_day() -> None:
     late = datetime(2026, 10, 8, 23, 30, tzinfo=timezone(timedelta(hours=-5)))
     assert observation_date(late) == "2026-10-09"
+
+
+@pytest.mark.parametrize("operation", ["canonical", "projection"])
+def test_cumulative_decimal_expansion_fails_before_allocating_output(operation):
+    import json
+    import tracemalloc
+    from decimal import Decimal
+
+    from oddsfox_catalogue.normalization import exact_json
+
+    values = json.loads("[" + ",".join(["1e4000"] * 4500) + "]", parse_float=Decimal)
+    function = canonical_json if operation == "canonical" else exact_json
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="byte allowance"):
+            function({"unknown_source_field": values})
+        assert tracemalloc.get_traced_memory()[1] < 2 * 1024**2
+    finally:
+        tracemalloc.stop()

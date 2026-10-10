@@ -1,4 +1,4 @@
-"""Quality limits: validation of the [quality] section and their translation into dbt vars."""
+"""Quality configuration no longer supplies legacy SQL publication baselines."""
 
 from __future__ import annotations
 
@@ -15,16 +15,13 @@ def _settings(tmp_path: Path, **env: str):
     return load_settings(root=tmp_path, env=env)
 
 
-def test_quality_vars_come_from_the_configured_limits(tmp_path: Path) -> None:
+def test_quality_limits_do_not_become_legacy_sql_vars(tmp_path: Path) -> None:
     settings = _settings(
         tmp_path,
         CATALOGUE_QUALITY_OPEN_EVENTS_DROP_ERROR_PCT="25",
-        CATALOGUE_QUALITY_UNRESOLVED_REFERENCE_MAX_RATIO="0.05",
     )
-    assert quality_dbt_vars(settings) == {
-        "max_open_events_drop_pct": 0.25,
-        "max_unresolved_reference_ratio": 0.05,
-    }
+    assert quality_dbt_vars(settings) == {}
+    assert settings.quality.open_events_drop_error_pct == 25
 
 
 def test_with_quality_vars_appends_when_no_vars_given(tmp_path: Path) -> None:
@@ -35,15 +32,11 @@ def test_with_quality_vars_appends_when_no_vars_given(tmp_path: Path) -> None:
     assert json.loads(args[2]) == quality_dbt_vars(settings)
 
 
-def test_with_quality_vars_lets_the_caller_override_a_key(tmp_path: Path) -> None:
+def test_with_quality_vars_preserves_explicit_caller_vars(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    args = with_quality_vars(settings, ["build", "--vars", '{"max_open_events_drop_pct": 0.9}'])
+    args = with_quality_vars(settings, ["build", "--vars", '{"projection_version": "v2"}'])
     merged = json.loads(args[args.index("--vars") + 1])
-    assert merged["max_open_events_drop_pct"] == 0.9
-    assert (
-        merged["max_unresolved_reference_ratio"]
-        == quality_dbt_vars(settings)["max_unresolved_reference_ratio"]
-    )
+    assert merged == {"projection_version": "v2"}
     assert args.count("--vars") == 1
 
 
@@ -51,6 +44,17 @@ def test_with_quality_vars_rejects_a_non_object_vars(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with pytest.raises(ValueError, match="JSON object"):
         with_quality_vars(settings, ["build", "--vars", "[1, 2]"])
+
+
+def test_vars_equals_is_canonical_and_duplicates_are_rejected(tmp_path):
+    settings = _settings(tmp_path)
+    assert with_quality_vars(settings, ["build", '--vars={"projection_version":"v2"}']) == [
+        "build",
+        "--vars",
+        '{"projection_version": "v2"}',
+    ]
+    with pytest.raises(ValueError, match="duplicate"):
+        with_quality_vars(settings, ["build", "--vars={}", "--vars", "{}"])
 
 
 def test_warn_above_error_is_rejected(tmp_path: Path) -> None:
@@ -67,7 +71,6 @@ def test_warn_above_error_is_rejected(tmp_path: Path) -> None:
     [
         {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "1.5"},
         {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "-0.1"},
-        {"CATALOGUE_QUALITY_UNRESOLVED_REFERENCE_MAX_RATIO": "2"},
         {"CATALOGUE_QUALITY_OPEN_EVENTS_DROP_ERROR_PCT": "150"},
     ],
 )

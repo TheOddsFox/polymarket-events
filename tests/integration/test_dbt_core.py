@@ -89,8 +89,8 @@ def _snapshot(warehouse: Path, table: str, key: str) -> list[tuple]:
 STATE_TABLES = {
     "core.events_current": "venue, event_id",
     "core.markets_current": "venue, market_id",
-    "history.event_history": "venue, event_id, version_no",
-    "history.market_history": "venue, market_id, version_no",
+    "history.event_history": "venue, event_id, observation_id",
+    "history.market_history": "venue, market_id, observation_id",
     "history.event_metrics": "observation_id",
     "history.market_metrics": "observation_id",
 }
@@ -119,8 +119,8 @@ def _state(settings: Settings) -> dict[str, list[tuple]]:
     return {t: _snapshot(settings.warehouse_path, t, k) for t, k in STATE_TABLES.items()}
 
 
-def test_incremental_build_matches_full_rebuild_after_a_closure(built, tmp_path: Path) -> None:
-    # The built copy already holds the bootstrap build, the baseline for the incremental runs.
+def test_repeated_build_matches_full_rebuild_after_a_closure(built, tmp_path: Path) -> None:
+    # The built copy holds the initial bootstrap observations.
     settings = copy_built(built[0], tmp_path)
 
     # Event 202 closes between batches. Daily capture must fetch it by ID and reflect it.
@@ -130,7 +130,7 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(built, tmp_path:
     _daily_batch(settings, tmp_path, closed_world, days=1)
 
     # The demo world has two open events, so closing one is a 50% drop by design. The
-    # regression threshold is loosened for this test only; the blocking test below keeps it.
+    # release regression enforcement is exercised by publication tests.
     incremental = run_dbt(["build", "--vars", DROP_THRESHOLD], settings.warehouse_path, tmp_path)
     assert incremental.returncode == 0, incremental.stdout[-3000:]
 
@@ -149,17 +149,17 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(built, tmp_path:
 
     versions = _snapshot_query(
         settings.warehouse_path,
-        "SELECT version_no, closed, is_current FROM history.event_history"
-        " WHERE event_id = '202' ORDER BY version_no",
+        "SELECT closed FROM history.event_history"
+        " WHERE event_id = '202' ORDER BY observed_at, observation_id",
     )
-    assert versions == [(1, False, False), (2, True, True)], "closing starts a new SCD2 version"
+    assert versions == [(False,), (True,)], "both immutable observations are retained"
     unchanged = _snapshot_query(
         settings.warehouse_path,
         "SELECT COUNT(*) FROM history.event_history WHERE event_id = '101'",
     )
-    assert unchanged == [(1,)], "an unchanged event keeps a single version"
+    assert unchanged == [(2,)], "unchanged observations remain distinct source evidence"
 
-    # A second batch on top of the incremental state. The metrics tables must gain its
+    # A second batch must add observations. The metrics tables must gain its
     # observations, each exactly once.
     metric_rows = _scalar(settings.warehouse_path, "SELECT COUNT(*) FROM history.event_metrics")
     _daily_batch(settings, tmp_path, closed_world, days=2)
@@ -183,45 +183,22 @@ def test_incremental_build_matches_full_rebuild_after_a_closure(built, tmp_path:
     assert after_incremental == _state(settings), "incremental state must equal a full rebuild"
 
 
-def test_count_regression_blocks_the_build(built, tmp_path: Path) -> None:
-    """A sudden drop in open events must fail the build, so publication never runs on it."""
-    settings = copy_built(built[0], tmp_path)
-
-    closed_world = demo_world()
-    closed_world.events["202"]["closed"] = True
-    closed_world.events["202"]["updatedAt"] = "2026-10-08T07:00:00Z"
-    runtime, _ = build_runtime(
-        tmp_path,
-        FakeGamma(closed_world),
-        now=FIXED_NOW + timedelta(days=1),
-        open_event_ids=lambda: read_open_event_ids(settings.warehouse_path),
-    )
-    try:
-        run_capture(runtime, "daily")
-    finally:
-        runtime.ledger.close()
-    _load(settings)
-
-    blocked = run_dbt(["build"], settings.warehouse_path, tmp_path)
-    assert blocked.returncode != 0
-    assert "assert_open_events_not_dropping" in blocked.stdout
-
-
-def test_unresolved_event_reference_blocks_the_build(tmp_path: Path) -> None:
-    """A market whose nested event stub names an event that was never captured.
-
-    The demo world resolves every reference, so it builds. This world adds one market whose
-    ``events`` stub points at event 999999, which is not in the captured events. That single
-    unresolved reference is far above the 1% cap, so the build must fail.
-    """
+def test_confirmed_absent_event_reference_is_retained(tmp_path: Path) -> None:
+    """Confirmed absence remains explicit and does not erase relationship evidence."""
     world = demo_world()
     ghost = {"id": "999999", "ticker": None, "slug": None, "title": "gone"}
     world.add_direct_market(make_market("9002", "Ghost market?", event_stub=ghost))
     settings = capture_and_load(tmp_path, world=world)
 
     result = run_dbt(["build"], settings.warehouse_path, tmp_path)
-    assert result.returncode != 0
-    assert "assert_unresolved_event_refs_within_limit" in result.stdout
+    assert result.returncode == 0, result.stdout[-3000:]
+    assert (
+        _scalar(
+            settings.warehouse_path,
+            "SELECT count(*) FROM core.market_event_bridge WHERE event_id = '999999'",
+        )
+        == 1
+    )
 
 
 def test_demo_world_resolves_every_event_reference(built, tmp_path: Path) -> None:

@@ -17,10 +17,13 @@ from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
 from fakes.harness import FIXED_NOW, build_runtime, make_settings
 from fakes.world import demo_world
-from oddsfox_catalogue.backup import MANIFEST, create_backup, verify_backup
+from oddsfox_catalogue.backup import MANIFEST, create_backup, restore_backup, verify_backup
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import rebuild_from_raw, run_capture
+from oddsfox_catalogue.certification import assert_build_valid
+from oddsfox_catalogue.config import load_settings
 from oddsfox_catalogue.pipeline import capture_stage, dbt_stage, load_stage
+from oddsfox_catalogue.publish import current_release, publish_release
 from oddsfox_catalogue.rebuild import (
     VERIFIED_TABLES,
     rebuild_and_verify,
@@ -113,8 +116,46 @@ def test_backup_verifies_and_detects_tampering(tmp_path: Path) -> None:
     page.write_bytes(page.read_bytes() + b"x")
     (backup / "stray.txt").write_text("not in the manifest")
     problems = verify_backup(backup)
-    assert any(p.startswith("checksum mismatch raw/") for p in problems)
+    assert any(p.startswith("size mismatch raw/") for p in problems)
     assert "unlisted file stray.txt" in problems
+
+
+def test_backup_restores_a_verified_publication_into_a_fresh_root(built_root, tmp_path: Path):
+    settings = copy_built(built_root, tmp_path / "source")
+    publish_release(settings, now=FIXED_NOW)
+    pointer = current_release(settings)
+    backup = create_backup(settings, now=FIXED_NOW)
+    destination = tmp_path / "restored"
+    restore_backup(backup, destination)
+    restored = load_settings(root=destination, env={})
+    assert current_release(restored) == pointer
+    assert_build_valid(restored)
+    assert warehouse_fingerprints(
+        restored.warehouse_path, VERIFIED_TABLES
+    ) == warehouse_fingerprints(settings.warehouse_path, VERIFIED_TABLES)
+    assert restored.quality == settings.quality
+
+
+def test_rebuild_rejects_existing_scratch_without_deleting_evidence(built_root, tmp_path: Path):
+    settings = copy_built(built_root, tmp_path / "source")
+    scratch = tmp_path / "prior-rebuild"
+    scratch.mkdir()
+    (scratch / "keep").write_bytes(b"diagnostic evidence")
+    with pytest.raises(FileExistsError, match="fresh scratch"):
+        rebuild_and_verify(settings, scratch=scratch)
+    assert (scratch / "keep").read_bytes() == b"diagnostic evidence"
+
+
+def test_rebuild_detects_metrics_and_relationship_mutation(built_root, tmp_path: Path):
+    settings = copy_built(built_root, tmp_path)
+    with duckdb.connect(str(settings.warehouse_path)) as connection:
+        connection.execute("DELETE FROM history.market_metrics")
+        connection.execute("DELETE FROM core.market_event_bridge")
+    report = rebuild_and_verify(settings)
+    assert not report.matched
+    assert any(name.startswith("history.market_metrics:") for name in report.mismatches)
+    assert any(name.startswith("core.market_event_bridge:") for name in report.mismatches)
+    assert any(name.startswith("published:market_event_bridge:") for name in report.mismatches)
 
 
 def test_stages_record_their_outcome_in_stage_runs(tmp_path: Path) -> None:
@@ -214,6 +255,10 @@ def test_open_event_drop_in_warn_band_builds_and_is_recorded(built_root, tmp_pat
             "CATALOGUE_QUALITY_OPEN_EVENTS_DROP_ERROR_PCT": "60",
         },
     )
+    # A changed quality policy needs its own complete build certification.
+    initial = dbt_stage(tolerant, ["build"])
+    assert initial.returncode == 0, initial.stdout[-3000:]
+    publish_release(tolerant, now=FIXED_NOW)
     _close_event_202_and_load(tolerant)
     built = dbt_stage(tolerant, ["build"])
     assert built.returncode == 0, built.stdout[-3000:]
@@ -230,11 +275,14 @@ def test_open_event_drop_in_warn_band_builds_and_is_recorded(built_root, tmp_pat
 def test_open_event_drop_above_error_fails_the_stage(built_root, tmp_path: Path) -> None:
     """With the default 10% error cap, the same 50% drop fails the build and is recorded."""
     settings = copy_built(built_root, tmp_path)
+    publish_release(settings, now=FIXED_NOW)
     _close_event_202_and_load(settings)
 
     failed = dbt_stage(settings, ["build"])
     assert failed.returncode != 0
-    assert "assert_open_events_not_dropping" in failed.stdout
+    assert "against the published baseline" in failed.stdout
+    # Repeating a failed build must still compare with the valid published baseline.
+    assert dbt_stage(settings, ["build"]).returncode != 0
 
     row = [r for r in _stage_rows(settings) if r["stage"] == "dbt:build"][-1]
     assert row["status"] == "failed"

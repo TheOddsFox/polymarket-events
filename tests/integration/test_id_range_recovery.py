@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import subprocess
@@ -23,7 +22,7 @@ from fakes.harness import FIXED_NOW, build_runtime
 from fakes.world import World, demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture import runner
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.reader import iter_scan_pages, scan_dir_for
+from oddsfox_catalogue.capture.reader import DurabilityError, scan_dir_for
 from oddsfox_catalogue.capture.runner import (
     CaptureSummary,
     _finalise_if_complete,
@@ -35,8 +34,9 @@ from oddsfox_catalogue.capture.runner import (
     rebuild_from_raw,
     run_capture,
 )
-from oddsfox_catalogue.capture.writer import manifest_path, read_body
+from oddsfox_catalogue.capture.writer import manifest_path
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
+from oddsfox_catalogue.gamma.http import RetriesExhausted
 from oddsfox_catalogue.gamma.scans import (
     ScanSpec,
     id_chunk_scan,
@@ -50,9 +50,7 @@ CHILD = TESTS_DIR / "fakes" / "capture_child.py"
 SERIAL = {"CATALOGUE_CAPTURE_WORKERS": "1"}
 BOOTSTRAP_LIST_SCANS = {
     "events_ids_0001",
-    "events_ids_tail",
     "markets_closed_ids_0001",
-    "markets_closed_ids_tail",
     "markets_keyset_open",
 }
 
@@ -106,7 +104,11 @@ def test_rebuild_restores_planned_scans_that_never_started(tmp_path: Path) -> No
 
     resumed_runtime, _ = build_runtime(crash_root, FakeGamma(demo_world()), env=SERIAL)
     try:
-        resumed = run_capture(resumed_runtime, "bootstrap")
+        resumed = run_capture(
+            resumed_runtime,
+            "bootstrap",
+            resume=resumed_runtime.ledger.list_batches()[0]["batch_id"],
+        )
         assert resumed.status == "captured"
         assert _page_fingerprints(resumed_runtime.ledger, resumed.batch_id) == clean_pages
     finally:
@@ -176,7 +178,11 @@ def _planning_crash_then_rebuild_and_resume(
 
     resumed_runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
     try:
-        resumed = run_capture(resumed_runtime, "bootstrap")
+        resumed = run_capture(
+            resumed_runtime,
+            "bootstrap",
+            resume=resumed_runtime.ledger.list_batches()[0]["batch_id"],
+        )
         assert resumed.status == "captured"
         assert _scan_names(resumed_runtime.ledger, resumed.batch_id) == clean_names
         assert _page_fingerprints(resumed_runtime.ledger, resumed.batch_id) == clean_pages
@@ -203,7 +209,7 @@ def test_a_crash_while_planning_stage_one_keeps_every_planned_scan(
     )
 
 
-def test_a_stage_one_chunk_with_a_rejected_id_is_split_and_captured(tmp_path: Path) -> None:
+def test_a_stage_one_rejected_singleton_blocks_completion_until_recovered(tmp_path: Path) -> None:
     """Stage one shares the window policy. A rejected id is split off and quarantined by ID."""
     poison = "990001"
     fake = FakeGamma(_world_with_ghost_references(2))
@@ -228,22 +234,18 @@ def test_a_stage_one_chunk_with_a_rejected_id_is_split_and_captured(tmp_path: Pa
     )
     runtime, _ = build_runtime(tmp_path, fake)
     try:
-        summary = run_capture(runtime, "bootstrap")
-        assert summary.status == "captured"
-        batch = runtime.ledger.get_batch(summary.batch_id)
-        scan = runtime.ledger.latest_attempt(summary.batch_id, "events_by_id_0001")
-        assert scan["status"] == "complete"
-        directory = runtime.settings.raw_dir / batch["observation_date"] / batch["batch_id"]
-        failed: list[str] = []
-        for manifest, _records in iter_scan_pages(runtime.settings, batch, scan):
-            body = json.loads(read_body(directory / scan["scan_id"], manifest))
-            failed.extend(item["id"] for item in body.get("fetch_failed", []))
-        assert failed == [poison]
-        # Stage two must not fetch an id stage one already quarantined.
-        for follow_up in runtime.ledger.list_scans(summary.batch_id):
-            if follow_up["kind"] != "single_ids":
-                continue
-            assert poison not in json.loads(follow_up["input_ids_json"] or "[]")
+        with pytest.raises(RetriesExhausted):
+            run_capture(runtime, "bootstrap")
+        batch = runtime.ledger.list_batches()[0]
+        scan = runtime.ledger.latest_attempt(batch["batch_id"], "events_by_id_0001")
+        assert scan["status"] == "failed"
+        committed = runtime.ledger.pages_for_scan(scan["scan_id"])
+        assert committed and all(not page["terminal"] for page in committed)
+        assert committed[-1]["offset_end"] == 1
+        fake.rules.clear()
+        recovered = run_capture(runtime, "bootstrap", resume=batch["batch_id"])
+        assert recovered.status == "captured" and recovered.resumed
+        assert runtime.ledger.pages_for_scan(scan["scan_id"])[: len(committed)] == committed
     finally:
         runtime.ledger.close()
 
@@ -267,7 +269,7 @@ def test_a_single_id_chunk_resumed_after_its_first_page_requests_the_rest(tmp_pa
         tmp_path, FakeGamma(_world_with_ghost_references(3)), env=SERIAL
     )
     try:
-        summary = run_capture(resumed_runtime, "bootstrap")
+        summary = run_capture(resumed_runtime, "bootstrap", resume=batch_id)
         assert summary.status == "captured"
         scan = resumed_runtime.ledger.latest_attempt(batch_id, "events_by_id_single_0001")
         pages = resumed_runtime.ledger.pages_for_scan(scan["scan_id"])
@@ -320,7 +322,7 @@ def test_a_marker_that_missed_a_planned_chunk_is_repaired_on_resume(
     resumed_runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
     try:
         with pytest.raises(SystemExit):
-            run_capture(resumed_runtime, "bootstrap")
+            run_capture(resumed_runtime, "bootstrap", resume=batch_id)
     finally:
         resumed_runtime.ledger.close()
     monkeypatch.undo()
@@ -334,7 +336,7 @@ def test_a_marker_that_missed_a_planned_chunk_is_repaired_on_resume(
 
     final_runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
     try:
-        summary = run_capture(final_runtime, "bootstrap")
+        summary = run_capture(final_runtime, "bootstrap", resume=batch_id)
         assert summary.status == "captured"
         assert _scan_names(final_runtime.ledger, summary.batch_id) == clean_names
         assert _page_fingerprints(final_runtime.ledger, summary.batch_id) == clean_pages
@@ -342,79 +344,54 @@ def test_a_marker_that_missed_a_planned_chunk_is_repaired_on_resume(
         final_runtime.ledger.close()
 
 
-def test_a_complete_marker_without_its_terminal_page_runs_again(tmp_path: Path) -> None:
-    """A scan marked complete is trusted only with its terminal page. Without it, the scan resumes."""
-    clean_names, clean_pages = _clean_run(tmp_path / "clean")
-    root = tmp_path / "damaged"
-    runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=SERIAL)
+def test_a_complete_marker_without_its_terminal_page_blocks_recovery(tmp_path: Path) -> None:
+    """Losing committed evidence is corruption; recovery cannot silently refetch it."""
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
     try:
         summary = run_capture(runtime, "bootstrap")
-        assert summary.status == "captured"
         batch_id = summary.batch_id
         batch = runtime.ledger.get_batch(batch_id)
-        scan = runtime.ledger.latest_attempt(batch_id, "events_ids_tail")
+        scan = runtime.ledger.latest_attempt(batch_id, "events_ids_0001")
         last_seq = max(page["seq"] for page in runtime.ledger.pages_for_scan(scan["scan_id"]))
         directory = scan_dir_for(
             runtime.settings, batch["observation_date"], batch_id, scan["scan_id"]
         )
-        manifest_path(directory, last_seq).unlink()  # the terminal page is gone from disk
+        manifest_path(directory, last_seq).unlink()
+        before = runtime.client.stats.requests
+        with pytest.raises(DurabilityError, match="missing or corrupt"):
+            run_capture(runtime, "bootstrap", resume=batch_id)
+        assert runtime.client.stats.requests == before
     finally:
         runtime.ledger.close()
-
-    fresh = _lose_ledger(root)
+    fresh = _lose_ledger(tmp_path)
     try:
-        rebuild_from_raw(runtime.settings, fresh)
-        assert fresh.latest_attempt(batch_id, "events_ids_tail")["status"] == "running"
-        assert fresh.get_batch(batch_id)["status"] == "capturing"
+        with pytest.raises(DurabilityError, match="no terminal page"):
+            rebuild_from_raw(runtime.settings, fresh)
     finally:
         fresh.close()
 
-    resumed_runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=SERIAL)
-    try:
-        resumed = run_capture(resumed_runtime, "bootstrap")
-        assert resumed.status == "captured"
-        assert _scan_names(resumed_runtime.ledger, resumed.batch_id) == clean_names
-        assert _page_fingerprints(resumed_runtime.ledger, resumed.batch_id) == clean_pages
-    finally:
-        resumed_runtime.ledger.close()
 
-
-def test_tail_above_the_mark_ends_when_every_id_fails(tmp_path: Path) -> None:
-    """Every event id above the high-water mark fails. The tail still stops after 3 windows."""
+def test_catalogue_never_requests_an_automatic_tail_above_its_mark(tmp_path: Path) -> None:
     fake = FakeGamma(demo_world())
-
-    def above_the_mark(request: httpx.Request) -> bool:
-        if request.url.path == "/events/keyset":
-            return any(int(i) > 303 for i in request.url.params.get_list("id"))
-        last = request.url.path.rsplit("/", 1)[-1]
-        return request.url.path.startswith("/events/") and last.isdigit() and int(last) > 303
-
-    fake.rules.append(
-        Rule(
-            above_the_mark,
-            lambda request: httpx.Response(500, json={"error": "down"}),
-            remaining=10**6,
-        )
-    )
     runtime, _ = build_runtime(tmp_path, fake)
     try:
         summary = run_capture(runtime, "bootstrap")
         assert summary.status == "captured"
-        batch = runtime.ledger.get_batch(summary.batch_id)
-        tail = next(
-            s
-            for s in runtime.ledger.list_scans(summary.batch_id)
-            if s["scan_name"] == "events_ids_tail"
+        assert not any(
+            "tail" in scan["scan_name"] for scan in runtime.ledger.list_scans(summary.batch_id)
         )
-        pages = runtime.ledger.pages_for_scan(tail["scan_id"])
-        assert [page["terminal"] for page in pages] == [0, 0, 1]
-
-        directory = runtime.settings.raw_dir / batch["observation_date"] / batch["batch_id"]
-        failed: list[str] = []
-        for manifest, _records in iter_scan_pages(runtime.settings, batch, tail):
-            body = json.loads(read_body(directory / tail["scan_id"], manifest))
-            failed.extend(item["id"] for item in body.get("fetch_failed", []))
-        assert len(failed) == 300
+        assert all(
+            int(value) <= 303
+            for path, params in fake.requests
+            if path == "/events/keyset"
+            for value in params.get("id", [])
+        )
+        assert all(
+            int(value) <= 8001
+            for path, params in fake.requests
+            if path == "/markets/keyset"
+            for value in params.get("id", [])
+        )
     finally:
         runtime.ledger.close()
 
@@ -613,11 +590,11 @@ def test_an_abandoned_attempt_with_no_successor_is_resumed(
     add_scan_attempt = runtime.ledger.add_scan_attempt
     calls = {"n": 0}
 
-    def crash_before_the_successor(scan: dict[str, Any]) -> None:
+    def crash_before_the_successor(scan: dict[str, Any], **kwargs) -> None:
         calls["n"] += 1
         if calls["n"] == 1:
             raise _Crash("signal between the abandoned status and its successor")
-        add_scan_attempt(scan)
+        add_scan_attempt(scan, **kwargs)
 
     monkeypatch.setattr(runtime.ledger, "add_scan_attempt", crash_before_the_successor)
     try:
@@ -627,7 +604,7 @@ def test_an_abandoned_attempt_with_no_successor_is_resumed(
         latest = runtime.ledger.latest_attempt(batch_id, "markets_keyset_open")
         assert latest is not None and latest["status"] == "abandoned"
 
-        summary = run_capture(runtime, "bootstrap")
+        summary = run_capture(runtime, "bootstrap", resume=batch_id)
         assert summary.status == "captured"
         attempts = [
             s
@@ -643,7 +620,7 @@ def test_an_abandoned_attempt_with_no_successor_is_resumed(
 
 
 @pytest.mark.parametrize("shape", ["legacy_order", "no_open_crawl"])
-def test_a_market_batch_that_cannot_prove_coverage_is_abandoned_not_resumed(
+def test_a_market_batch_that_cannot_prove_coverage_is_retained_and_explicit_resume_rejected(
     tmp_path: Path, shape: str
 ) -> None:
     """Resume only plans that put the open crawl first. Any other batch is abandoned, raw kept."""
@@ -673,7 +650,11 @@ def test_a_market_batch_that_cannot_prove_coverage_is_abandoned_not_resumed(
         assert summary.resumed is False
         assert summary.status == "captured"
         assert summary.batch_id != old_id
-        assert runtime.ledger.get_batch(old_id)["status"] == "abandoned"
+        assert runtime.ledger.get_batch(old_id)["status"] == "capturing"
+        before = runtime.client.stats.requests
+        with pytest.raises(ValueError, match="unsupported capture scope"):
+            run_capture(runtime, "bootstrap", resume=old_id)
+        assert runtime.client.stats.requests == before
     finally:
         runtime.ledger.close()
 
@@ -813,7 +794,9 @@ def test_a_failing_worker_close_does_not_fail_the_drain(
         runtime.ledger.close()
 
 
-def test_a_batch_on_a_deep_keyset_plan_is_abandoned_not_resumed(tmp_path: Path) -> None:
+def test_a_batch_on_a_deep_keyset_plan_is_retained_and_explicit_resume_rejected(
+    tmp_path: Path,
+) -> None:
     """A bootstrap planned on the deep keyset is never resumed, even with the open crawl first."""
     runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
     old_id = "20261007T010000Z-bootstrap"
@@ -831,12 +814,18 @@ def test_a_batch_on_a_deep_keyset_plan_is_abandoned_not_resumed(tmp_path: Path) 
         summary = run_capture(runtime, "bootstrap")
         assert summary.resumed is False
         assert summary.status == "captured"
-        assert runtime.ledger.get_batch(old_id)["status"] == "abandoned"
+        assert runtime.ledger.get_batch(old_id)["status"] == "capturing"
+        before = runtime.client.stats.requests
+        with pytest.raises(ValueError, match="unsupported capture scope"):
+            run_capture(runtime, "bootstrap", resume=old_id)
+        assert runtime.client.stats.requests == before
     finally:
         runtime.ledger.close()
 
 
-def test_a_batch_with_no_list_scans_is_abandoned_not_resumed(tmp_path: Path) -> None:
+def test_a_batch_with_no_list_scans_is_retained_and_explicit_resume_rejected(
+    tmp_path: Path,
+) -> None:
     """A batch with no scans was never planned. Resuming it would stay capturing forever."""
     runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
     old_id = "20261007T020000Z-bootstrap"
@@ -847,7 +836,11 @@ def test_a_batch_with_no_list_scans_is_abandoned_not_resumed(tmp_path: Path) -> 
         summary = run_capture(runtime, "bootstrap")
         assert summary.resumed is False
         assert summary.status == "captured"
-        assert runtime.ledger.get_batch(old_id)["status"] == "abandoned"
+        assert runtime.ledger.get_batch(old_id)["status"] == "capturing"
+        before = runtime.client.stats.requests
+        with pytest.raises(ValueError, match="unsupported capture scope"):
+            run_capture(runtime, "bootstrap", resume=old_id)
+        assert runtime.client.stats.requests == before
     finally:
         runtime.ledger.close()
 
@@ -880,7 +873,9 @@ def test_high_water_is_read_once_per_batch_even_across_a_resume(tmp_path: Path) 
     try:
         with pytest.raises(SystemExit):
             run_capture(runtime, "bootstrap")
-        summary = run_capture(runtime, "bootstrap")
+        summary = run_capture(
+            runtime, "bootstrap", resume=runtime.ledger.list_batches()[0]["batch_id"]
+        )
         assert summary.status == "captured"
         assert summary.resumed is True
         assert fake.calls_to("/events") == 1
@@ -1042,7 +1037,9 @@ def test_closed_market_windows_wait_for_the_open_crawl(
     assert min(closed) > order.index("end:markets_keyset_open")
 
 
-def test_a_single_event_that_keeps_failing_is_quarantined(tmp_path: Path) -> None:
+def test_a_single_event_that_keeps_failing_blocks_completion_until_recovered(
+    tmp_path: Path,
+) -> None:
     """A stage-2 id that keeps failing is quarantined, so the batch still captures."""
     fake = FakeGamma(_world_with_missing_event())
     fake.rules.append(
@@ -1054,22 +1051,21 @@ def test_a_single_event_that_keeps_failing_is_quarantined(tmp_path: Path) -> Non
     )
     runtime, _ = build_runtime(tmp_path, fake, env=SERIAL)
     try:
-        summary = run_capture(runtime, "bootstrap")
-        assert summary.status == "captured"
-        batch = runtime.ledger.get_batch(summary.batch_id)
-        scan = next(
-            s
-            for s in runtime.ledger.list_scans(summary.batch_id)
-            if s["scan_name"] == "events_by_id_single_0001"
-        )
-        directory = runtime.settings.raw_dir / batch["observation_date"] / batch["batch_id"]
-        failed: list[str] = []
-        for manifest, _records in iter_scan_pages(runtime.settings, batch, scan):
-            body = json.loads(read_body(directory / scan["scan_id"], manifest))
-            failed.extend(item["id"] for item in body.get("fetch_failed", []))
+        with pytest.raises(RetriesExhausted):
+            run_capture(runtime, "bootstrap")
+        batch = runtime.ledger.list_batches()[0]
+        scan = runtime.ledger.latest_attempt(batch["batch_id"], "events_by_id_single_0001")
+        assert scan["status"] == "failed"
+        assert runtime.ledger.pages_for_scan(scan["scan_id"]) == []
+        fake.rules.clear()
+        recovered = run_capture(runtime, "bootstrap", resume=batch["batch_id"])
+        assert recovered.status == "captured" and recovered.resumed
+        scan = runtime.ledger.latest_attempt(batch["batch_id"], "events_by_id_single_0001")
+        assert [page["http_status"] for page in runtime.ledger.pages_for_scan(scan["scan_id"])] == [
+            404
+        ]
     finally:
         runtime.ledger.close()
-    assert failed == ["999999"]
 
 
 def test_a_shutdown_interrupt_does_not_skip_cleanup_or_replace_the_first_failure(

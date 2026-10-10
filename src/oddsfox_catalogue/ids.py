@@ -10,11 +10,14 @@ import hashlib
 import json
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 BATCH_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
-_BATCH_ID_RE = re.compile(r"^\d{8}T\d{6}Z-(bootstrap|daily|reconcile)$")
-MODES = ("bootstrap", "daily", "reconcile")
+_BATCH_ID_RE = re.compile(
+    r"^\d{8}T\d{6}Z-(bootstrap|daily|reconcile|selected)(?:-(?:[2-9]|[1-9][0-9]+))?$"
+)
+MODES = ("bootstrap", "daily", "reconcile", "selected")
 
 
 def utc_now() -> datetime:
@@ -44,7 +47,7 @@ def make_batch_id(mode: str, started: datetime) -> str:
 def parse_batch_id(batch_id: str) -> tuple[datetime, str]:
     if not _BATCH_ID_RE.match(batch_id):
         raise ValueError(f"malformed batch id {batch_id!r}")
-    stamp, mode = batch_id.split("-", 1)
+    stamp, mode, *_ = batch_id.split("-")
     return datetime.strptime(stamp, BATCH_STAMP_FORMAT).replace(tzinfo=UTC), mode
 
 
@@ -60,9 +63,38 @@ def make_page_id(scan_id: str, seq: int) -> str:
     return f"{scan_id}.p{seq:06d}"
 
 
-def canonical_json(value: Any) -> str:
+MAX_CANONICAL_BYTES = 16 * 1024**2
+
+
+def validate_exact_size(value: Any, *, max_bytes: int = MAX_CANONICAL_BYTES) -> None:
+    """Count encoded tokens before Decimal expansion or whole-output allocation."""
+    encoder = json.JSONEncoder(
+        sort_keys=True, separators=(",", ":"), allow_nan=False, default=_exact_number
+    )
+    size = 0
+    try:
+        for token in encoder.iterencode(value):
+            size += len(token.encode("utf-8"))
+            if size > max_bytes:
+                raise ValueError("canonical JSON expansion exceeds its byte allowance")
+    except RecursionError as exc:
+        raise ValueError("canonical JSON nesting exceeds its limit") from exc
+
+
+def canonical_json(value: Any, *, max_bytes: int = MAX_CANONICAL_BYTES) -> str:
     """Stable JSON text: sorted keys, compact separators, no NaN."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    validate_exact_size(value, max_bytes=max_bytes)
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False, default=_exact_number
+    )
+
+
+def _exact_number(value: Any) -> str:
+    if isinstance(value, Decimal) and value.is_finite():
+        from oddsfox_catalogue.normalization import decimal_string
+
+        return decimal_string(value)
+    raise TypeError("unsupported canonical JSON value")
 
 
 def sha256_bytes(data: bytes) -> str:

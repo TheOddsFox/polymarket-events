@@ -53,6 +53,7 @@ def build_runtime(
     *,
     now: datetime = FIXED_NOW,
     open_event_ids=None,
+    open_market_ids=None,
     clock: FakeClock | None = None,
     max_scan_attempts: int = 3,
     env: dict[str, str] | None = None,
@@ -65,6 +66,10 @@ def build_runtime(
         clock=clock,
         sleep=clock.sleep,
         now=lambda: now,
+        max_requests=settings.capture.max_requests,
+        max_download_bytes=settings.capture.max_download_bytes,
+        max_body_bytes=settings.capture.max_response_bytes,
+        max_duration_s=settings.capture.max_duration_s,
     )
     ledger = Ledger(settings.ledger_path)
     runtime = CaptureRuntime(
@@ -73,6 +78,13 @@ def build_runtime(
         ledger=ledger,
         now=lambda: now,
         open_event_ids=open_event_ids,
+        open_market_ids=(
+            open_market_ids
+            if open_market_ids is not None
+            else (lambda: set())
+            if open_event_ids is not None
+            else None
+        ),
         git_sha="testsha",
         max_scan_attempts=max_scan_attempts,
     )

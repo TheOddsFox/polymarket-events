@@ -95,9 +95,11 @@ def test_a_pooled_failure_then_resume_matches_a_clean_serial_run(
     try:
         with pytest.raises(RuntimeError, match="injected failure"):
             run_capture(runtime, "bootstrap")
-        summary = run_capture(runtime, "bootstrap")
+        interrupted_id = runtime.ledger.list_batches()[0]["batch_id"]
+        summary = run_capture(runtime, "bootstrap", resume=interrupted_id)
         assert summary.status == "captured"
         assert summary.resumed is True
+        assert summary.batch_id == interrupted_id
         assert _content(_manifests(runtime, summary.batch_id)) == _content(clean)
     finally:
         runtime.ledger.close()
@@ -126,14 +128,14 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
     fake = FakeGamma(_tiny_world())
     persisted = threading.Event()
 
-    def is_tail(request: httpx.Request) -> bool:
-        return request.url.path == "/events/keyset" and "2" in request.url.params.get_list("id")
+    def is_event_scan(request: httpx.Request) -> bool:
+        return request.url.path == "/events/keyset"
 
     def fail_after_sibling(_: httpx.Request) -> httpx.Response:
         assert persisted.wait(5)
         raise RuntimeError("injected failure")  # an ordinary error fails the scan
 
-    fake.rules.append(Rule(is_tail, fail_after_sibling, remaining=1))
+    fake.rules.append(Rule(is_event_scan, fail_after_sibling, remaining=1))
     runtime, _ = build_runtime(tmp_path, fake, env={"CATALOGUE_CAPTURE_WORKERS": "2"})
     original = runtime.ledger.record_page
 
@@ -148,8 +150,9 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
         batch = runtime.ledger.list_batches()[0]
         assert batch["status"] == "capturing"
         scans = {scan["scan_name"]: scan for scan in runtime.ledger.list_scans(batch["batch_id"])}
-        assert scans["events_ids_tail"]["status"] == "failed"
-        sibling = scans["events_ids_0001"]
+        assert not any("tail" in name for name in scans)
+        assert scans["events_ids_0001"]["status"] == "failed"
+        sibling = scans["markets_keyset_open"]
         assert sibling["fetched_seq"] >= 1
         assert runtime.ledger.pages_for_scan(sibling["scan_id"])
     finally:
@@ -159,7 +162,7 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
 def test_a_scan_stopped_after_a_page_keeps_that_page_and_stays_running(tmp_path: Path) -> None:
     """A stop that lands mid-scan lets the page in flight finish. The scan then stays running."""
     runtime, _ = build_runtime(
-        tmp_path, FakeGamma(demo_world()), env={"CATALOGUE_CAPTURE_WORKERS": "1"}
+        tmp_path, FakeGamma(_two_event_world()), env={"CATALOGUE_CAPTURE_WORKERS": "1"}
     )
     stop = threading.Event()
     original = runtime.ledger.record_page
@@ -169,20 +172,23 @@ def test_a_scan_stopped_after_a_page_keeps_that_page_and_stays_running(tmp_path:
         stop.set()  # a signal arrives once the first page is durable
 
     try:
-        batch = runner._start_batch(runtime, "bootstrap")
-        tail = next(
+        batch = runner._start_batch(runtime, "selected", ["1", "2"], [])
+        runner._seal_plan(runtime, batch)
+        batch = runtime.ledger.get_batch(batch["batch_id"])
+        selected = next(
             scan
             for scan in runtime.ledger.list_scans(batch["batch_id"])
-            if scan["scan_name"] == "events_ids_tail"
+            if scan["scan_name"] == "markets_selected"
         )
         runtime.ledger.record_page = record_then_stop
         summary = CaptureSummary(batch_id=batch["batch_id"], status="capturing", resumed=False)
-        runner._run_scan(runtime, batch, tail, summary, stop)
+        runner._run_scan(runtime, batch, selected, summary, stop)
 
-        scan = runtime.ledger.get_scan(tail["scan_id"])
+        scan = runtime.ledger.get_scan(selected["scan_id"])
         assert scan is not None
         assert scan["status"] == "running"
-        assert len(runtime.ledger.pages_for_scan(tail["scan_id"])) == 1
+        pages = runtime.ledger.pages_for_scan(selected["scan_id"])
+        assert len(pages) == 1 and not pages[0]["terminal"]
     finally:
         runtime.ledger.close()
 
@@ -303,16 +309,18 @@ def test_a_pooled_signal_then_resume_matches_a_clean_serial_run(
         (run,) = [r for r in runtime.ledger.stage_runs() if r["stage"] == "capture:bootstrap"]
         assert run["status"] == "failed"
         assert run["error"] == "Terminated: SIGTERM"
-        assert runtime.ledger.list_batches()[0]["status"] == "capturing"
+        batch = runtime.ledger.list_batches()[0]
+        assert batch["status"] == "capturing"
     finally:
         runtime.ledger.close()
 
     monkeypatch.undo()
     resumed_runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=env)
     try:
-        summary = run_capture(resumed_runtime, "bootstrap")
+        summary = run_capture(resumed_runtime, "bootstrap", resume=batch["batch_id"])
         assert summary.status == "captured"
         assert summary.resumed is True
+        assert summary.batch_id == batch["batch_id"]
         assert _content(_manifests(resumed_runtime, summary.batch_id)) == _content(clean)
     finally:
         resumed_runtime.ledger.close()

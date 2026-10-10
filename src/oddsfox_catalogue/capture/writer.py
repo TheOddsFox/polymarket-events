@@ -8,8 +8,10 @@ when its manifest exists and both checksums verify.
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,12 +19,18 @@ from typing import Any
 from oddsfox_catalogue.ids import canonical_json, sha256_bytes
 
 MANIFEST_VERSION = 1
+MAX_BODY_BYTES = 16 * 1024**2
+MAX_MANIFEST_BYTES = 1024**2
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
+    for ancestor in path.parents:
+        if ancestor.is_symlink():
+            raise ValueError("output path contains a symlink")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("wb") as handle:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
@@ -93,36 +101,99 @@ def write_page(
     return PageWrite(gz, manifest_file, body_digest, gz_digest)
 
 
-def read_manifest(path: Path) -> dict[str, Any] | None:
+def read_regular_bytes(path: Path, *, max_bytes: int, trusted_root: Path | None = None) -> bytes:
+    """Read a bounded regular file without following a symlink or leaving its root."""
+    path = Path(os.path.abspath(path))
+    if trusted_root is not None:
+        root = Path(os.path.abspath(trusted_root))
+        if not path.is_relative_to(root):
+            raise ValueError("raw path leaves trusted root")
+    for ancestor in (path, *path.parents):
+        if ancestor.is_symlink():
+            raise ValueError("raw path contains a symlink")
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError("raw path is not a regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("raw path is not a regular file")
+        if info.st_size > max_bytes:
+            raise ValueError("raw file exceeds byte limit")
+        data = handle.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("raw file exceeds byte limit")
+    return data
+
+
+def read_manifest(path: Path, *, trusted_root: Path | None = None) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(
+            read_regular_bytes(path, max_bytes=MAX_MANIFEST_BYTES, trusted_root=trusted_root)
+        )
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 
 
-def verify_page(scan_dir: Path, manifest: dict[str, Any]) -> bool:
+def verify_page(
+    scan_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    trusted_root: Path | None = None,
+    max_body_bytes: int = MAX_BODY_BYTES,
+) -> bool:
     """True only if the gz file exists and matches both recorded checksums."""
-    gz = scan_dir / manifest["file"]
     try:
-        compressed = gz.read_bytes()
-    except OSError:
+        read_body(scan_dir, manifest, trusted_root=trusted_root, max_body_bytes=max_body_bytes)
+    except (OSError, ValueError, EOFError, KeyError):
         return False
-    if sha256_bytes(compressed) != manifest["gz_sha256"]:
-        return False
-    try:
-        body = gzip.decompress(compressed)
-    except (OSError, EOFError):
-        return False
-    return sha256_bytes(body) == manifest["body_sha256"] and len(body) == manifest["body_bytes"]
+    return True
 
 
-def read_body(scan_dir: Path, manifest: dict[str, Any]) -> bytes:
+def read_body(
+    scan_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    trusted_root: Path | None = None,
+    max_body_bytes: int = MAX_BODY_BYTES,
+) -> bytes:
     """Return the verified raw body for a page. Raises if the checksum fails."""
-    gz = (scan_dir / manifest["file"]).read_bytes()
-    body = gzip.decompress(gz)
-    if sha256_bytes(body) != manifest["body_sha256"]:
-        raise ValueError(f"checksum mismatch for {manifest['file']}")
+    if (
+        isinstance(max_body_bytes, bool)
+        or not isinstance(max_body_bytes, int)
+        or not 0 < max_body_bytes <= MAX_BODY_BYTES
+    ):
+        raise ValueError("raw body byte limit must be within 16 MiB")
+    name = manifest.get("file")
+    if (
+        not isinstance(name, str)
+        or Path(name).name != name
+        or not name.endswith(".json.gz")
+        or "\\" in name
+    ):
+        raise ValueError("unsafe raw payload path")
+    size = manifest.get("body_bytes")
+    if (
+        type(manifest.get("manifest_version")) is not int
+        or manifest.get("manifest_version") != MANIFEST_VERSION
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 <= size <= max_body_bytes
+    ):
+        raise ValueError("unsupported raw manifest or body byte limit")
+    gz = read_regular_bytes(
+        scan_dir / name, max_bytes=max_body_bytes + 1024**2, trusted_root=trusted_root or scan_dir
+    )
+    if sha256_bytes(gz) != manifest.get("gz_sha256"):
+        raise ValueError("raw gzip checksum mismatch")
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(gz)) as handle:
+            body = handle.read(min(size, max_body_bytes) + 1)
+    except (OSError, EOFError) as exc:
+        raise ValueError("invalid raw gzip") from exc
+    if len(body) != size or sha256_bytes(body) != manifest.get("body_sha256"):
+        raise ValueError("raw body checksum or size mismatch")
     return body
 
 

@@ -55,6 +55,7 @@ class PageResult:
     response: Response = field(repr=False)
     terminal: bool
     ids_hash: str
+    page_unit_revision: int = 1
 
     @property
     def record_count(self) -> int:
@@ -123,9 +124,11 @@ def keyset_pages(
     cursor = start.cursor
     seen = set(start.seen_cursors)
     seq = start.seq
+    high_water = base_params.get("_high_water")
+    previous_hash = start.last_ids_hash
 
     while True:
-        params = dict(base_params)
+        params = {key: value for key, value in base_params.items() if not key.startswith("_")}
         if cursor is not None:
             params["after_cursor"] = cursor
         response = client.get(endpoint, params)
@@ -135,11 +138,23 @@ def keyset_pages(
 
         if next_cursor is not None:
             if next_cursor == cursor or next_cursor in seen:
-                raise ScanFailed(f"{endpoint}: repeated cursor {next_cursor[:24]!r}")
+                raise ScanFailed(f"{endpoint}: repeated cursor")
             if not records:
                 raise ScanFailed(f"{endpoint}: empty page carried a cursor")
             seen.add(next_cursor)
 
+        source_ids = _ids(records)
+        numeric_ids = [int(value) for value in source_ids if value.isascii() and value.isdigit()]
+        reached_high_water = False
+        if high_water is not None:
+            if numeric_ids != sorted(numeric_ids):
+                raise MalformedResponse("sealed keyset response is not ordered by ascending ID")
+            reached_high_water = high_water == 0 or any(
+                value >= high_water for value in numeric_ids
+            )
+            if records and ids_hash(source_ids) == previous_hash:
+                raise ScanFailed("sealed keyset repeated its previous records")
+        terminal = next_cursor is None or reached_high_water
         seq += 1
         yield PageResult(
             seq=seq,
@@ -152,11 +167,12 @@ def keyset_pages(
             output_offset=None,
             records=records,
             response=response,
-            terminal=next_cursor is None,
-            ids_hash=ids_hash(_ids(records)),
+            terminal=terminal,
+            ids_hash=ids_hash(source_ids),
         )
-        if next_cursor is None:
+        if terminal:
             return
+        previous_hash = ids_hash(source_ids)
         cursor = next_cursor
 
 
@@ -283,26 +299,19 @@ def _synthetic_response(
     )
 
 
-def _fetch_id_window(
+def _fetch_id_leaves(
     client: GammaClient,
     endpoint: str,
     record_key: str,
     ids: list[int],
     closed: bool | None,
     extra: Mapping[str, Any] | None = None,
-) -> tuple[list[Any], list[int], Response]:
-    """Fetch one id window. A window that keeps failing is split down to one id.
+) -> Iterator[tuple[list[int], list[Any], Response]]:
+    """Yield native bounded responses before fetching the next split unit."""
 
-    Any failure on a window of several ids, a non-retryable error included, splits
-    it in half, so one bad id cannot fail the scan. A single id that still fails
-    after ``/events/{id}`` or ``/markets/{id}`` is returned in the failed list,
-    whatever the hard error. A 404 means the id does not exist.
-    """
-    params = _window_params(ids, record_key, closed, extra)
-
-    def fetch(wanted: list[int]) -> tuple[list[Any], list[int], list[Response]]:
+    def fetch(wanted: list[int]) -> Iterator[tuple[list[int], list[Any], Response]]:
         if not wanted:
-            return [], [], []
+            return
         request = _window_params(wanted, record_key, closed, extra)
         try:
             response = client.get(
@@ -317,19 +326,15 @@ def _fetch_id_window(
             _reject_window_mismatch(endpoint, wanted, records, cursor)
         except (RetriesExhausted, MalformedResponse):
             if len(wanted) == 1:
-                # A one-id window that cannot answer is answered by ID, as after bisection.
-                return _fetch_single(wanted[0])
+                yield wanted, *_fetch_single(wanted[0])
+                return
             mid = len(wanted) // 2
-            left_records, left_failed, left_parts = fetch(wanted[:mid])
-            right_records, right_failed, right_parts = fetch(wanted[mid:])
-            return (
-                left_records + right_records,
-                left_failed + right_failed,
-                left_parts + right_parts,
-            )
-        return records, [], [response]
+            yield from fetch(wanted[:mid])
+            yield from fetch(wanted[mid:])
+            return
+        yield wanted, records, response
 
-    def _fetch_single(entity_id: int) -> tuple[list[Any], list[int], list[Response]]:
+    def _fetch_single(entity_id: int) -> tuple[list[Any], Response]:
         path = _single_path(endpoint, entity_id)
         # The by-id route must ask for the same payload the window asked for. A market
         # without include_tag comes back with no tags.
@@ -338,30 +343,51 @@ def _fetch_id_window(
             query["include_tag"] = True
         if extra:
             query.update(extra)
-        try:
-            response = client.get(
-                path,
-                query,
-                max_retries=ID_WINDOW_MAX_RETRIES,
-                backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
-            )
-            if response.status == 404:
-                return [], [], [response]
-            if response.status != 200:
-                raise MalformedResponse(f"{path}: unexpected HTTP {response.status}")
-            records, _ = unpack(response.json, record_key)
-            if not _describes(records, str(entity_id)):
-                raise MalformedResponse(f"{path}: body does not describe {entity_id}")
-        except (RetriesExhausted, MalformedResponse):
-            # Still failing for this id alone: quarantine it so the window can finish.
-            return [], [entity_id], []
-        return records, [], [response]
+        response = client.get(
+            path,
+            query,
+            max_retries=ID_WINDOW_MAX_RETRIES,
+            backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
+        )
+        if response.status == 404:
+            return [], response
+        if response.status != 200:
+            raise MalformedResponse(f"{path}: unexpected HTTP {response.status}")
+        records, cursor = unpack(response.json, record_key)
+        if cursor is not None or not _describes(records, str(entity_id)):
+            raise MalformedResponse(f"{path}: body does not describe {entity_id}")
+        return records, response
 
-    records, failed, parts = fetch(ids)
+    yield from fetch(ids)
+
+
+def _fetch_id_window(
+    client: GammaClient,
+    endpoint: str,
+    record_key: str,
+    ids: list[int],
+    closed: bool | None,
+    extra: Mapping[str, Any] | None = None,
+) -> tuple[list[Any], list[int], Response]:
+    """Retain logical-window empty counting for the legacy tail iterator only."""
+    records, parts = [], []
+    for _, leaf_records, response in _fetch_id_leaves(
+        client, endpoint, record_key, ids, closed, extra
+    ):
+        records.extend(leaf_records)
+        parts.append(response)
     return (
         records,
-        failed,
-        _synthetic_response(client, endpoint, params, record_key, records, failed, parts),
+        [],
+        _synthetic_response(
+            client,
+            endpoint,
+            _window_params(ids, record_key, closed, extra),
+            record_key,
+            records,
+            [],
+            parts,
+        ),
     )
 
 
@@ -372,13 +398,7 @@ def id_range_pages(
     record_key: str,
     start: PageState | None = None,
 ) -> Iterator[PageResult]:
-    """Request explicit id windows. Page ``seq`` covers ``[lo+(seq-1)*step, ...)``.
-
-    An empty window is stored. A tail scan (no ``hi``) stops after
-    ``empty_stop`` consecutive windows with no records. A window whose ids all
-    failed counts as empty, so a persistent outage above the mark still ends.
-    Resume uses ``start.seq`` and ``start.empty_run`` and does not repeat durable pages.
-    """
+    """Finite scans commit each native leaf; legacy tails commit logical windows."""
     if record_key not in RECORD_KEYS:
         raise ValueError(f"unknown record key {record_key!r}")
     start = start or PageState()
@@ -394,6 +414,33 @@ def id_range_pages(
         closed = closed == "true"
     extra = {key: True for key in _INCLUDE_FLAGS if base_params.get(key)}
     seq = start.seq
+    if not tail:
+        if hi is None:
+            raise ValueError("finite ID scans require a sealed upper bound")
+        window_lo = start.offset + 1 if start.seq else lo
+        while window_lo <= hi:
+            window_hi = min(lo + ((window_lo - lo) // step + 1) * step - 1, hi)
+            for wanted, records, response in _fetch_id_leaves(
+                client, endpoint, record_key, list(range(window_lo, window_hi + 1)), closed, extra
+            ):
+                seq += 1
+                yield PageResult(
+                    seq=seq,
+                    endpoint=response.endpoint,
+                    params=response.params,
+                    record_key=record_key,
+                    input_cursor=None,
+                    output_cursor=None,
+                    offset=wanted[0],
+                    output_offset=wanted[-1],
+                    records=records,
+                    response=response,
+                    terminal=wanted[-1] == hi,
+                    ids_hash=ids_hash(_ids(records)),
+                    page_unit_revision=2,
+                )
+            window_lo = window_hi + 1
+        return
     index = start.seq
     empty_run = start.empty_run
 
@@ -444,69 +491,77 @@ def id_list_pages(
     record_key: str,
     start: PageState | None = None,
 ) -> Iterator[PageResult]:
-    """Fetch one ``keyset_ids`` chunk as a single id window, with the window policy.
-
-    The chunk is split in half on any failure, and a single id that still fails is
-    quarantined by ID, as an id-range window is. A chunk is one terminal page, so a
-    durable page means the chunk is done and nothing is fetched again.
-    """
+    """Commit native leaves with half-open positions in the frozen input list."""
     if record_key not in RECORD_KEYS:
         raise ValueError(f"unknown record key {record_key!r}")
-    if start is not None and start.seq >= 1:
+    start = start or PageState()
+    if start.seq and start.offset == 0:
+        # Legacy ID-list pages were one terminal unit with no position.
         return
     ids = [int(entity_id) for entity_id in base_params["id"]]
-    records, _failed, response = _fetch_id_window(client, endpoint, record_key, ids, None)
-    yield PageResult(
-        seq=1,
-        endpoint=endpoint,
-        params=_window_params(ids, record_key, None),
-        record_key=record_key,
-        input_cursor=None,
-        output_cursor=None,
-        offset=None,
-        output_offset=None,
-        records=records,
-        response=response,
-        terminal=True,
-        ids_hash=ids_hash(_ids(records)),
-    )
+    offset, seq = start.offset, start.seq
+    for wanted, records, response in _fetch_id_leaves(
+        client, endpoint, record_key, ids[offset:], None
+    ):
+        end = offset + len(wanted)
+        seq += 1
+        yield PageResult(
+            seq=seq,
+            endpoint=response.endpoint,
+            params=response.params,
+            record_key=record_key,
+            input_cursor=None,
+            output_cursor=None,
+            offset=offset,
+            output_offset=end,
+            records=records,
+            response=response,
+            terminal=end == len(ids),
+            ids_hash=ids_hash(_ids(records)),
+            page_unit_revision=2,
+        )
+        offset = end
 
 
 def single_event_page(
-    client: GammaClient, event_id: str, seq: int, *, terminal: bool = True
+    client: GammaClient,
+    event_id: str,
+    seq: int,
+    *,
+    terminal: bool = True,
+    record_key: str = "events",
 ) -> PageResult:
-    """Fetch ``/events/{id}``. A 404 is an empty page. A failing id is quarantined.
+    """Fetch one native ID. A 404 is an empty page; unresolved failures propagate.
 
     Retries use the id-window policy, so a bad id cannot stall the batch on the global
-    retry budget. An id that still fails becomes a ``fetch_failed`` body, as a window does.
+    retry budget. An id that still fails raises; it cannot become completed empty evidence.
     ``terminal`` is true only for the last id of a chunk, so a resume after an earlier page
     still fetches the rest.
     """
     if not event_id.isdigit():
         raise ValueError(f"event ids are numeric: {event_id!r}")
-    endpoint = f"/events/{event_id}"
+    if record_key not in RECORD_KEYS:
+        raise ValueError("unsupported native target type")
+    endpoint = f"/{record_key}/{event_id}"
+    query = {"include_tag": True} if record_key == "markets" else {}
     records: list[Any] = []
-    try:
-        response = client.get(
-            endpoint,
-            {},
-            max_retries=ID_WINDOW_MAX_RETRIES,
-            backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
-        )
-        if response.status == 200:
-            records, _ = unpack(response.json, "events")
-            if not _describes(records, event_id):
-                raise MalformedResponse(f"{endpoint}: body does not describe event {event_id}")
-        elif response.status != 404:
-            raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
-    except (RetriesExhausted, MalformedResponse):
-        records = []
-        response = _synthetic_response(client, endpoint, {}, "events", [], [int(event_id)], [])
+    response = client.get(
+        endpoint,
+        query,
+        max_retries=ID_WINDOW_MAX_RETRIES,
+        backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
+    )
+    if response.status == 200:
+        records, cursor = unpack(response.json, record_key)
+        if cursor is not None or not _describes(records, event_id):
+            raise MalformedResponse(f"{endpoint}: body does not describe event {event_id}")
+    elif response.status != 404:
+        raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
     return PageResult(
         seq=seq,
         endpoint=endpoint,
-        params={},
-        record_key="events",
+        params=query,
+        record_key=record_key,
         input_cursor=None,
         output_cursor=None,
         offset=None,

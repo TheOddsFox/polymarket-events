@@ -63,6 +63,7 @@ def test_a_stop_signal_during_capture_records_failed_stage_and_exits_128_plus_si
 ) -> None:
     monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
     monkeypatch.setenv("CATALOGUE_GAMMA_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("CATALOGUE_GAMMA_ALLOW_LOOPBACK", "1")
     # Four workers: the signal has to drain the pool, not only a serial scan.
     monkeypatch.setenv("CATALOGUE_CAPTURE_WORKERS", "4")
 

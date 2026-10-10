@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from oddsfox_catalogue.normalization import Observation, project
+
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "gamma"
 SYNTHETIC = sorted((FIXTURES / "synthetic").glob("*.json"))
 LIVE = sorted((FIXTURES / "live").glob("*.json"))
@@ -22,7 +24,6 @@ MARKET_REQUIRED = {
     "id",
     "conditionId",
     "outcomes",
-    "outcomePrices",
     "clobTokenIds",
     "positionIds",
     "version",
@@ -79,11 +80,9 @@ def test_market_objects_have_required_fields_and_encoded_arrays(path: Path) -> N
         missing = MARKET_REQUIRED - set(market)
         assert not missing, f"{path.name}: market {market.get('id')} missing {sorted(missing)}"
 
-        # outcomes and outcomePrices are JSON-encoded strings, index-aligned.
+        # Prices are optional evidence and never establish catalogue identities.
         labels = json.loads(market["outcomes"])
-        prices = json.loads(market["outcomePrices"])
-        assert isinstance(labels, list) and isinstance(prices, list)
-        assert len(labels) == len(prices), f"market {market['id']} outcome/price length mismatch"
+        assert isinstance(labels, list)
 
         assert market["version"] in {"v1", "v2"}
         if market["version"] == "v2":
@@ -122,11 +121,11 @@ def test_stub_reference_fixture_is_identity_only() -> None:
 
 
 def test_outcome_identifier_fields_follow_version() -> None:
-    """v2 carries positionIds (clobTokenIds null); v1 carries clobTokenIds. Version decides."""
+    """Explicit version selects native identity, independently of the other ID array."""
     markets = _all_markets(_load(FIXTURES / "synthetic" / "markets_keyset_open.json"))
-    assert {m["version"] for m in markets} == {"v1", "v2"}, "fixture should cover both versions"
+    assert {m["version"] for m in markets} == {"v1", "v2"}
     for market in markets:
-        if market["version"] == "v2":
-            assert market["clobTokenIds"] is None
-        else:
-            assert market["positionIds"] is None
+        normalized, outcomes = project(Observation(market, {}))
+        assert normalized["usable"]
+        expected_kind = "poly_v2_position" if market["version"] == "v2" else "ctf_token"
+        assert all(row["asset_kind"] == expected_kind for row in outcomes)

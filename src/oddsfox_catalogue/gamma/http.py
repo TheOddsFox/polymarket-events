@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -52,6 +56,36 @@ class CaptureStopped(GammaError):
 
 class RequestBudgetExceeded(GammaError):
     """An invocation exhausted its shared request or download allowance."""
+
+
+def validate_origin(base_url: str, *, allow_loopback: bool = False, mock: bool = False) -> None:
+    try:
+        url = urlsplit(base_url)
+        production = (
+            url.scheme == "https"
+            and url.hostname == "gamma-api.polymarket.com"
+            and url.port in {None, 443}
+        )
+        local = (
+            allow_loopback
+            and url.scheme == "http"
+            and url.hostname in {"127.0.0.1", "localhost", "::1"}
+        )
+        valid = (
+            (production or local or mock)
+            and not (url.username or url.password or url.query or url.fragment)
+            and url.path in {"", "/"}
+        )
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise ValueError(
+            "Gamma uses the fixed HTTPS host or an explicitly enabled loopback test server"
+        )
+
+
+def _invalid_number(_: str) -> None:
+    raise ValueError("non-finite JSON number")
 
 
 @dataclass(frozen=True)
@@ -107,14 +141,18 @@ class TokenBucket:
             self._sleep(step)
             remaining -= step
 
-    def acquire(self) -> None:
+    def acquire(self, *, deadline: float | None = None) -> None:
         while True:
             with self._lock:
                 now = self._clock()
+                if deadline is not None and now >= deadline:
+                    raise RequestBudgetExceeded("Gamma invocation duration exhausted")
                 wait = self._next_at - now
                 if wait <= 0:
                     self._next_at = max(now, self._next_at) + self._interval
                     return
+                if deadline is not None and now + wait > deadline:
+                    raise RequestBudgetExceeded("Gamma invocation duration exhausted")
             # Sleep outside the lock so another worker can record a penalty
             # against the same deadline instead of queueing behind this wait.
             self._pause(wait)
@@ -217,10 +255,12 @@ class GammaClient:
         limiter: TokenBucket | None = None,
         stats: RequestStats | None = None,
         stats_lock: threading.Lock | None = None,
-        max_body_bytes: int | None = None,
-        max_requests: int | None = None,
-        max_download_bytes: int | None = None,
-        trust_env: bool = True,
+        max_body_bytes: int = 16 * 1024**2,
+        max_requests: int = 25_000,
+        max_download_bytes: int = 4 * 1024**3,
+        max_duration_s: float = 4 * 60 * 60,
+        deadline: float | None = None,
+        trust_env: bool = False,
     ) -> None:
         self._settings = settings
         self._now = now
@@ -229,13 +269,32 @@ class GammaClient:
         self._rng = rng or random.Random()
         self._transport = transport
         self._max_body_bytes = max_body_bytes
+        validate_origin(
+            settings.base_url,
+            allow_loopback=settings.allow_loopback,
+            mock=isinstance(transport, httpx.MockTransport),
+        )
+        if trust_env:
+            raise ValueError("ambient Gamma credentials and proxies are forbidden")
+        if (
+            isinstance(max_body_bytes, bool)
+            or not isinstance(max_body_bytes, int)
+            or not 0 < max_body_bytes <= 16 * 1024**2
+        ):
+            raise ValueError("max_body_bytes must be within 16 MiB")
+        if (
+            isinstance(max_duration_s, bool)
+            or not math.isfinite(max_duration_s)
+            or max_duration_s <= 0
+        ):
+            raise ValueError("max_duration_s must be positive and finite")
+        self._deadline = deadline if deadline is not None else clock() + max_duration_s
+        self._max_duration_s = max_duration_s
         for name, limit in (
             ("max_requests", max_requests),
             ("max_download_bytes", max_download_bytes),
         ):
-            if limit is not None and (
-                isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
-            ):
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         self._max_requests = max_requests
         self._max_download_bytes = max_download_bytes
@@ -290,6 +349,8 @@ class GammaClient:
             max_body_bytes=self._max_body_bytes,
             max_requests=self._max_requests,
             max_download_bytes=self._max_download_bytes,
+            max_duration_s=self._max_duration_s,
+            deadline=self._deadline,
             trust_env=self._trust_env,
         )
 
@@ -299,6 +360,7 @@ class GammaClient:
                 setattr(self.stats, name, getattr(self.stats, name) + amount)
 
     def _check_budget_locked(self) -> None:
+        self._check_deadline()
         if self._max_requests is not None and self.stats.requests >= self._max_requests:
             raise RequestBudgetExceeded("Gamma request allowance exhausted")
         if (
@@ -306,6 +368,12 @@ class GammaClient:
             and self.stats.downloaded_bytes >= self._max_download_bytes
         ):
             raise RequestBudgetExceeded("Gamma download allowance exhausted")
+
+    def _check_deadline(self) -> float:
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            raise RequestBudgetExceeded("Gamma invocation duration exhausted")
+        return remaining
 
     def _reserve_request(self) -> None:
         with self._stats_lock:
@@ -334,6 +402,8 @@ class GammaClient:
         ``max_retries`` and ``backoff_cap_s`` override the client settings for this call.
         Id-window fetches use a shorter budget than keyset crawls.
         """
+        if not re.fullmatch(r"/(?:events|markets)(?:/keyset|/[1-9][0-9]*)?", endpoint):
+            raise MalformedResponse("Gamma endpoint must be a supported relative path")
         clean = encode_params(params or {})
         retry_budget = self._settings.max_retries if max_retries is None else max_retries
         backoff_cap = self._settings.backoff_cap_s if backoff_cap_s is None else backoff_cap_s
@@ -341,57 +411,63 @@ class GammaClient:
         while True:
             with self._stats_lock:
                 self._check_budget_locked()
-            self._limiter.acquire()
+            self._limiter.acquire(deadline=self._deadline)
             started = self._clock()
             self._reserve_request()
             try:
-                if self._max_body_bytes is None and self._max_download_bytes is None:
-                    raw = self._client.get(endpoint, params=clean)
-                    self._count_download(len(raw.content))
-                else:
-                    with self._client.stream(
-                        "GET", endpoint, params=clean, headers={"Accept-Encoding": "identity"}
-                    ) as streamed:
+                remaining = self._check_deadline()
+                with self._client.stream(
+                    "GET",
+                    endpoint,
+                    params=clean,
+                    headers={"Accept-Encoding": "identity"},
+                    timeout=httpx.Timeout(
+                        connect=min(self._settings.connect_timeout_s, remaining),
+                        read=min(self._settings.read_timeout_s, remaining),
+                        write=min(10.0, remaining),
+                        pool=min(10.0, remaining),
+                    ),
+                ) as streamed:
+                    if streamed.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise MalformedResponse(f"{endpoint}: compressed response forbidden")
+                    chunks = bytearray()
+                    for chunk in streamed.iter_bytes():
+                        self._count_download(len(chunk))
+                        self._check_deadline()
                         if (
-                            streamed.headers.get("content-encoding", "identity").lower()
-                            != "identity"
+                            self._max_body_bytes is not None
+                            and len(chunks) + len(chunk) > self._max_body_bytes
                         ):
-                            raise MalformedResponse(f"{endpoint}: compressed response forbidden")
-                        chunks = bytearray()
-                        for chunk in streamed.iter_bytes():
-                            self._count_download(len(chunk))
-                            if (
-                                self._max_body_bytes is not None
-                                and len(chunks) + len(chunk) > self._max_body_bytes
-                            ):
-                                raise MalformedResponse(f"{endpoint}: response exceeds byte limit")
-                            chunks.extend(chunk)
-                        raw = httpx.Response(
-                            streamed.status_code,
-                            headers={
-                                key: value
-                                for key, value in streamed.headers.items()
-                                if key.lower() not in {"content-encoding", "content-length"}
-                            },
-                            content=bytes(chunks),
-                        )
-            except (httpx.TransportError, httpx.DecodingError) as exc:
+                            raise MalformedResponse(f"{endpoint}: response exceeds byte limit")
+                        chunks.extend(chunk)
+                    raw = httpx.Response(
+                        streamed.status_code,
+                        headers={
+                            key: value
+                            for key, value in streamed.headers.items()
+                            if key.lower() not in {"content-encoding", "content-length"}
+                        },
+                        content=bytes(chunks),
+                    )
+            except (httpx.TransportError, httpx.DecodingError):
                 # A body that will not decode is a failed request, as a dropped connection is.
                 self._add(transport_errors=1)
                 if retries >= retry_budget:
-                    raise RetriesExhausted(f"{endpoint}: transport error: {exc}") from exc
+                    raise RetriesExhausted(
+                        f"{endpoint}: transport failed after {retries} retries"
+                    ) from None
                 retries += 1
                 self._add(retries=1)
                 logger.warning(
-                    "gamma %s transport error, retry %s of %s: %s",
+                    "gamma %s transport error, retry %s of %s",
                     endpoint,
                     retries,
                     retry_budget,
-                    exc,
                 )
                 self._limiter.penalize(self._delay(retries, None, backoff_cap))
                 continue
 
+            self._check_deadline()
             latency = self._clock() - started
             self._add(total_latency_s=latency)
             status = raw.status_code
@@ -417,7 +493,7 @@ class GammaClient:
                 continue
 
             if status == 422 and "after_cursor" in clean:
-                raise CursorExpired(f"{endpoint}: cursor rejected: {raw.text[:200]}")
+                raise CursorExpired(f"{endpoint}: cursor rejected")
             if status == 404:
                 self._add(not_found=1)
                 return Response(
@@ -431,11 +507,13 @@ class GammaClient:
                     received_at=self._now(),
                     headers=dict(raw.headers),
                 )
-            if status >= 400:
-                raise MalformedResponse(f"{endpoint}: HTTP {status}: {raw.text[:200]}")
+            if status != 200:
+                raise MalformedResponse(f"{endpoint}: unexpected HTTP {status}")
 
             try:
-                parsed = json.loads(raw.content)
+                parsed = json.loads(
+                    raw.content, parse_float=Decimal, parse_constant=_invalid_number
+                )
             except (ValueError, UnicodeDecodeError) as exc:
                 raise MalformedResponse(f"{endpoint}: body is not JSON") from exc
 

@@ -20,6 +20,7 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
+from oddsfox_catalogue.gamma.http import RequestBudgetExceeded, RetriesExhausted
 from oddsfox_catalogue.load.runner import LoadBlocked, LoadRuntime, load_pending
 from oddsfox_catalogue.load.source import event_resource, make_pipeline
 
@@ -35,6 +36,34 @@ def _capture(root: Path) -> str:
         return summary.batch_id
     finally:
         runtime.ledger.close()
+
+
+@pytest.mark.parametrize("selection", ["event", "market"])
+@pytest.mark.parametrize("incidental", [None, {"question": "Missing incidental identity"}])
+def test_selected_load_excludes_malformed_incidental_parent_markets(
+    tmp_path, selection, incidental
+):
+    world = demo_world()
+    fake = FakeGamma(world)
+    fake.nested_overrides["5002"] = incidental
+    runtime, _ = build_runtime(tmp_path, fake)
+    try:
+        summary = run_capture(
+            runtime,
+            "selected",
+            market_ids=["5001"] if selection == "market" else [],
+            event_ids=["101"] if selection == "event" else [],
+        )
+        assert summary.status == "captured"
+        settings = runtime.settings
+    finally:
+        runtime.client.close()
+        runtime.ledger.close()
+    result = _load(settings)
+    assert len(result.batches_registered) == 1
+    assert _table_count(settings, "quarantined_records") == 0
+    assert _table_count(settings, "event_observations") == 1
+    assert _table_count(settings, "market_observations") == (2 if selection == "market" else 0)
 
 
 def _load(settings: Settings) -> Any:
@@ -184,6 +213,7 @@ def test_schema_drift_in_envelope_is_rejected(tmp_path: Path) -> None:
             "endpoint": "/events/keyset",
             "payload_hash": "h",
             "payload": {},
+            "normalized": {},
             "unexpected_new_column": "boom",
         }
     ]
@@ -254,42 +284,40 @@ def _fake_that_drops_event_150() -> FakeGamma:
     return fake
 
 
-def test_fetch_failed_is_loaded_as_quarantine_and_counts_against_the_gate(
+def test_unresolved_fetch_cannot_register_partial_load_and_resumes_without_relaxing_gate(
     tmp_path: Path,
 ) -> None:
-    runtime, _ = build_runtime(tmp_path, _fake_that_drops_event_150())
+    fake = _fake_that_drops_event_150()
+    runtime, _ = build_runtime(tmp_path, fake)
     try:
-        run_capture(runtime, "bootstrap")
-    finally:
-        runtime.ledger.close()
-
-    permissive = make_settings(tmp_path, {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "0.5"})
-    summary = _load(permissive)
-    assert summary.quarantined >= 1
-    assert (
-        _query(
-            permissive,
-            "SELECT reason FROM bronze.quarantined_records "
-            "WHERE json_extract_string(payload, '$.id') = '150'",
+        with pytest.raises(RetriesExhausted):
+            run_capture(runtime, "bootstrap")
+        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
+        settings = runtime.settings
+        partial = load_pending(
+            LoadRuntime(settings=settings, ledger=runtime.ledger, now=lambda: FIXED_NOW)
         )
-        == "fetch_failed"
-    )
-    assert (
-        _query(permissive, "SELECT COUNT(*) FROM bronze.event_observations WHERE entity_id = '150'")
-        == 0
-    )
-
-    blocked_root = tmp_path / "blocked"
-    runtime, _ = build_runtime(blocked_root, _fake_that_drops_event_150())
-    try:
-        blocked_id = run_capture(runtime, "bootstrap").batch_id
+        assert partial.batches_registered == []
+        assert runtime.ledger.get_batch(batch_id)["status"] == "capturing"
+        assert (
+            _query(settings, "SELECT COUNT(*) FROM bronze.event_observations WHERE entity_id='150'")
+            == 0
+        )
+        fake.rules.clear()
+        captured = run_capture(runtime, "bootstrap", resume=batch_id)
+        assert captured.status == "captured"
+        complete = load_pending(
+            LoadRuntime(settings=settings, ledger=runtime.ledger, now=lambda: FIXED_NOW)
+        )
+        assert complete.batches_registered == [batch_id]
+        assert (
+            _query(settings, "SELECT COUNT(*) FROM bronze.event_observations WHERE entity_id='150'")
+            == 1
+        )
+        assert _query(settings, "SELECT COUNT(*) FROM bronze.quarantined_records") == 0
     finally:
         runtime.ledger.close()
-    blocked_settings = make_settings(blocked_root, {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "0"})
-    with pytest.raises(LoadBlocked, match="quarantine_max_ratio"):
-        _load(blocked_settings)
-    assert _batch_status(blocked_settings, blocked_id) == "captured"
-    assert _registry_rows(blocked_settings) == []
+        runtime.client.close()
 
 
 def test_batch_over_quarantine_cap_is_blocked_and_not_registered(tmp_path: Path) -> None:
@@ -342,9 +370,201 @@ def test_insert_only_merge_keys_on_observation_id_not_payload(tmp_path: Path) ->
             "endpoint": "/events/keyset",
             "payload_hash": "same-hash",
             "payload": {"id": "1"},
+            "normalized": {},
         }
 
     for observation_id in ["obs-a", "obs-b"]:
         pipeline.run(event_resource([row(observation_id)]))
 
     assert _query(settings, "SELECT COUNT(*) FROM bronze.event_observations") == 2
+
+
+def test_replay_blocks_conflicting_persisted_normalization(tmp_path: Path) -> None:
+    """An existing key cannot silently swallow a changed semantic projection."""
+    _capture(tmp_path)
+    settings = make_settings(tmp_path)
+    _load(settings)
+    connection = duckdb.connect(str(settings.warehouse_path))
+    try:
+        connection.execute(
+            "UPDATE bronze.event_observations SET normalized = '{}' WHERE entity_id = '101'"
+        )
+    finally:
+        connection.close()
+    ledger = Ledger(settings.ledger_path)
+    try:
+        with ledger.transaction() as connection:
+            connection.execute("UPDATE pages SET loaded_at = NULL, dlt_load_id = NULL")
+    finally:
+        ledger.close()
+    with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
+        _load(settings)
+
+
+def test_replay_blocks_conflicting_persisted_receipt_timestamp(tmp_path: Path) -> None:
+    """A mutated locator/envelope must fail even when normalized semantics are identical."""
+    _capture(tmp_path)
+    settings = make_settings(tmp_path)
+    _load(settings)
+    connection = duckdb.connect(str(settings.warehouse_path))
+    try:
+        connection.execute(
+            "UPDATE bronze.event_observations SET observed_at = observed_at + INTERVAL '1 second' WHERE entity_id = '101'"
+        )
+    finally:
+        connection.close()
+    ledger = Ledger(settings.ledger_path)
+    try:
+        with ledger.transaction() as connection:
+            connection.execute("UPDATE pages SET loaded_at = NULL, dlt_load_id = NULL")
+    finally:
+        ledger.close()
+    with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
+        _load(settings)
+
+
+def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(tmp_path: Path) -> None:
+    """An empty first capture has canonical schemas without inventing an evidence row."""
+    from oddsfox_catalogue.load.rows import PageContext, rows_for_page
+    from oddsfox_catalogue.load.source import market_resource, quarantine_resource
+
+    settings = make_settings(tmp_path)
+    pipeline = make_pipeline(settings.warehouse_path, settings.dlt_pipelines_dir, settings.load)
+    for factory in (event_resource, market_resource, quarantine_resource):
+        pipeline.run(factory([], materialize_only=True))
+    for table in ("event_observations", "market_observations", "quarantined_records"):
+        assert _table_count(settings, table) == 0
+    context = PageContext("page", "batch", "/events", FIXED_NOW, "events")
+    rows = rows_for_page(context, [make_event("1", "First")])
+    for _ in range(2):
+        pipeline.run(event_resource(rows.events))
+    assert _table_count(settings, "event_observations") == 1
+
+
+def test_load_preflight_blocks_before_dlt_when_working_allowance_is_too_small(
+    tmp_path: Path,
+) -> None:
+    batch_id = _capture(tmp_path)
+    settings = make_settings(tmp_path, {"CATALOGUE_CAPTURE_MAX_TEMP_BYTES": str(8 * 1024**2 - 1)})
+    with pytest.raises(RequestBudgetExceeded, match="temporary storage allowance"):
+        _load(settings)
+    assert _batch_status(settings, batch_id) == "captured"
+    assert not settings.warehouse_path.exists()
+    with Ledger(settings.ledger_path) as ledger:
+        assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+
+
+@pytest.mark.parametrize("allowance", ["retained", "temporary"])
+def test_load_resource_admission_precedes_fresh_warehouse_stamp(tmp_path, allowance):
+    from dataclasses import replace
+
+    from oddsfox_catalogue.limits import retained_bytes
+
+    batch_id = _capture(tmp_path)
+    settings = make_settings(tmp_path)
+    overrides = (
+        {"max_retained_bytes": retained_bytes(settings) + 4096}
+        if allowance == "retained"
+        else {"max_temp_bytes": 4096}
+    )
+    settings = replace(settings, capture=replace(settings.capture, **overrides))
+    with pytest.raises(RequestBudgetExceeded, match="allowance"):
+        _load(settings)
+    assert not settings.warehouse_path.exists()
+    assert _batch_status(settings, batch_id) == "captured"
+    with Ledger(settings.ledger_path) as ledger:
+        assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+
+
+def test_byte_heavy_selected_load_stays_inside_documented_reservation(tmp_path: Path) -> None:
+    import hashlib
+
+    from fakes.world import World
+    from oddsfox_catalogue.limits import retained_bytes
+    from oddsfox_catalogue.load.runner import (
+        LOAD_EXPANSION_FACTOR,
+        LOAD_FIXED_RESERVE,
+        _encoded_row_bytes,
+        _rows_for_chunk,
+    )
+
+    noise = "".join(hashlib.sha256(str(value).encode()).hexdigest() for value in range(8192))
+    world = World()
+    event = make_event("11", "Byte-heavy event")
+    market = make_market("201", "Byte-heavy market", event_stub=event_stub(event))
+    market["synthetic_payload"] = noise
+    event["synthetic_payload"] = noise
+    event["markets"] = [market]
+    world.add_event(event)
+    runtime, _ = build_runtime(
+        tmp_path,
+        FakeGamma(world),
+        env={
+            "CATALOGUE_CAPTURE_MAX_RETAINED_BYTES": str(128 * 1024**2),
+            "CATALOGUE_CAPTURE_MAX_TEMP_BYTES": str(128 * 1024**2),
+        },
+    )
+    try:
+        captured = run_capture(runtime, "selected", market_ids=["201"])
+        load_runtime = LoadRuntime(
+            settings=runtime.settings, ledger=runtime.ledger, now=lambda: FIXED_NOW
+        )
+        rows, _ = _rows_for_chunk(
+            load_runtime, runtime.ledger.pending_load_pages(captured.batch_id)
+        )
+        encoded = sum(
+            _encoded_row_bytes(row)
+            for relation in (rows.events, rows.markets, rows.quarantine)
+            for row in relation
+        )
+        before = retained_bytes(runtime.settings)
+        loaded = load_pending(load_runtime)
+        after = retained_bytes(runtime.settings)
+        assert encoded > 1024**2
+        assert loaded.batches_registered == [captured.batch_id]
+        assert 0 < after - before <= LOAD_FIXED_RESERVE + LOAD_EXPANSION_FACTOR * encoded
+        assert after < runtime.settings.capture.max_retained_bytes
+    finally:
+        runtime.ledger.close()
+        runtime.client.close()
+
+
+def test_existing_dlt_working_bytes_are_subtracted_before_load(tmp_path: Path) -> None:
+    batch_id = _capture(tmp_path)
+    settings = make_settings(tmp_path, {"CATALOGUE_CAPTURE_MAX_TEMP_BYTES": str(16 * 1024**2)})
+    settings.dlt_pipelines_dir.mkdir(parents=True, exist_ok=True)
+    retained = settings.dlt_pipelines_dir / "synthetic-existing-package.bin"
+    retained.write_bytes(b"x" * (9 * 1024**2))
+    with pytest.raises(RequestBudgetExceeded, match="temporary storage allowance"):
+        _load(settings)
+    assert retained.stat().st_size == 9 * 1024**2
+    assert _batch_status(settings, batch_id) == "captured"
+    with Ledger(settings.ledger_path) as ledger:
+        assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+
+
+def test_cached_pipeline_refreshes_spill_allowance_before_every_run(tmp_path: Path) -> None:
+    from oddsfox_catalogue.limits import remaining_temp_bytes
+    from oddsfox_catalogue.load.runner import _run_resource
+    from oddsfox_catalogue.load.source import market_resource
+
+    settings = make_settings(tmp_path, {"CATALOGUE_CAPTURE_MAX_TEMP_BYTES": str(64 * 1024**2)})
+    with Ledger(settings.ledger_path) as ledger:
+        runtime = LoadRuntime(settings=settings, ledger=ledger, now=lambda: FIXED_NOW)
+        _run_resource(runtime, event_resource([], materialize_only=True))
+        pipeline = runtime.pipeline
+        assert pipeline is not None
+        first_destination = pipeline.destination
+        first = first_destination.config_params["credentials"]["global_config"][
+            "max_temp_directory_size"
+        ]
+        (settings.dlt_pipelines_dir / "additional-working-bytes").write_bytes(b"x" * 1024**2)
+        expected = f"{remaining_temp_bytes(settings)}B"
+        _run_resource(runtime, market_resource([], materialize_only=True))
+        assert runtime.pipeline is pipeline
+        assert pipeline.destination is not first_destination
+        second = pipeline.destination.config_params["credentials"]["global_config"][
+            "max_temp_directory_size"
+        ]
+        assert second == expected
+        assert int(second[:-1]) < int(first[:-1])

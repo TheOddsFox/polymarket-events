@@ -3,11 +3,11 @@
 Plan shape:
 
 * bootstrap / reconcile: the open-market keyset first, then id-range scans for
-  every event and every closed market, each with a short tail above its
-  high-water mark. Closed-market windows wait for the open crawl at run time.
-  Deep keyset cursors and offset lists are not used. Gamma returns HTTP 500
-  on deep cursors and HTTP 422 once an offset passes a few thousand.
-* daily: the open-event keyset, then re-fetch previously open IDs missing from it.
+  every event and every closed market, sealed at their
+  high-water marks. Closed-market windows wait for the open crawl at run time.
+  Finite ID windows avoid deep closed-catalogue cursors and offset ceilings.
+* daily: direct open-event and open-market keysets, then re-fetch previously
+  open or unknown records missing from those lists.
 
 Follow-up scans (ID chunks, then single lookups) are created after their
 inputs are known, so they are persisted with their input ID lists. This keeps
@@ -25,6 +25,7 @@ from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse
 from oddsfox_catalogue.gamma.paginators import unpack
 
 ScanKind = Literal["keyset", "offset", "id_range", "keyset_ids", "single_ids"]
+MAX_PLAN_SCANS = 20_000
 ID_CHUNK = 100
 ID_STEP = 100
 TAIL_EMPTY_WINDOWS = 3
@@ -125,16 +126,20 @@ def _high_water(client: GammaClient, endpoint: str, record_key: str) -> int:
     if response.status != 200:
         raise MalformedResponse(f"{endpoint}: high-water HTTP {response.status}")
     records, _ = unpack(response.json, record_key)
-    if not records or not isinstance(records[0], dict) or "id" not in records[0]:
-        raise MalformedResponse(f"{endpoint}: high-water response has no id")
+    if not records:
+        return 0
+    if len(records) != 1 or not isinstance(records[0], dict):
+        raise MalformedResponse("high-water response has an invalid ID")
+    value = str(records[0].get("id", ""))
+    if (
+        not value.isascii()
+        or not value.isdecimal()
+        or not 0 < len(value) <= 20
+        or int(value) <= 0
+        or str(int(value)) != value
+    ):
+        raise MalformedResponse("high-water response has an invalid ID")
     return int(records[0]["id"])
-
-
-def _cap(mark: int, override: int) -> tuple[int, bool]:
-    """Return ``(mark, include_tail)``. An override below the server mark drops the tail."""
-    if override > 0 and override < mark:
-        return override, False
-    return mark, True
 
 
 def _partitions(
@@ -146,6 +151,8 @@ def _partitions(
     closed: bool | None,
     extra: dict[str, Any] | None = None,
 ) -> list[ScanSpec]:
+    if partition < 1 or (hi + partition - 1) // partition > MAX_PLAN_SCANS:
+        raise ValueError("source high-water implies an excessive finite scan plan")
     scans: list[ScanSpec] = []
     start = 1
     index = 1
@@ -168,68 +175,81 @@ def _partitions(
     return scans
 
 
-def id_range_plan(
-    gamma: GammaSettings, capture: CaptureSettings, client: GammaClient
-) -> list[ScanSpec]:
-    """Open-market keyset first, then event and closed-market id ranges and their tails.
+def high_water(client: GammaClient, record_key: str) -> int:
+    return _high_water(client, "/" + record_key, record_key)
 
-    The open crawl is first in plan order, and the runner holds the closed-market windows until
-    it completes. A market is then seen by the open crawl while it is open, or by a closed window
-    once it has closed. A closed window that ran earlier could miss a market that closed mid-batch.
-    """
-    event_mark, event_tail = _cap(_high_water(client, "/events", "events"), capture.max_id_override)
-    market_mark, market_tail = _cap(
-        _high_water(client, "/markets", "markets"), capture.max_id_override
+
+def sealed_plan(
+    mode: str, gamma: GammaSettings, capture: CaptureSettings, marks: dict[str, int]
+) -> list[ScanSpec]:
+    """A source high-water is a finite observation boundary, never an expanding tail."""
+    planned_count = 1 + sum(
+        (marks[key] + capture.id_partition_size - 1) // capture.id_partition_size
+        for key in ("events", "markets")
     )
-    scans: list[ScanSpec] = [markets_keyset_open(gamma)]
-    event_flags = _event_flags(gamma)
-    scans.extend(
-        _partitions(
+    if mode != "daily" and planned_count > MAX_PLAN_SCANS:
+        raise ValueError("source high-water implies an excessive finite scan plan")
+    market_open = markets_keyset_open(gamma)
+    market_open = ScanSpec(
+        market_open.name,
+        market_open.kind,
+        market_open.endpoint,
+        market_open.record_key,
+        _freeze(
+            {
+                **market_open.param_dict,
+                "_high_water": marks["markets"],
+                "order": "id",
+                "ascending": True,
+            }
+        ),
+    )
+    if mode == "daily":
+        event_open = event_keyset_open(gamma)
+        event_open = ScanSpec(
+            event_open.name,
+            event_open.kind,
+            event_open.endpoint,
+            event_open.record_key,
+            _freeze(
+                {
+                    **event_open.param_dict,
+                    "_high_water": marks["events"],
+                    "order": "id",
+                    "ascending": True,
+                }
+            ),
+        )
+        return [event_open, market_open]
+    return [
+        market_open,
+        *_partitions(
             "events_ids",
             "/events/keyset",
             "events",
-            event_mark,
+            marks["events"],
             capture.id_partition_size,
             None,
-            event_flags,
-        )
-    )
-    if event_tail:
-        scans.append(
-            id_range_scan(
-                "events_ids_tail",
-                "/events/keyset",
-                "events",
-                lo=event_mark + 1,
-                hi=None,
-                closed=None,
-                tail=True,
-                extra=event_flags,
-            )
-        )
-    scans.extend(
-        _partitions(
+            _event_flags(gamma),
+        ),
+        *_partitions(
             "markets_closed_ids",
             "/markets/keyset",
             "markets",
-            market_mark,
+            marks["markets"],
             capture.id_partition_size,
             True,
-        )
-    )
-    if market_tail:
-        scans.append(
-            id_range_scan(
-                "markets_closed_ids_tail",
-                "/markets/keyset",
-                "markets",
-                lo=market_mark + 1,
-                hi=None,
-                closed=True,
-                tail=True,
-            )
-        )
-    return scans
+        ),
+    ]
+
+
+def id_range_plan(
+    gamma: GammaSettings, capture: CaptureSettings, client: GammaClient
+) -> list[ScanSpec]:
+    marks = {key: high_water(client, key) for key in ("events", "markets")}
+    if capture.max_id_override:
+        marks = {key: min(value, capture.max_id_override) for key, value in marks.items()}
+    return sealed_plan("bootstrap", gamma, capture, marks)
 
 
 def list_scans_for(
@@ -239,13 +259,12 @@ def list_scans_for(
     capture: CaptureSettings | None = None,
     client: GammaClient | None = None,
 ) -> list[ScanSpec]:
-    if mode == "daily":
-        return [event_keyset_open(gamma)]
-    if mode in {"bootstrap", "reconcile"}:
-        if capture is None or client is None:
-            raise ValueError(f"{mode} planning needs capture settings and a Gamma client")
-        return id_range_plan(gamma, capture, client)
-    raise ValueError(f"unknown mode {mode!r}")
+    if mode not in {"bootstrap", "daily", "reconcile"} or capture is None or client is None:
+        raise ValueError("catalogue planning requires a supported mode, settings and client")
+    marks = {key: high_water(client, key) for key in ("events", "markets")}
+    if capture.max_id_override:
+        marks = {key: min(value, capture.max_id_override) for key, value in marks.items()}
+    return sealed_plan(mode, gamma, capture, marks)
 
 
 def chunk(ids: list[str], size: int = ID_CHUNK) -> list[list[str]]:
@@ -274,6 +293,12 @@ def single_id_scan(index: int, ids: list[str]) -> ScanSpec:
         endpoint="/events/{id}",
         record_key="events",
         input_ids=tuple(ids),
+    )
+
+
+def native_single_scan(name: str, ids: list[str], record_key: str) -> ScanSpec:
+    return ScanSpec(
+        name, "single_ids", "/" + record_key + "/{id}", record_key, input_ids=tuple(ids)
     )
 
 

@@ -14,9 +14,10 @@ jobs:
     timeout-minutes: 45
     env:
       UV_PYTHON: "3.12"
-      # Tests must never reach the live Gamma API. Every fixture-backed test uses an
-      # in-process transport; this address is unroutable and would fail loudly if one leaked.
+      # Ordinary tests use in-process transports; installed workflow proof starts
+      # its own bounded loopback fixture server. Neither uses live Gamma.
       CATALOGUE_GAMMA_BASE_URL: "http://127.0.0.1:9"
+      CATALOGUE_GAMMA_ALLOW_LOOPBACK: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -32,6 +33,14 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked
 
+      - name: Prepare hash-locked production dependencies for offline installation
+        env:
+          UV_LINK_MODE: copy
+        run: |
+          uv export --locked --offline --no-dev --no-emit-project --output-file "$RUNNER_TEMP/catalogue-production-requirements.txt"
+          uv venv --offline --python 3.12 "$RUNNER_TEMP/catalogue-dependency-preparation"
+          uv pip install --default-index https://pypi.org/simple --python "$RUNNER_TEMP/catalogue-dependency-preparation/bin/python" --require-hashes -r "$RUNNER_TEMP/catalogue-production-requirements.txt"
+
       - name: Lint
         run: |
           uv run ruff check .
@@ -40,32 +49,10 @@ jobs:
       - name: dbt parse
         run: uv run catalogue dbt -- parse
 
-      - name: Unit tests
-        run: uv run pytest -q tests/unit
+      - name: Complete offline test suite
+        run: uv run --locked pytest -q
 
-      - name: Capture and crash recovery (after_page_rename, after_ledger_commit, expired cursor)
-        run: uv run pytest -q tests/integration/test_capture.py
-
-      - name: Id-range recovery (rebuild keeps planned scans, tails end, pool reopens, quarantine)
-        run: uv run pytest -q tests/integration/test_id_range_recovery.py
-
-      - name: Bootstrap wrapper (retries only exit 1, signals stop, attempt cap)
-        run: uv run pytest -q tests/integration/test_bootstrap_until_done.py
-
-      - name: Capture worker pool (shared rate limit, sibling drain, concurrency)
-        run: uv run pytest -q tests/integration/test_capture_pool.py
-
-      - name: Loader (duplicates, closures, schema drift, mid_dlt_load, before_registry)
-        run: uv run pytest -q tests/integration/test_load.py
-
-      - name: dbt models (closures, SCD2 history, count regression, incremental equivalence)
-        run: uv run pytest -q tests/integration/test_dbt_core.py
-
-      - name: Publication (fingerprints, pointer swap, mid_publish crash, publication blocking)
-        run: uv run pytest -q tests/integration/test_publish.py
-
-      - name: Operations (rebuild verify, replay order, backups, stage metrics, launchd)
-        run: uv run pytest -q tests/integration/test_ops.py
-
-      - name: Dagster jobs and run queue config
-        run: uv run pytest -q tests/integration/test_dagster.py
+      - name: Audited installed package and full offline workflow
+        env:
+          UV_LINK_MODE: copy
+        run: uv run --locked python scripts/verify-installed-workflow.py

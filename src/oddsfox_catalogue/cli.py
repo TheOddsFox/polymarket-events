@@ -11,33 +11,39 @@ import json
 import logging
 import signal
 import sys
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from oddsfox_catalogue import __version__
-from oddsfox_catalogue.backup import create_backup, verify_backup
+from oddsfox_catalogue.backup import create_backup, restore_backup, verify_backup
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import (
-    CaptureRuntime,
     abandon_batch,
     rebuild_from_raw,
     run_capture,
 )
-from oddsfox_catalogue.config import Settings, load_settings, settings_as_dict
-from oddsfox_catalogue.gamma.http import GammaClient
+from oddsfox_catalogue.certification import read_build_validity
+from oddsfox_catalogue.config import load_settings, settings_as_dict
+from oddsfox_catalogue.gamma.http import GammaError
 from oddsfox_catalogue.ids import MODES, sha256_bytes
 from oddsfox_catalogue.load.runner import LoadBlocked
 from oddsfox_catalogue.metadata import MetadataError, export_metadata, refresh_metadata
-from oddsfox_catalogue.pipeline import dbt_stage, load_stage, publish_stage, refresh
-from oddsfox_catalogue.publish import PublishBlocked, current_release
+from oddsfox_catalogue.pipeline import (
+    capture_runtime,
+    dbt_stage,
+    load_stage,
+    publish_stage,
+    refresh,
+)
+from oddsfox_catalogue.publish import PublishBlocked, current_release, verify_release
 from oddsfox_catalogue.rebuild import rebuild_and_verify
-from oddsfox_catalogue.runlock import RunBusy, current_git_sha, run_lock
+from oddsfox_catalogue.runlock import RunBusy, run_lock
 from oddsfox_catalogue.signals import SIGNALS, Terminated
-from oddsfox_catalogue.warehouse import BaselineMissing, read_open_event_ids
+from oddsfox_catalogue.warehouse import BaselineMissing
+from oddsfox_catalogue.warehouse_version import WarehouseVersionError
 
 Handler = Callable[[argparse.Namespace], int]
 
@@ -72,24 +78,6 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-@contextmanager
-def _capture_runtime(settings: Settings) -> Iterator[CaptureRuntime]:
-    client = GammaClient(settings.gamma)
-    ledger = Ledger(settings.ledger_path)
-    runtime = CaptureRuntime(
-        settings=settings,
-        client=client,
-        ledger=ledger,
-        open_event_ids=lambda: read_open_event_ids(settings.warehouse_path),
-        git_sha=current_git_sha(settings.root),
-    )
-    try:
-        yield runtime
-    finally:
-        ledger.close()
-        client.close()
-
-
 def _cmd_version(_: argparse.Namespace) -> int:
     print(__version__)
     return 0
@@ -103,8 +91,14 @@ def _cmd_config_show(_: argparse.Namespace) -> int:
 
 def _cmd_capture(args: argparse.Namespace) -> int:
     settings = load_settings()
-    with run_lock(settings.run_lock_path), _capture_runtime(settings) as runtime:
-        summary = run_capture(runtime, args.mode)
+    with run_lock(settings.run_lock_path), capture_runtime(settings) as runtime:
+        summary = run_capture(
+            runtime,
+            args.mode,
+            market_ids=args.market_id,
+            event_ids=args.event_id,
+            resume=args.resume,
+        )
     print(
         json.dumps(
             {
@@ -115,6 +109,9 @@ def _cmd_capture(args: argparse.Namespace) -> int:
                 "pages_adopted": summary.pages_adopted,
                 "records": summary.records,
                 "scans": len(summary.scans),
+                "http_attempts": summary.http_attempts,
+                "downloaded_bytes": summary.downloaded_bytes,
+                "duration_s": summary.duration_s,
             },
             indent=2,
         )
@@ -177,7 +174,9 @@ def _cmd_publish(_: argparse.Namespace) -> int:
 
 def _cmd_refresh(args: argparse.Namespace) -> int:
     settings = load_settings()
-    result = refresh(settings, args.mode)
+    result = refresh(
+        settings, args.mode, market_ids=args.market_id, event_ids=args.event_id, resume=args.resume
+    )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("status") == "published" else 2
 
@@ -213,6 +212,26 @@ def _cmd_current(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """Verify immutable outputs without requiring a valid current warehouse."""
+    settings = load_settings()
+    if args.release is None:
+        pointer = current_release(settings)
+        if pointer is None:
+            raise PublishBlocked("no published release to verify")
+        path = settings.published_dir / pointer["path"]
+        digest = pointer["manifest_sha256"]
+    else:
+        path, digest = args.release, None
+    manifest = verify_release(settings, path, manifest_sha256=digest)
+    print(
+        json.dumps(
+            {"verified": True, "release_id": manifest["release_id"], "path": str(path)}, indent=2
+        )
+    )
+    return 0
+
+
 def _cmd_backup_create(args: argparse.Namespace) -> int:
     settings = load_settings()
     with run_lock(settings.run_lock_path):
@@ -228,6 +247,12 @@ def _cmd_backup_verify(args: argparse.Namespace) -> int:
     problems = verify_backup(args.path)
     print(json.dumps({"verified": not problems, "problems": problems}, indent=2))
     return 0 if not problems else 4
+
+
+def _cmd_backup_restore(args: argparse.Namespace) -> int:
+    destination = restore_backup(args.path, args.destination)
+    print(json.dumps({"restored": True, "destination": str(destination)}, indent=2))
+    return 0
 
 
 def _cmd_rebuild(_: argparse.Namespace) -> int:
@@ -270,7 +295,7 @@ def _cmd_status(_: argparse.Namespace) -> int:
         ]
     finally:
         ledger.close()
-    print(json.dumps(rows, indent=2))
+    print(json.dumps({"batches": rows, "warehouse_build": read_build_validity(settings)}, indent=2))
     return 0
 
 
@@ -320,6 +345,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     capture = sub.add_parser("capture", help="capture raw Gamma pages for one mode")
     capture.add_argument("--mode", choices=MODES, required=True)
+    capture.add_argument(
+        "--market-id", action="append", default=[], help="selected Gamma market ID; repeat for more"
+    )
+    capture.add_argument(
+        "--event-id", action="append", default=[], help="selected Gamma event ID; repeat for more"
+    )
+    capture.add_argument("--resume", help="explicit existing batch ID to verify and resume")
     capture.set_defaults(handler=_cmd_capture)
 
     ledger = sub.add_parser("ledger", help="ledger maintenance")
@@ -376,11 +408,25 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("current", help="show the current published release").set_defaults(
         handler=_cmd_current
     )
+    verify = sub.add_parser(
+        "verify", help="verify an immutable release independently of the warehouse"
+    )
+    verify.add_argument(
+        "--release", type=Path, help="release directory; defaults to the current release"
+    )
+    verify.set_defaults(handler=_cmd_verify)
 
     refresh_parser = sub.add_parser(
         "refresh", help="capture, load, build, and publish in one stage order"
     )
     refresh_parser.add_argument("--mode", choices=MODES, required=True)
+    refresh_parser.add_argument(
+        "--market-id", action="append", default=[], help="selected Gamma market ID; repeat for more"
+    )
+    refresh_parser.add_argument(
+        "--event-id", action="append", default=[], help="selected Gamma event ID; repeat for more"
+    )
+    refresh_parser.add_argument("--resume", help="explicit existing batch ID to verify and resume")
     refresh_parser.set_defaults(handler=_cmd_refresh)
 
     sub.add_parser(
@@ -398,6 +444,12 @@ def build_parser() -> argparse.ArgumentParser:
     backup_verify = backup_sub.add_parser("verify", help="re-hash a backup and list problems")
     backup_verify.add_argument("path", type=Path)
     backup_verify.set_defaults(handler=_cmd_backup_verify)
+    backup_restore = backup_sub.add_parser(
+        "restore", help="verify and restore into a fresh operator root"
+    )
+    backup_restore.add_argument("path", type=Path)
+    backup_restore.add_argument("--destination", type=Path, required=True)
+    backup_restore.set_defaults(handler=_cmd_backup_restore)
 
     rebuild = sub.add_parser(
         "rebuild", help="rebuild from raw pages and compare with the live warehouse"
@@ -423,8 +475,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             # This covers a signal during argument parsing as well as during a stage.
             print(f"error: terminated by {exc}", file=sys.stderr)
             return 128 + exc.signum
-        except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked, MetadataError) as exc:
+        except (
+            RunBusy,
+            PublishBlocked,
+            BaselineMissing,
+            LoadBlocked,
+            MetadataError,
+            WarehouseVersionError,
+            GammaError,
+            ValueError,
+            OSError,
+        ) as exc:
             print(f"error: {exc}", file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "status": "blocked",
+                        "message": str(exc),
+                        "batch_id": getattr(exc, "batch_id", None),
+                        "http_attempts": getattr(exc, "http_attempts", 0),
+                        "downloaded_bytes": getattr(exc, "downloaded_bytes", 0),
+                    }
+                ),
+                file=sys.stderr,
+            )
             return 3
     finally:
         restore_signals()

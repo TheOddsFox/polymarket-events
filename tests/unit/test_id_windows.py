@@ -10,7 +10,7 @@ import pytest
 
 from fakes.harness import FakeClock
 from oddsfox_catalogue.config import GammaSettings
-from oddsfox_catalogue.gamma.http import GammaClient
+from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse, RetriesExhausted
 from oddsfox_catalogue.gamma.paginators import PageState, id_list_pages, id_range_pages
 
 NOW = datetime(2026, 10, 8, 6, 0, tzinfo=UTC)
@@ -60,44 +60,39 @@ def test_resumed_tail_keeps_its_empty_run() -> None:
     assert calls["n"] == 4
 
 
-def test_tail_stops_when_every_window_fails() -> None:
-    """A persistent outage above the mark must not run the tail forever."""
-
-    def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error": "down"})
-
-    client, _ = _client(handler)
+def test_an_unresolved_window_fails_without_yielding_empty_evidence() -> None:
+    client, _ = _client(lambda _: httpx.Response(500, json={"error": "down"}))
     try:
-        pages = list(id_range_pages(client, "/events/keyset", _tail(step=2), "events"))
+        with pytest.raises(RetriesExhausted):
+            next(id_range_pages(client, "/events/keyset", _tail(step=2), "events"))
+        assert 0 < client.stats.requests < 100
     finally:
         client.close()
 
-    assert [page.terminal for page in pages] == [False, False, True]
-    assert all(page.record_count == 0 for page in pages)
-    failed = [item["id"] for page in pages for item in page.response.json["fetch_failed"]]
-    assert failed == ["1", "2", "3", "4", "5", "6"]
 
-
-@pytest.mark.parametrize(("status", "quarantined"), [(400, True), (403, True), (404, False)])
-def test_single_id_hard_error_is_quarantined_and_404_is_not(status: int, quarantined: bool) -> None:
+@pytest.mark.parametrize("status", [400, 403, 404])
+def test_single_id_hard_error_blocks_and_404_is_confirmed_absence(status: int) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/events/keyset":
-            return httpx.Response(500, json={"error": "down"})
-        return httpx.Response(status, json={"error": "nope"})
+        return httpx.Response(
+            500 if request.url.path == "/events/keyset" else status, json={"error": "nope"}
+        )
 
     client, _ = _client(handler)
     try:
-        (page,) = id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events")
+        if status != 404:
+            with pytest.raises(MalformedResponse):
+                next(
+                    id_range_pages(
+                        client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events"
+                    )
+                )
+        else:
+            (page,) = id_range_pages(
+                client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events"
+            )
+            assert page.terminal and page.response.status == 404 and page.records == []
     finally:
         client.close()
-
-    assert page.terminal
-    if quarantined:
-        assert page.response.status == 200
-        assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]
-    else:
-        assert page.response.status == 404
-        assert page.records == []
 
 
 def test_id_window_sends_the_event_include_flags() -> None:
@@ -163,9 +158,7 @@ def test_a_market_answered_by_id_still_asks_for_its_tags() -> None:
     assert page.records == [{"id": "7", "tags": [{"id": "2"}]}]
 
 
-def test_single_id_that_returns_another_record_is_quarantined() -> None:
-    """A 200 for id 7 that describes record 8 does not answer for 7. It is quarantined."""
-
+def test_single_id_that_returns_another_record_blocks_completion() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/events/keyset":
             return httpx.Response(500, json={"error": "down"})
@@ -173,12 +166,10 @@ def test_single_id_that_returns_another_record_is_quarantined() -> None:
 
     client, _ = _client(handler)
     try:
-        (page,) = id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events")
+        with pytest.raises(MalformedResponse):
+            next(id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events"))
     finally:
         client.close()
-
-    assert page.records == []
-    assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]
 
 
 def test_a_transient_window_error_is_retried_before_any_bisection() -> None:
@@ -217,16 +208,16 @@ def _rejects_id_two(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"events": [{"id": i} for i in ids]})
 
 
-def test_a_multi_id_window_rejected_with_422_is_split_and_its_bad_id_quarantined() -> None:
-    """A 422 on a multi-id window is not fatal. The window splits, and only the bad id is lost."""
+def test_a_rejected_multi_id_window_splits_but_unresolved_singleton_blocks() -> None:
     client, _ = _client(_rejects_id_two)
     try:
-        (page,) = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        pages = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        first = next(pages)
+        assert first.records == [{"id": "1"}] and not first.terminal
+        with pytest.raises(RetriesExhausted):
+            next(pages)
     finally:
         client.close()
-
-    assert [record["id"] for record in page.records] == ["1"]
-    assert page.response.json["fetch_failed"] == [{"id": "2", "reason": "fetch_failed"}]
 
 
 def _undecodable_for_id_two(request: httpx.Request) -> httpx.Response:
@@ -237,32 +228,50 @@ def _undecodable_for_id_two(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"events": [{"id": i} for i in ids]})
 
 
-def test_a_body_that_does_not_decode_is_split_and_its_bad_id_quarantined() -> None:
-    """A body that fails to decode is a failed request, as a dropped connection is. Only id 2 is lost."""
+def test_an_undecodable_singleton_blocks_a_split_window() -> None:
     client, _ = _client(_undecodable_for_id_two)
     try:
-        (page,) = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        pages = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        first = next(pages)
+        assert first.records == [{"id": "1"}] and not first.terminal
+        with pytest.raises(RetriesExhausted):
+            next(pages)
     finally:
         client.close()
 
-    assert [record["id"] for record in page.records] == ["1"]
-    assert page.response.json["fetch_failed"] == [{"id": "2", "reason": "fetch_failed"}]
 
+def test_a_keyset_ids_chunk_resumes_after_provider_recovery() -> None:
+    recovered = {"ready": False}
 
-def test_a_keyset_ids_chunk_gets_the_window_policy() -> None:
-    """A stage-1 chunk splits on a 422 like a window, and a bad id is quarantined by ID."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not recovered["ready"]:
+            return _rejects_id_two(request)
+        return httpx.Response(
+            200, json={"events": [{"id": value} for value in request.url.params.get_list("id")]}
+        )
+
     chunk = {"limit": 100, "id": [1, 2, 3]}
-    client, _ = _client(_rejects_id_two)
+    client, _ = _client(handler)
     try:
-        (page,) = id_list_pages(client, "/events/keyset", chunk, "events")
-        resumed = list(id_list_pages(client, "/events/keyset", chunk, "events", PageState(seq=1)))
+        pages = id_list_pages(client, "/events/keyset", chunk, "events")
+        first = next(pages)
+        assert first.records == [{"id": "1"}] and first.output_offset == 1
+        with pytest.raises(RetriesExhausted):
+            next(pages)
+        recovered["ready"] = True
+        (page,) = id_list_pages(
+            client, "/events/keyset", chunk, "events", PageState(seq=1, offset=1)
+        )
+        assert page.seq == 2 and page.terminal
+        assert [record["id"] for record in page.records] == ["2", "3"]
+        assert (
+            list(
+                id_list_pages(client, "/events/keyset", chunk, "events", PageState(seq=2, offset=3))
+            )
+            == []
+        )
     finally:
         client.close()
-
-    assert page.seq == 1 and page.terminal
-    assert sorted(record["id"] for record in page.records) == ["1", "3"]
-    assert page.response.json["fetch_failed"] == [{"id": "2", "reason": "fetch_failed"}]
-    assert resumed == [], "a durable chunk page is not fetched again"
 
 
 def test_a_429_without_retry_after_waits_at_least_the_base_backoff() -> None:
@@ -296,19 +305,15 @@ def test_a_429_without_retry_after_waits_at_least_the_base_backoff() -> None:
     assert clock.sleeps == [5.0]
 
 
-def test_a_single_id_window_with_a_hard_error_is_quarantined() -> None:
-    """A one-id window answered with a hard error gets the by-ID answer, not a failed scan."""
-
+def test_a_single_id_hard_window_error_uses_lookup_and_blocks_unresolved_failure() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/events/keyset":
-            return httpx.Response(400, json={"error": "bad request"})
-        return httpx.Response(500, json={"error": "down"})
+        return httpx.Response(
+            400 if request.url.path == "/events/keyset" else 500, json={"error": "down"}
+        )
 
     client, _ = _client(handler)
     try:
-        (page,) = id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events")
+        with pytest.raises(RetriesExhausted):
+            next(id_range_pages(client, "/events/keyset", {"lo": 7, "step": 1, "hi": 7}, "events"))
     finally:
         client.close()
-
-    assert page.records == []
-    assert page.response.json["fetch_failed"] == [{"id": "7", "reason": "fetch_failed"}]

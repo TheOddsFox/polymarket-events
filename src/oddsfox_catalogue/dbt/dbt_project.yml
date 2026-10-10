@@ -1,0 +1,29 @@
+name: oddsfox_catalogue
+version: "0.1.0"
+config-version: 2
+profile: oddsfox_catalogue
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # Semantic projection version. Bump to rebuild history when the meaning of a field changes.
+  projection_version: "v2"
+
+models:
+  oddsfox_catalogue:
+    +materialized: view
+    staging:
+      +schema: staging
+    core:
+      +schema: core
+      +materialized: table
+    history:
+      +schema: history
+      +materialized: table
+    marts:
+      +schema: marts
+      +materialized: table

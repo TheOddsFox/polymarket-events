@@ -6,16 +6,16 @@ Stack: Python 3.12, uv, dlt, dbt, DuckDB, and Dagster. Use the `oddsfox-polymark
 
 ## Pipeline
 
-Gamma API capture writes immutable JSON.gz pages and manifests under `data/raw`. Load writes them into bronze with dlt. dbt builds staging, core current, history (SCD2), and marts. Publish writes `data/published/releases/<id>/*.parquet` and `current.json`.
+Gamma API capture writes immutable JSON.gz pages and manifests under `data/raw`. Load writes them into bronze with dlt. Shared normalization supplies both metadata.v1 and the replacement catalogue.v2 warehouse. dbt builds staging, core current, observation history, and marts. Publish writes `data/published/releases/<id>/*.parquet`, coverage and `current.json`. Legacy warehouse roots are incompatible; use a fresh root without modifying old state.
 
-Operator targets: `make bootstrap` (first run), `make refresh` (daily), `make reconcile` (weekly), `make replay` (no Gamma calls), `make validate`, `make publish`, `make current`, `make status`, `make backup`, `make verify-backup BACKUP=...`, and `make rebuild`.
+Operator targets: `make bootstrap` (first run), `make refresh` (daily), `make reconcile` (weekly), `make replay` (no Gamma calls), `make validate`, `make publish`, `make current`, `make status`, `make verify`, `make backup`, `make verify-backup BACKUP=...`, `make restore-backup BACKUP=... DESTINATION=...`, and `make rebuild`.
 
 ## Verification
 
-- Fast: `git diff --check`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest -q -n auto --dist loadscope`
+- Fast: `git diff --check`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest -q`
 - Completion: both diff checks, `uv lock --check`, `uv sync --locked`, the same Ruff checks, `uv run catalogue dbt -- parse`, and `uv run pytest -q` (one process; CI matches this)
 
-These commands are wrapped by `scripts/verify-fast` and `scripts/verify`. Hosted CI runs the same lint, dbt parse, and test steps and never contacts Pad.
+These commands are wrapped by `scripts/verify-fast` and `scripts/verify`. Hosted CI runs the complete test suite, distribution audits and the installed catalogue workflow against synthetic loopback fixtures. Runtime checks use an independent environment outside the checkout with read-only packaged dbt resources. CI never contacts live Gamma or Pad.
 
 ## Tests
 

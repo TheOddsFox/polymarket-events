@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -17,7 +19,8 @@ ENV_PREFIX = "CATALOGUE"
 @dataclass(frozen=True)
 class GammaSettings:
     base_url: str = "https://gamma-api.polymarket.com"
-    requests_per_second: float = 5.0
+    requests_per_second: float = 2.0
+    allow_loopback: bool = False
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 60.0
     max_retries: int = 12
@@ -34,8 +37,8 @@ class PathSettings:
     data_dir: str = "data"
     state_dir: str = ".state"
     warehouse_file: str = "data/warehouse/catalogue.duckdb"
-    dbt_project_dir: str = "dbt"
-    dbt_profiles_dir: str = "dbt"
+    dbt_project_dir: str = ""
+    dbt_profiles_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,14 +52,8 @@ class LoadSettings:
 @dataclass(frozen=True)
 class QualitySettings:
     quarantine_max_ratio: float = 0.01
-    unresolved_reference_max_ratio: float = 0.01
     open_events_drop_warn_pct: float = 5.0
     open_events_drop_error_pct: float = 10.0
-
-
-@dataclass(frozen=True)
-class PublishSettings:
-    retain_releases: int = 5
 
 
 @dataclass(frozen=True)
@@ -76,7 +73,13 @@ class CaptureSettings:
 
     id_partition_size: int = 50_000
     max_id_override: int = 0
-    workers: int = 4
+    workers: int = 1
+    max_requests: int = 25_000
+    max_download_bytes: int = 4 * 1024**3
+    max_duration_s: float = 4.0 * 60 * 60
+    max_response_bytes: int = 16 * 1024**2
+    max_retained_bytes: int = 64 * 1024**3
+    max_temp_bytes: int = 8 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -86,7 +89,6 @@ class Settings:
     paths: PathSettings = field(default_factory=PathSettings)
     load: LoadSettings = field(default_factory=LoadSettings)
     quality: QualitySettings = field(default_factory=QualitySettings)
-    publish: PublishSettings = field(default_factory=PublishSettings)
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
     capture: CaptureSettings = field(default_factory=CaptureSettings)
 
@@ -129,11 +131,25 @@ class Settings:
 
     @property
     def dbt_project_dir(self) -> Path:
-        return self._abs(self.paths.dbt_project_dir)
+        from oddsfox_catalogue.resources import dbt_project_dir
+
+        return (
+            self._abs(self.paths.dbt_project_dir)
+            if self.paths.dbt_project_dir
+            else dbt_project_dir()
+        )
 
     @property
     def dbt_profiles_dir(self) -> Path:
-        return self._abs(self.paths.dbt_profiles_dir)
+        return (
+            self._abs(self.paths.dbt_profiles_dir)
+            if self.paths.dbt_profiles_dir
+            else self.dbt_project_dir
+        )
+
+    @property
+    def temporary_dir(self) -> Path:
+        return self.state_dir / "tmp"
 
     @property
     def published_dir(self) -> Path:
@@ -163,10 +179,23 @@ def _build_section(cls: type, raw: Mapping[str, Any], section: str, env: Mapping
     defaults = cls()
     values: dict[str, Any] = {}
     for name in known:
-        base = raw.get(name, getattr(defaults, name))
+        target = getattr(defaults, name)
+        base = raw.get(name, target)
         env_key = f"{ENV_PREFIX}_{section}_{name}".upper()
         if env_key in env:
-            base = _coerce(env[env_key], getattr(defaults, name))
+            base = _coerce(env[env_key], target)
+        if isinstance(target, bool):
+            valid = isinstance(base, bool)
+        elif isinstance(target, int):
+            valid = isinstance(base, int) and not isinstance(base, bool)
+        elif isinstance(target, float):
+            valid = (
+                isinstance(base, int | float) and not isinstance(base, bool) and math.isfinite(base)
+            )
+        else:
+            valid = isinstance(base, str)
+        if not valid:
+            raise ValueError(f"[{section}] {name} has an invalid type or non-finite value")
         values[name] = base
     return cls(**values)
 
@@ -190,7 +219,6 @@ def load_settings(
         "paths": PathSettings,
         "load": LoadSettings,
         "quality": QualitySettings,
-        "publish": PublishSettings,
         "schedule": ScheduleSettings,
         "capture": CaptureSettings,
     }
@@ -210,7 +238,7 @@ def load_settings(
 def _validate(settings: Settings) -> None:
     """Reject quality limits that would silently disable a gate or make no sense."""
     quality = settings.quality
-    for name in ("quarantine_max_ratio", "unresolved_reference_max_ratio"):
+    for name in ("quarantine_max_ratio",):
         value = getattr(quality, name)
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"[quality] {name} must be between 0 and 1, got {value}")
@@ -233,6 +261,41 @@ def _validate(settings: Settings) -> None:
         )
     if capture.workers < 1:
         raise ValueError(f"[capture] workers must be at least 1, got {capture.workers}")
+    for name in (
+        "max_requests",
+        "max_download_bytes",
+        "max_response_bytes",
+        "max_retained_bytes",
+        "max_temp_bytes",
+    ):
+        value = getattr(capture, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"[capture] {name} must be a positive integer")
+    if capture.max_response_bytes > 16 * 1024**2:
+        raise ValueError("[capture] max_response_bytes cannot exceed 16 MiB")
+    if (
+        isinstance(capture.max_duration_s, bool)
+        or not math.isfinite(capture.max_duration_s)
+        or capture.max_duration_s <= 0
+    ):
+        raise ValueError("[capture] max_duration_s must be positive and finite")
+    for name in ("requests_per_second", "connect_timeout_s", "read_timeout_s"):
+        value = getattr(settings.gamma, name)
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"[gamma] {name} must be positive and finite")
+    for name in ("max_retries",):
+        if getattr(settings.gamma, name) < 0:
+            raise ValueError(f"[gamma] {name} must be nonnegative")
+    for name in ("max_pages_per_run", "duckdb_threads"):
+        if getattr(settings.load, name) < 1:
+            raise ValueError(f"[load] {name} must be positive")
+    memory = re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:B|KB|KiB|MB|MiB|GB|GiB|TB|TiB)",
+        settings.load.duckdb_memory_limit,
+        re.IGNORECASE,
+    )
+    if memory is None or not math.isfinite(float(memory[1])) or float(memory[1]) <= 0:
+        raise ValueError("[load] duckdb_memory_limit must declare a positive finite byte size")
 
 
 def settings_as_dict(settings: Settings) -> dict[str, Any]:
