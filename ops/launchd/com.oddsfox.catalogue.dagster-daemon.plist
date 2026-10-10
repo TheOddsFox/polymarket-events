@@ -22,17 +22,17 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>DAGSTER_HOME</key>
-    <string>__PROJECT_ROOT__/.state/dagster_home</string>
+    <string>__OPERATOR_ROOT__/.state/dagster_home</string>
     <key>CATALOGUE_ROOT</key>
-    <string>__PROJECT_ROOT__</string>
+    <string>__OPERATOR_ROOT__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>__PROJECT_ROOT__/.state/logs/dagster-daemon.out.log</string>
+  <string>__OPERATOR_ROOT__/.state/logs/dagster-daemon.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__PROJECT_ROOT__/.state/logs/dagster-daemon.err.log</string>
+  <string>__OPERATOR_ROOT__/.state/logs/dagster-daemon.err.log</string>
 </dict>
 </plist>

@@ -4,6 +4,7 @@ and launchd templates."""
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import subprocess
 from datetime import timedelta
@@ -318,6 +319,27 @@ def test_make_recipes_quote_paths_that_contain_spaces() -> None:
     assert 'backup verify "data/backups/a b"' in backup.stdout
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_make_uses_default_data_root_or_explicit_operator_root(tmp_path, configured):
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"CATALOGUE_ROOT", "DAGSTER_HOME"}
+    }
+    expected = tmp_path / "configured operator" if configured else tmp_path / "data"
+    if configured:
+        env["CATALOGUE_ROOT"] = str(expected)
+    result = subprocess.run(
+        ["make", "-n", "-f", str(REPO / "Makefile"), "dagster-home"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert f'mkdir -p "{expected}/.state/dagster_home"' in result.stdout
+
+
 def test_launchd_templates_are_valid_plists() -> None:
     templates = sorted((REPO / "ops" / "launchd").glob("*.plist"))
     assert {t.name for t in templates} == {
@@ -326,7 +348,24 @@ def test_launchd_templates_are_valid_plists() -> None:
         "com.oddsfox.catalogue.dagster-daemon.plist",
     }
     for template in templates:
-        text = template.read_text(encoding="utf-8").replace("__PROJECT_ROOT__", "/tmp/root")
+        text = (
+            template.read_text(encoding="utf-8")
+            .replace("__PROJECT_ROOT__", "/tmp/project")
+            .replace("__OPERATOR_ROOT__", "/tmp/operator")
+        )
         plist = plistlib.loads(text.encode("utf-8"))
         assert plist["Label"].startswith("com.oddsfox.catalogue.")
         assert "__PROJECT_ROOT__" in template.read_text(encoding="utf-8")
+        assert plist["EnvironmentVariables"]["CATALOGUE_ROOT"] == "/tmp/operator"
+        for key in ("StandardOutPath", "StandardErrorPath"):
+            assert Path(plist[key]).is_relative_to("/tmp/operator/.state/logs")
+        if "dagster-daemon" in plist["Label"]:
+            assert plist["EnvironmentVariables"]["DAGSTER_HOME"] == (
+                "/tmp/operator/.state/dagster_home"
+            )
+            assert plist["ProgramArguments"][0] == "/tmp/project/.venv/bin/dagster-daemon"
+            assert plist["ProgramArguments"][-1] == "/tmp/project/ops/workspace.yaml"
+            assert plist["WorkingDirectory"] == "/tmp/project"
+        else:
+            assert plist["ProgramArguments"][2] == "/tmp/project"
+            assert plist["EnvironmentVariables"]["PATH"].startswith("/tmp/project/.venv/bin:")

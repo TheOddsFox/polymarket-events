@@ -1,5 +1,6 @@
 """Finite local storage limits, shared by operator entry points."""
 
+import os
 import stat
 from pathlib import Path
 
@@ -32,7 +33,11 @@ def directory_bytes(directory: Path) -> int:
 
 
 def _union_bytes(paths: tuple[Path, ...]) -> int:
-    roots = {path.absolute() for path in paths}
+    for path in paths:
+        for ancestor in (path, *path.parents):
+            if ancestor.is_symlink():
+                raise RequestBudgetExceeded("storage path contains a symlink")
+    roots = {Path(os.path.abspath(path)) for path in paths}
     roots = {p for p in roots if not any(p != q and p.is_relative_to(q) for q in roots)}
     return sum(directory_bytes(root) for root in roots)
 
@@ -40,6 +45,7 @@ def _union_bytes(paths: tuple[Path, ...]) -> int:
 def retained_bytes(settings: Settings) -> int:
     return _union_bytes(
         (
+            settings.root,
             settings.data_dir,
             settings.state_dir,
             settings.dlt_pipelines_dir,

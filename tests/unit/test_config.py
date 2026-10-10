@@ -35,6 +35,37 @@ def test_env_overrides_apply_with_correct_types(tmp_path: Path) -> None:
     assert settings.load.max_pages_per_run == 7
 
 
+def test_default_operator_root_is_cwd_data_and_reads_its_own_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "data" / "config" / "catalogue.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("[gamma]\nrequests_per_second=1.5\n")
+    settings = load_settings(env={})
+    assert settings.root == tmp_path / "data"
+    assert settings.gamma.requests_per_second == 1.5
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_explicit_root_environment_and_config_precedence_is_preserved(
+    tmp_path, monkeypatch, explicit
+):
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "selected-config.toml"
+    config.write_text("[gamma]\nrequests_per_second=1.5\ninclude_chat=true\n")
+    requested = tmp_path / "explicit" if explicit else tmp_path / "environment"
+    settings = load_settings(
+        root=requested if explicit else None,
+        env={
+            "CATALOGUE_ROOT": str(tmp_path / "environment"),
+            "CATALOGUE_CONFIG": str(config),
+            "CATALOGUE_GAMMA_REQUESTS_PER_SECOND": "2.5",
+        },
+    )
+    assert settings.root == requested
+    assert settings.gamma.requests_per_second == 2.5
+    assert settings.gamma.include_chat is True
+
+
 def test_workers_below_one_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="workers"):
         load_settings(root=tmp_path, env={"CATALOGUE_CAPTURE_WORKERS": "0"})

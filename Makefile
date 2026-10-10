@@ -4,7 +4,7 @@
 UV ?= uv
 RUN := $(UV) run --locked
 CATALOGUE := $(RUN) catalogue
-export CATALOGUE_ROOT ?= $(CURDIR)
+export CATALOGUE_ROOT ?= $(CURDIR)/data
 export DAGSTER_HOME ?= $(CATALOGUE_ROOT)/.state/dagster_home
 
 .PHONY: sync lint test test-dev dagster-home bootstrap refresh reconcile replay validate publish \

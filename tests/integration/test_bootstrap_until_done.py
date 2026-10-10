@@ -8,11 +8,14 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "bootstrap-until-done"
@@ -96,6 +99,52 @@ def test_fail_then_success_exits_zero_and_logs_both_attempts(tmp_path: Path) -> 
     assert len(ATTEMPT_LINE.findall(text)) == 2
     assert "attempt 1/20 exit=1" in text
     assert "attempt 2/20 exit=0" in text
+
+
+@pytest.mark.parametrize("selection", ["default", "operator", "logs_override"])
+def test_wrapper_logs_and_child_root_follow_operator_selection(tmp_path, selection):
+    checkout = tmp_path / "checkout with spaces"
+    scripts = checkout / "scripts"
+    scripts.mkdir(parents=True)
+    copied = scripts / SCRIPT.name
+    shutil.copyfile(SCRIPT, copied)
+    copied.chmod(0o755)
+    observed = tmp_path / "observed-root"
+    stub = tmp_path / "report-root.py"
+    stub.write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text(os.environ.get('CATALOGUE_ROOT', 'missing'))\n"
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("BOOTSTRAP_") and key != "CATALOGUE_ROOT"
+    }
+    root = checkout / "data" if selection == "default" else tmp_path / "operator with spaces"
+    logs = root / ".state" / "logs"
+    env.update(
+        BOOTSTRAP_COMMAND=shlex.join([sys.executable, str(stub), str(observed)]),
+        BOOTSTRAP_MAX_ATTEMPTS="1",
+        BOOTSTRAP_RETRY_SLEEP_S="0",
+    )
+    if selection != "default":
+        env["CATALOGUE_ROOT"] = str(root)
+    if selection == "logs_override":
+        logs = tmp_path / "explicit logs"
+        env["BOOTSTRAP_LOG_DIR"] = str(logs)
+    result = subprocess.run(
+        [str(copied)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert observed.read_text() == str(root)
+    [log] = logs.glob("bootstrap-*.log")
+    assert "attempt 1/1 exit=0" in log.read_text()
+    assert not (checkout / ".state").exists()
 
 
 def test_exit_3_stops_after_one_attempt_without_sleeping(tmp_path: Path) -> None:

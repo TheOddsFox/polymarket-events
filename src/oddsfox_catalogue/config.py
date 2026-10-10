@@ -206,7 +206,7 @@ def load_settings(
 ) -> Settings:
     """Load settings from the TOML file, then apply environment overrides."""
     environ = dict(os.environ if env is None else env)
-    project_root = Path(root or environ.get(PROJECT_ROOT_ENV) or Path.cwd()).resolve()
+    project_root = Path(root or environ.get(PROJECT_ROOT_ENV) or Path.cwd() / "data").resolve()
     config_path = Path(environ.get(CONFIG_FILE_ENV, project_root / "config" / "catalogue.toml"))
 
     raw: dict[str, Any] = {}

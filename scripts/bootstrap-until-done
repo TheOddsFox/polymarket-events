@@ -6,10 +6,12 @@
 # immediately too: the wrapper logs the signal, forwards it to the child, and exits
 # 128 plus the signal number so a kill is not retried. Anything other than 1 stops immediately.
 # Each attempt appends its output and one "attempt N/M exit=RC" line to a timestamped log under
-# .state/logs. BOOTSTRAP_LOG_DIR overrides that directory so tests can stay out of the
-# repository's .state. Relative paths resolve from the repository root.
+# <operator-root>/.state/logs. BOOTSTRAP_LOG_DIR overrides that directory.
+# Explicit relative paths resolve from the repository root.
 set -eu
 cd "$(dirname "$0")/.."
+CATALOGUE_ROOT=${CATALOGUE_ROOT:-"$PWD/data"}
+export CATALOGUE_ROOT
 
 RESUME_BATCH=${BOOTSTRAP_RESUME_BATCH:-}
 if [ -n "${BOOTSTRAP_COMMAND:-}" ]; then
@@ -30,7 +32,7 @@ else
 fi
 MAX_ATTEMPTS=${BOOTSTRAP_MAX_ATTEMPTS:-20}
 RETRY_SLEEP_S=${BOOTSTRAP_RETRY_SLEEP_S:-30}
-LOG_DIR=${BOOTSTRAP_LOG_DIR:-.state/logs}
+LOG_DIR=${BOOTSTRAP_LOG_DIR:-"$CATALOGUE_ROOT/.state/logs"}
 
 case "$MAX_ATTEMPTS" in
   [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;

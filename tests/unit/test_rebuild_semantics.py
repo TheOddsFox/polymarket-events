@@ -6,7 +6,13 @@ import duckdb
 import pytest
 
 from oddsfox_catalogue.config import Settings
-from oddsfox_catalogue.rebuild import VERIFIED_TABLES, fingerprint_table, scratch_settings
+from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
+from oddsfox_catalogue.rebuild import (
+    VERIFIED_TABLES,
+    _combined_limits,
+    fingerprint_table,
+    scratch_settings,
+)
 
 
 def test_fingerprint_preserves_duplicate_rows_schema_and_exact_decimal_values():
@@ -71,3 +77,69 @@ def test_scratch_rejects_symlink_ancestors(tmp_path):
     (tmp_path / "alias").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         scratch_settings(Settings(tmp_path / "source"), tmp_path / "alias/new")
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_combined_rebuild_limit_counts_complete_source_and_scratch_once(tmp_path, nested):
+    source = Settings(tmp_path / "source")
+    source = replace(source, capture=replace(source.capture, max_retained_bytes=9))
+    source.state_dir.mkdir(parents=True)
+    source.data_dir.mkdir()
+    (source.root / "operator-evidence").write_bytes(b"123")
+    (source.state_dir / "checkpoint").write_bytes(b"12")
+    (source.data_dir / "capture").write_bytes(b"1")
+    scratch = scratch_settings(
+        source, source.state_dir / "rebuild" / "attempt" if nested else tmp_path / "scratch"
+    )
+    scratch.root.mkdir(parents=True)
+    (scratch.root / "rebuilt-evidence").write_bytes(b"123")
+    _combined_limits(source, scratch)
+    limited = replace(source, capture=replace(source.capture, max_retained_bytes=8))
+    with pytest.raises(ValueError, match="combined retained"):
+        _combined_limits(limited, scratch)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_combined_rebuild_limit_keeps_external_configured_paths(tmp_path, relative):
+    source = Settings(tmp_path / "source")
+    source.root.mkdir()
+    (source.root / "operator-evidence").write_bytes(b"123")
+    data, state = tmp_path / "external-data", tmp_path / "external-state"
+    data.mkdir()
+    state.mkdir()
+    (data / "capture").write_bytes(b"12")
+    (state / "checkpoint").write_bytes(b"12")
+    warehouse = tmp_path / "external.duckdb"
+    warehouse.write_bytes(b"12345")
+    warehouse.with_name(warehouse.name + ".wal").write_bytes(b"1")
+    source = replace(
+        source,
+        paths=replace(
+            source.paths,
+            data_dir="../external-data" if relative else str(data),
+            state_dir="../external-state" if relative else str(state),
+            warehouse_file="../external.duckdb" if relative else str(warehouse),
+        ),
+        capture=replace(source.capture, max_retained_bytes=17),
+    )
+    scratch = scratch_settings(source, tmp_path / "scratch")
+    if relative:
+        scratch = replace(scratch, root=source.root / ".." / "scratch")
+    scratch.root.mkdir()
+    (scratch.root / "rebuilt").write_bytes(b"1234")
+    _combined_limits(source, scratch)
+    limited = replace(source, capture=replace(source.capture, max_retained_bytes=16))
+    with pytest.raises(ValueError, match="combined retained"):
+        _combined_limits(limited, scratch)
+
+
+def test_combined_rebuild_rejects_source_alias_before_parent_normalization(tmp_path):
+    source = Settings(tmp_path / "source")
+    source.root.mkdir()
+    target = tmp_path / "elsewhere" / "nested"
+    target.mkdir(parents=True)
+    (tmp_path / "alias").symlink_to(target, target_is_directory=True)
+    source = replace(source, paths=replace(source.paths, data_dir="../alias/../external"))
+    scratch = scratch_settings(source, tmp_path / "scratch")
+    with pytest.raises(RequestBudgetExceeded, match="symlink"):
+        _combined_limits(source, scratch)

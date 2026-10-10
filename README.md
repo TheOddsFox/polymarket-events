@@ -70,10 +70,19 @@ Lower-level commands: `uv run catalogue --help`.
 
 ## Manual operation
 
+CLI, Dagster and Make default to a dedicated `./data` operator root. Explicit
+`CATALOGUE_ROOT` or a programmatic root takes precedence. With the default layout,
+captures are under `./data/data/raw` and state under `./data/.state`. Use a fresh
+root for this contract; previous roots are never discovered or moved automatically.
+The optional configuration file is `<operator-root>/config/catalogue.toml`; use
+`CATALOGUE_CONFIG` to select the checkout's configuration template explicitly.
+
 Completion covers manually invoked catalogue commands. Scheduler definitions and templates are
 optional operator tools; none is activated by installation or verification. CLI and Dagster
 resolve the same packaged dbt resources, warehouse and resource limits. Generated targets,
 logs and dlt state stay under the operator root.
+Optional launchd templates require separate `__PROJECT_ROOT__` and `__OPERATOR_ROOT__`
+paths; editing these templates does not activate scheduling.
 
 ## Invocation limits
 
@@ -88,6 +97,13 @@ Every capture includes planning, retries and follow-up requests in these default
 | Retained root / temporary storage | 64 GiB / 8 GiB |
 | DuckDB memory | 2 GiB |
 
+Retained storage includes every file under the operator root and configured external
+data/state/warehouse paths, counting nested paths once. Symlinks and special files
+fail the storage check; the checkout and virtual environment belong outside this root.
+Pinned dlt may create a small temporary merge-SQL file in the OS temporary directory
+before moving it into counted state. It contains fixed-schema statements, not source
+rows or credentials; an interrupted load can leave that transient file behind.
+
 Override settings explicitly with `CATALOGUE_<SECTION>_<KEY>` or TOML. Never increase limits
 automatically to pass a run. Production requests use Gamma HTTPS, with no redirects, ambient
 credentials or proxies. Streamed error bodies and partial downloads count toward the allowance.
@@ -95,7 +111,7 @@ Loopback source fixtures require explicit `CATALOGUE_GAMMA_ALLOW_LOOPBACK=1`.
 
 ## Quality limits
 
-Each limit is a `[quality]` setting in `config/catalogue.toml`, overridable with
+Each limit is a `[quality]` setting in the operator's `config/catalogue.toml`, overridable with
 `CATALOGUE_QUALITY_<KEY>`. Values are validated when settings load: ratios must lie in [0, 1],
 percentages in [0, 100], and the warn limit may not exceed the error limit.
 

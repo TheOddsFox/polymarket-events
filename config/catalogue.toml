@@ -3,7 +3,7 @@
 # Every key can be overridden with an environment variable named
 # CATALOGUE_<SECTION>_<KEY> (upper case), for example
 # CATALOGUE_GAMMA_REQUESTS_PER_SECOND=1.5.
-# Paths are relative to the project root unless absolute.
+# Paths are relative to the operator root unless absolute.
 
 [gamma]
 base_url = "https://gamma-api.polymarket.com"

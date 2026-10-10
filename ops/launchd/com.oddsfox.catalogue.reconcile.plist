@@ -17,6 +17,8 @@
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>CATALOGUE_ROOT</key>
+    <string>__OPERATOR_ROOT__</string>
     <key>PATH</key>
     <string>__PROJECT_ROOT__/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
@@ -27,8 +29,8 @@
     <key>Weekday</key><integer>0</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>__PROJECT_ROOT__/.state/logs/reconcile.out.log</string>
+  <string>__OPERATOR_ROOT__/.state/logs/reconcile.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__PROJECT_ROOT__/.state/logs/reconcile.err.log</string>
+  <string>__OPERATOR_ROOT__/.state/logs/reconcile.err.log</string>
 </dict>
 </plist>

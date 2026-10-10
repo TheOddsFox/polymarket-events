@@ -92,6 +92,7 @@ def scratch_settings(settings: Settings, scratch: Path) -> Settings:
 
 def _combined_limits(settings: Settings, rebuilt: Settings):
     paths = (
+        settings.root,
         settings.data_dir,
         settings.state_dir,
         settings.warehouse_path,
