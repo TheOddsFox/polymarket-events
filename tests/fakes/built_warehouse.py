@@ -5,7 +5,6 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from fakes.dbt_run import run_dbt
 from fakes.fake_gamma import FakeGamma
 from fakes.harness import FIXED_NOW, build_runtime, make_settings
 from fakes.world import demo_world
@@ -13,6 +12,7 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
+from oddsfox_catalogue.pipeline import dbt_stage
 
 
 def capture_and_load(root: Path, world=None) -> Settings:
@@ -32,7 +32,7 @@ def capture_and_load(root: Path, world=None) -> Settings:
 
 def build_warehouse(root: Path) -> Settings:
     settings = capture_and_load(root)
-    result = run_dbt(["build"], settings.warehouse_path, root)
+    result = dbt_stage(settings, ["build"])
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     return settings
 

@@ -6,7 +6,9 @@ from typing import Any
 
 import pytest
 
-from oddsfox_catalogue.capture.runner import _held_closed_windows, _unsafe_to_resume
+from oddsfox_catalogue.capture.runner import _held_closed_windows, _scope
+from oddsfox_catalogue.config import CaptureSettings, GammaSettings
+from oddsfox_catalogue.gamma.scans import sealed_plan
 
 OPEN = "markets_keyset_open"
 CLOSED = "markets_closed_ids_0001"
@@ -53,47 +55,25 @@ def test_a_batch_with_no_open_crawl_holds_its_closed_windows() -> None:
     assert _held_closed_windows([_row(CLOSED, plan_order=1)]) == {f"{CLOSED}#1"}
 
 
-def test_the_open_crawl_first_in_plan_order_is_safe_to_resume() -> None:
-    scans = [_row(OPEN, plan_order=1), _row(EVENTS, plan_order=2), _row(CLOSED, plan_order=3)]
-    assert not _unsafe_to_resume(scans)
+def test_legacy_unsealed_scope_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unsupported capture scope"):
+        _scope({"scope_json": "{}"})
 
 
-def test_closed_windows_planned_before_the_open_crawl_are_unsafe_to_resume() -> None:
-    scans = [_row(EVENTS, plan_order=1), _row(CLOSED, plan_order=2), _row(OPEN, plan_order=3)]
-    assert _unsafe_to_resume(scans)
+def test_current_catalogue_scale_produces_a_small_finite_plan() -> None:
+    specs = sealed_plan(
+        "bootstrap", GammaSettings(), CaptureSettings(), {"events": 200_000, "markets": 5_234_660}
+    )
+    assert len(specs) == 110
+    assert not any(spec.param_dict.get("tail") for spec in specs)
+    assert specs[-1].param_dict["hi"] == 5_234_660
 
 
-def test_a_batch_without_an_open_crawl_or_any_scans_is_unsafe() -> None:
-    assert _unsafe_to_resume([_row(EVENTS, plan_order=1)])
-    assert _unsafe_to_resume([])
-
-
-@pytest.mark.parametrize(
-    "name",
-    ["events_keyset_all", "events_archived_offset", "markets_keyset_closed", "events_keyset_open"],
-)
-def test_a_deep_keyset_or_offset_scan_name_is_unsafe_even_with_the_open_crawl_first(
-    name: str,
-) -> None:
-    scans = [_row(OPEN, plan_order=1), _row(name, plan_order=2)]
-    assert _unsafe_to_resume(scans)
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "events_ids_0001",
-        "events_ids_tail",
-        "markets_closed_ids_0001",
-        "markets_closed_ids_tail",
-        "events_by_id_0001",
-        "events_by_id_single_0001",
-        # Past 9999 windows the index has five digits. The name must still count as id-range.
-        "events_ids_10000",
-        "markets_closed_ids_10000",
-        "events_by_id_10000",
-    ],
-)
-def test_every_scan_name_the_id_range_plan_produces_is_safe(name: str) -> None:
-    scans = [_row(OPEN, plan_order=1), _row(name, plan_order=2)]
-    assert not _unsafe_to_resume(scans)
+def test_huge_high_water_with_tiny_partition_fails_before_materializing_plan() -> None:
+    with pytest.raises(ValueError, match="excessive finite scan plan"):
+        sealed_plan(
+            "bootstrap",
+            GammaSettings(),
+            CaptureSettings(id_partition_size=1),
+            {"events": 1, "markets": 10**19},
+        )

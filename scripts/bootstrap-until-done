@@ -1,5 +1,5 @@
 #!/bin/sh
-# Re-run bootstrap only when the command crashes (exit 1). Gamma retries exhausted raise out of
+# Repeat only an explicitly named bootstrap acquisition when the command crashes (exit 1). Gamma retries exhausted raise out of
 # the CLI, so the process exits 1 and the capturing batch can be resumed. Exit 0 is success.
 # Exit 2 is a handled failure after capture (dbt or publish); retrying would open a new full
 # crawl. Exit 3 is the run lock or a blocked stage. SIGHUP, SIGTERM, and SIGINT stop
@@ -11,7 +11,23 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-COMMAND=${BOOTSTRAP_COMMAND:-"uv run --locked catalogue refresh --mode bootstrap"}
+RESUME_BATCH=${BOOTSTRAP_RESUME_BATCH:-}
+if [ -n "${BOOTSTRAP_COMMAND:-}" ]; then
+  COMMAND=$BOOTSTRAP_COMMAND
+  MAY_RETRY=1
+elif [ -n "$RESUME_BATCH" ]; then
+  case "$RESUME_BATCH" in
+    *[!a-zA-Z0-9-]*|*-daily*|*-selected*|*-reconcile*)
+      echo "BOOTSTRAP_RESUME_BATCH must name a bootstrap acquisition" >&2
+      exit 2
+      ;;
+  esac
+  COMMAND="uv run --locked catalogue refresh --mode bootstrap --resume $RESUME_BATCH"
+  MAY_RETRY=1
+else
+  COMMAND="uv run --locked catalogue refresh --mode bootstrap"
+  MAY_RETRY=0
+fi
 MAX_ATTEMPTS=${BOOTSTRAP_MAX_ATTEMPTS:-20}
 RETRY_SLEEP_S=${BOOTSTRAP_RETRY_SLEEP_S:-30}
 LOG_DIR=${BOOTSTRAP_LOG_DIR:-.state/logs}
@@ -77,6 +93,10 @@ while :; do
   # Only an uncaught crash is worth another capture. Exit 2 would recrawl Gamma after dbt
   # or publish already failed. Exit 3 is the lock or a blocked stage.
   if [ "$rc" -ne 1 ]; then
+    exit "$rc"
+  fi
+  if [ "$MAY_RETRY" -eq 0 ]; then
+    echo "Capture interrupted. Read the reported batch ID, then set BOOTSTRAP_RESUME_BATCH for explicit resume." >&2
     exit "$rc"
   fi
   if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then

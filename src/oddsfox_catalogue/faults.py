@@ -16,6 +16,8 @@ CRASH_EXIT_CODE = 87
 KNOWN_POINTS = frozenset(
     {
         "after_page_rename",
+        "after_control_ledger_commit",
+        "after_control_marker_commit",
         "after_ledger_commit",
         "mid_dlt_load",
         "before_registry",

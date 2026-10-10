@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 import dlt
+from dlt.extract import materialize_schema_item
 from dlt.sources import DltResource
 
 from oddsfox_catalogue.config import LoadSettings
+from oddsfox_catalogue.load.runtime import confined_runtime
 
 PIPELINE_NAME = "polymarket_catalogue"
 SCHEMA_CONTRACT = {"tables": "evolve", "columns": "freeze", "data_type": "freeze"}
@@ -49,6 +51,7 @@ ENVELOPE_COLUMNS: dict[str, dict[str, Any]] = {
     "endpoint": _TEXT_REQUIRED,
     "payload_hash": _TEXT_REQUIRED,
     "payload": _JSON_REQUIRED,
+    "normalized": _JSON_REQUIRED,
 }
 
 MARKET_EXTRA_COLUMNS: dict[str, dict[str, Any]] = {
@@ -106,13 +109,14 @@ def _resource(
     columns: dict[str, dict[str, Any]],
     primary_key: str,
     contract: dict[str, str] | None = None,
+    materialize_only: bool = False,
 ) -> DltResource:
     return dlt.resource(
-        data,
+        [materialize_schema_item()] if materialize_only else data,
         name=name,
         columns=columns,
-        primary_key=primary_key,
-        write_disposition=INSERT_ONLY,
+        primary_key=None if materialize_only else primary_key,
+        write_disposition="append" if materialize_only else INSERT_ONLY,
         schema_contract=contract or SCHEMA_CONTRACT,
     )
 
@@ -157,24 +161,52 @@ def registry_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResou
     )
 
 
-def make_pipeline(warehouse: Path, pipelines_dir: Path, load: LoadSettings) -> dlt.Pipeline:
+def make_pipeline(
+    warehouse: Path,
+    pipelines_dir: Path,
+    load: LoadSettings,
+    *,
+    temp_directory: Path | None = None,
+    max_temp_bytes: int | None = None,
+) -> dlt.Pipeline:
     """The one dlt pipeline that owns bronze. State lives under ``pipelines_dir``."""
     warehouse.parent.mkdir(parents=True, exist_ok=True)
     pipelines_dir.mkdir(parents=True, exist_ok=True)
-    destination = dlt.destinations.duckdb(
+    with confined_runtime(pipelines_dir):
+        return dlt.pipeline(
+            pipeline_name=PIPELINE_NAME,
+            destination=make_destination(
+                warehouse, load, temp_directory=temp_directory, max_temp_bytes=max_temp_bytes
+            ),
+            dataset_name=load.dataset_name,
+            pipelines_dir=str(pipelines_dir),
+            enable_runtime_trace=False,
+        )
+
+
+def make_destination(
+    warehouse: Path,
+    load: LoadSettings,
+    *,
+    temp_directory: Path | None = None,
+    max_temp_bytes: int | None = None,
+):
+    """Fresh connection settings for the current remaining operator allowance."""
+    temporary_config = {}
+    if temp_directory is not None:
+        temp_directory.mkdir(parents=True, exist_ok=True)
+        temporary_config["temp_directory"] = str(temp_directory)
+    if max_temp_bytes is not None:
+        temporary_config["max_temp_directory_size"] = f"{max_temp_bytes}B"
+    return dlt.destinations.duckdb(
         credentials={
             "database": str(warehouse),
             "global_config": {
+                **temporary_config,
                 "memory_limit": load.duckdb_memory_limit,
                 "threads": load.duckdb_threads,
             },
         }
-    )
-    return dlt.pipeline(
-        pipeline_name=PIPELINE_NAME,
-        destination=destination,
-        dataset_name=load.dataset_name,
-        pipelines_dir=str(pipelines_dir),
     )
 
 

@@ -2,25 +2,39 @@
 
 from __future__ import annotations
 
-import gzip
-import json
 import os
 import re
 import shutil
 import tempfile
 import uuid
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.writer import atomic_write_bytes, write_marker, write_page
+from oddsfox_catalogue.capture.writer import (
+    atomic_write_bytes,
+    read_body,
+    read_regular_bytes,
+    write_marker,
+    write_page,
+)
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.gamma.http import GammaClient, GammaError
 from oddsfox_catalogue.ids import canonical_json, iso_utc, observation_id, sha256_bytes, utc_now
-from oddsfox_catalogue.load.rows import parse_timestamp
+from oddsfox_catalogue.normalization import (
+    NormalizationError as MetadataError,
+)
+from oddsfox_catalogue.normalization import (
+    Observation,
+    _read_json,
+    _timestamp,
+    memberships,
+    parse_timestamp,
+    project,
+    validate_market_ids,
+)
 
 CONTRACT = "oddsfox.polymarket.metadata.v1"
 RELATIONS = ("markets", "outcomes", "memberships", "identity_history", "coverage")
@@ -29,33 +43,6 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 ID_RE = re.compile(r"[1-9][0-9]{0,19}\Z")
 CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
-
-
-class MetadataError(ValueError):
-    """The requested handoff cannot be produced safely."""
-
-
-@dataclass(frozen=True)
-class Observation:
-    market: dict[str, Any]
-    provenance: dict[str, Any]
-    enclosing_event_id: str | None = None
-
-    @property
-    def rank(self) -> tuple[int, str, str]:
-        return (
-            int(self.provenance["source_kind"] == "market_direct"),
-            self.provenance["received_at"],
-            self.provenance["observation_id"],
-        )
-
-
-def validate_market_ids(values: list[str]) -> list[str]:
-    if not values or len(values) > MAX_MARKETS:
-        raise MetadataError(f"select between 1 and {MAX_MARKETS} explicit market IDs")
-    if any(not isinstance(value, str) or not ID_RE.fullmatch(value) for value in values):
-        raise MetadataError("market IDs must be positive canonical decimal integers")
-    return sorted(set(values), key=int)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -68,156 +55,7 @@ def _json_bytes(value: Any) -> bytes:
             return [exact(val) for val in item]
         return item
 
-    return (canonical_json(exact(value)) + "\n").encode()
-
-
-def _read_json(data: bytes) -> Any:
-    try:
-        return json.loads(data, parse_float=Decimal, parse_constant=lambda _: _invalid_json())
-    except (ValueError, UnicodeError) as exc:
-        raise MetadataError("invalid JSON evidence") from exc
-
-
-def _invalid_json() -> None:
-    raise MetadataError("non-finite JSON number")
-
-
-def _array(value: Any, name: str) -> list[Any] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        try:
-            value = _read_json(value.encode())
-        except (ValueError, UnicodeError) as exc:
-            raise MetadataError(f"{name} is not a JSON array") from exc
-    if not isinstance(value, list):
-        raise MetadataError(f"{name} is not an array")
-    return value
-
-
-def _asset_ids(value: Any, name: str, count: int) -> list[str] | None:
-    items = _array(value, name)
-    if items is None:
-        return None
-    if len(items) != count:
-        raise MetadataError(f"{name} does not align with outcomes")
-    result: list[str] = []
-    for item in items:
-        if isinstance(item, bool) or not isinstance(item, str | int):
-            raise MetadataError(f"{name} contains an invalid native ID")
-        text = str(item)
-        if not text.isascii() or not text.isdigit() or str(int(text)) != text:
-            raise MetadataError(f"{name} contains a noncanonical native ID")
-        if not 0 < int(text) < 2**256:
-            raise MetadataError(f"{name} contains an out-of-range native ID")
-        result.append(text)
-    if len(set(result)) != len(result):
-        raise MetadataError(f"{name} contains duplicate native IDs")
-    return result
-
-
-def _decimal(value: Any) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        parsed = Decimal(str(value))
-    except InvalidOperation:
-        return None
-    return str(parsed) if parsed.is_finite() and parsed > 0 else None
-
-
-def _boolean(value: Any) -> bool | None:
-    return value if isinstance(value, bool) else None
-
-
-def _timestamp(value: Any) -> str | None:
-    parsed = parse_timestamp(value)
-    return iso_utc(parsed) if parsed else None
-
-
-def project(observation: Observation) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Validate identities without prices. An unusable row never nominates an asset."""
-    raw, provenance = observation.market, observation.provenance
-    market_id = str(raw["id"])
-    source_version = raw.get("version")
-    version = str(source_version).lower() if source_version is not None else None
-    condition = raw.get("conditionId")
-    condition = (
-        condition.lower()
-        if isinstance(condition, str) and CONDITION_RE.fullmatch(condition)
-        else None
-    )
-    market = {
-        "venue": "polymarket",
-        "market_id": market_id,
-        "condition_id": condition,
-        "question": raw.get("question") if isinstance(raw.get("question"), str) else None,
-        "slug": raw.get("slug") if isinstance(raw.get("slug"), str) else None,
-        "description": raw.get("description") if isinstance(raw.get("description"), str) else None,
-        "source_market_version": source_version,
-        "protocol": None,
-        "active": _boolean(raw.get("active")),
-        "closed": _boolean(raw.get("closed")),
-        "archived": _boolean(raw.get("archived")),
-        "resolved": _boolean(raw.get("resolved")),
-        "enable_order_book": _boolean(raw.get("enableOrderBook")),
-        "accepting_orders": _boolean(raw.get("acceptingOrders")),
-        "neg_risk": _boolean(raw.get("negRisk")),
-        "tick_size": _decimal(raw.get("orderPriceMinTickSize")),
-        "minimum_order_size": _decimal(raw.get("orderMinSize")),
-        "created_at": _timestamp(raw.get("createdAt")),
-        "start_at": _timestamp(raw.get("startDate")),
-        "end_at": _timestamp(raw.get("endDate")),
-        "close_at": _timestamp(raw.get("closedTime")),
-        "resolved_at": _timestamp(raw.get("resolvedAt")),
-        "source_updated_at": _timestamp(raw.get("updatedAt")),
-        "usable": False,
-        "identity_error": None,
-        **provenance,
-    }
-    try:
-        labels = _array(raw.get("outcomes"), "outcomes")
-        if not labels or any(not isinstance(item, str) or not item for item in labels):
-            raise MetadataError("outcomes must contain nonempty labels")
-        tokens = _asset_ids(raw.get("clobTokenIds"), "clobTokenIds", len(labels))
-        positions = _asset_ids(raw.get("positionIds"), "positionIds", len(labels))
-        if version in {"v2", "2"}:
-            if not positions:
-                raise MetadataError("v2 market lacks positionIds")
-            kind, asset_ids, protocol = "poly_v2_position", positions, "polymarket_v2"
-        elif version in {None, "v1", "1"}:
-            if positions:
-                raise MetadataError("positionIds require explicit v2 metadata")
-            if not tokens:
-                raise MetadataError("CTF market lacks clobTokenIds")
-            if condition is None:
-                raise MetadataError("CTF market lacks a valid conditionId")
-            kind, asset_ids, protocol = "ctf_token", tokens, "ctf"
-        else:
-            raise MetadataError("unsupported source market version")
-        market["usable"], market["protocol"] = True, protocol
-        outcomes = [
-            {
-                "venue": "polymarket",
-                "market_id": market_id,
-                "condition_id": condition,
-                "outcome_index": index + 1,
-                "outcome_label": label,
-                "asset_kind": kind,
-                "asset_id": asset_ids[index],
-                "clob_token_id": tokens[index] if tokens else None,
-                "position_id": positions[index] if positions else None,
-                "chain_index_set": None,
-                "usable": True,
-                "identity_error": None,
-                **provenance,
-            }
-            for index, label in enumerate(labels)
-        ]
-        return market, outcomes
-    except MetadataError as exc:
-        market["identity_error"] = str(exc)
-        return market, []
+    return (canonical_json(exact(value), max_bytes=MAX_OUTPUT_BYTES) + "\n").encode()
 
 
 def _records(payload: Any, key: str) -> list[Any]:
@@ -231,11 +69,18 @@ def _records(payload: Any, key: str) -> list[Any]:
     raise MetadataError("raw page has an unsupported envelope")
 
 
-def _verified_payload(path: Path) -> tuple[dict[str, Any], Any]:
+def _verified_payload(
+    path: Path, *, trusted_root: Path | None = None
+) -> tuple[dict[str, Any], Any]:
     """Read only regular local files with a literal sibling payload name."""
     if path.is_symlink() or not path.is_file():
         raise MetadataError("raw manifest is not a regular file")
-    manifest = _read_json(path.read_bytes())
+    try:
+        manifest = _read_json(
+            read_regular_bytes(path, max_bytes=1024**2, trusted_root=trusted_root)
+        )
+    except (OSError, ValueError) as exc:
+        raise MetadataError("invalid raw manifest file") from exc
     if not isinstance(manifest, dict) or manifest.get("manifest_version") != 1:
         raise MetadataError("unsupported raw manifest")
     if (
@@ -246,21 +91,15 @@ def _verified_payload(path: Path) -> tuple[dict[str, Any], Any]:
         or not isinstance(manifest.get("body_bytes"), int)
     ):
         raise MetadataError("invalid raw manifest fields")
-    name = manifest.get("file")
-    if not isinstance(name, str) or Path(name).name != name or not name.endswith(".json.gz"):
-        raise MetadataError("unsafe raw payload path")
-    payload_path = path.parent / name
-    if payload_path.is_symlink() or not payload_path.is_file():
-        raise MetadataError("raw payload is not a regular file")
-    compressed = payload_path.read_bytes()
-    if sha256_bytes(compressed) != manifest.get("gz_sha256"):
-        raise MetadataError("raw gzip checksum mismatch")
     try:
-        body = gzip.decompress(compressed)
-    except (OSError, EOFError) as exc:
-        raise MetadataError("invalid raw gzip") from exc
-    if len(body) != manifest.get("body_bytes") or sha256_bytes(body) != manifest.get("body_sha256"):
-        raise MetadataError("raw body checksum mismatch")
+        body = read_body(
+            path.parent,
+            manifest,
+            trusted_root=trusted_root or path.parent,
+            max_body_bytes=MAX_BODY_BYTES,
+        )
+    except (OSError, ValueError, EOFError) as exc:
+        raise MetadataError(str(exc)) from exc
     return manifest, _read_json(body) if manifest["http_status"] == 200 else None
 
 
@@ -303,35 +142,6 @@ def _observations(
     return found
 
 
-def _memberships(selected: Observation, observations: list[Observation]) -> list[dict[str, Any]]:
-    refs = selected.market.get("events")
-    # Explicit empty membership wins. Missing membership can use an enclosing event observation.
-    if isinstance(refs, list):
-        ids = {
-            str(ref["id"])
-            for ref in refs
-            if isinstance(ref, dict) and ID_RE.fullmatch(str(ref.get("id", "")))
-        }
-        evidence = {event_id: selected.provenance for event_id in ids}
-    elif "events" in selected.market:
-        evidence = {}
-    else:
-        evidence = {
-            obs.enclosing_event_id: obs.provenance
-            for obs in sorted(observations, key=lambda obs: obs.rank)
-            if obs.enclosing_event_id and ID_RE.fullmatch(obs.enclosing_event_id)
-        }
-    return [
-        {
-            "venue": "polymarket",
-            "market_id": str(selected.market["id"]),
-            "event_id": event_id,
-            **provenance,
-        }
-        for event_id, provenance in sorted(evidence.items())
-    ]
-
-
 def _relations(
     market_ids: list[str], observations: list[Observation], coverage: list[dict[str, Any]]
 ) -> dict[str, list[dict[str, Any]]]:
@@ -364,7 +174,7 @@ def _relations(
         market, outcomes = project(selected)
         relations["markets"].append(market)
         relations["outcomes"].extend(outcomes)
-        relations["memberships"].extend(_memberships(selected, candidates))
+        relations["memberships"].extend(memberships(selected, candidates))
     # A native identity may never nominate conflicting markets/conditions in one bundle.
     owners: dict[tuple[str, str], set[tuple[str, str | None]]] = {}
     for row in relations["outcomes"]:
@@ -372,11 +182,14 @@ def _relations(
             (row["market_id"], row["condition_id"])
         )
     ambiguous = {key for key, values in owners.items() if len(values) != 1}
-    conflicted_markets = set()
-    for row in relations["outcomes"]:
-        if (row["asset_kind"], row["asset_id"]) in ambiguous:
-            row["usable"], row["identity_error"] = False, "native identity has conflicting owners"
-            conflicted_markets.add(row["market_id"])
+    conflicted_markets = {
+        row["market_id"]
+        for row in relations["outcomes"]
+        if (row["asset_kind"], row["asset_id"]) in ambiguous
+    }
+    relations["outcomes"] = [
+        row for row in relations["outcomes"] if row["market_id"] not in conflicted_markets
+    ]
     for market in relations["markets"]:
         if market["market_id"] in conflicted_markets:
             market["usable"], market["identity_error"] = (
@@ -385,7 +198,11 @@ def _relations(
             )
     relations["coverage"] = coverage
     relations["identity_history"].sort(
-        key=lambda row: (int(row["market_id"]), row["received_at"], row["observation_id"])
+        key=lambda row: (
+            int(row["market_id"]),
+            parse_timestamp(row["received_at"]),
+            row["observation_id"],
+        )
     )
     return relations
 
@@ -445,12 +262,19 @@ def export_metadata(
     market_ids = validate_market_ids(market_ids)
     requested = set(market_ids)
     observations: list[Observation] = []
-    coverage_evidence: dict[str, tuple[int, str, str, str, str | None]] = {}
+    coverage_evidence: dict[str, tuple[int, Any, str, str, str | None]] = {}
     request_markers: dict[Path, dict[str, Any]] = {}
     for path in sorted((settings.data_dir / "metadata" / "raw").glob("**/_request.json")):
         if path.is_symlink() or not path.is_file():
             raise MetadataError("request marker is not a regular file")
-        record = _read_json(path.read_bytes())
+        try:
+            record = _read_json(
+                read_regular_bytes(
+                    path, max_bytes=1024**2, trusted_root=settings.data_dir / "metadata" / "raw"
+                )
+            )
+        except (OSError, ValueError) as exc:
+            raise MetadataError("invalid request marker file") from exc
         if not isinstance(record, dict) or record.get("status") not in {
             "found",
             "absent",
@@ -462,7 +286,7 @@ def export_metadata(
         if market_id in requested:
             evidence = (
                 1,
-                record["received_at"],
+                parse_timestamp(record["received_at"]),
                 record["capture_id"],
                 record["status"],
                 record.get("error"),
@@ -476,7 +300,7 @@ def export_metadata(
                 record = request_markers.get(path.parent)
                 if record is None or record["status"] == "failed":
                     continue
-            manifest, payload = _verified_payload(path)
+            manifest, payload = _verified_payload(path, trusted_root=directory)
             record_key = manifest.get("record_key")
             if record_key is None:
                 record_key = (
@@ -520,7 +344,11 @@ def _validate_endpoint(settings: Settings) -> None:
     production = (
         url.scheme == "https" and url.hostname == "gamma-api.polymarket.com" and port in {None, 443}
     )
-    local_test = url.scheme == "http" and url.hostname in {"127.0.0.1", "localhost", "::1"}
+    local_test = (
+        settings.gamma.allow_loopback
+        and url.scheme == "http"
+        and url.hostname in {"127.0.0.1", "localhost", "::1"}
+    )
     if (
         not (production or local_test)
         or url.username

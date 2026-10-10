@@ -17,6 +17,21 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS build_validity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    status TEXT NOT NULL CHECK (status IN ('dirty', 'valid')),
+    updated_at TEXT NOT NULL,
+    reason TEXT,
+    payload_json TEXT,
+    payload_sha256 TEXT
+);
+CREATE TABLE IF NOT EXISTS capture_controls (
+    control_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    previous_sha256 TEXT
+);
 CREATE TABLE IF NOT EXISTS batches (
     batch_id          TEXT PRIMARY KEY,
     mode              TEXT NOT NULL,
@@ -26,7 +41,8 @@ CREATE TABLE IF NOT EXISTS batches (
     started_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     git_sha           TEXT,
-    error             TEXT
+    error             TEXT,
+    scope_json        TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS scans (
@@ -50,6 +66,7 @@ CREATE TABLE IF NOT EXISTS scans (
     started_at       TEXT NOT NULL,
     finished_at      TEXT,
     error            TEXT,
+    phase            INTEGER NOT NULL DEFAULT 0,
     UNIQUE (batch_id, scan_name, attempt)
 );
 
@@ -163,6 +180,27 @@ class Ledger:
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
 
+    def build_validity(self) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM build_validity WHERE singleton = 1")
+
+    def set_build_validity(
+        self,
+        status: str,
+        updated_at: str,
+        *,
+        reason: str | None = None,
+        payload_json: str | None = None,
+        payload_sha256: str | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO build_validity VALUES (1, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET status=excluded.status, "
+                "updated_at=excluded.updated_at, reason=excluded.reason, "
+                "payload_json=excluded.payload_json, payload_sha256=excluded.payload_sha256",
+                (status, updated_at, reason, payload_json, payload_sha256),
+            )
+
     # Batches ---------------------------------------------------------------------
     def create_batch(
         self,
@@ -172,15 +210,29 @@ class Ledger:
         started_at: str,
         git_sha: str | None,
         scans: list[dict[str, Any]],
+        *,
+        scope: dict[str, Any] | None = None,
+        plan_stage: int = 0,
+        control: dict[str, Any] | None = None,
     ) -> None:
         """Create a batch and its initial scan plan in one transaction."""
         with self.transaction() as conn:
             conn.execute(
                 "INSERT INTO batches (batch_id, mode, observation_date, status, plan_stage, "
-                "started_at, updated_at, git_sha) VALUES (?, ?, ?, 'capturing', 0, ?, ?, ?)",
-                (batch_id, mode, observation_date, started_at, started_at, git_sha),
+                "started_at, updated_at, git_sha, scope_json) VALUES (?, ?, ?, 'capturing', ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    mode,
+                    observation_date,
+                    plan_stage,
+                    started_at,
+                    started_at,
+                    git_sha,
+                    json.dumps(scope or {}, sort_keys=True, separators=(",", ":")),
+                ),
             )
             _insert_scans(conn, scans)
+            _insert_control(conn, control)
 
     def add_plan(
         self,
@@ -188,14 +240,39 @@ class Ledger:
         stage: int,
         scans: list[dict[str, Any]],
         updated_at: str,
+        *,
+        scope: dict[str, Any] | None = None,
+        control: dict[str, Any] | None = None,
     ) -> None:
         """Append follow-up scans and advance the plan stage atomically."""
         with self.transaction() as conn:
             _insert_scans(conn, scans)
+            if scope is not None:
+                conn.execute(
+                    "UPDATE batches SET scope_json = ? WHERE batch_id = ?",
+                    (json.dumps(scope, sort_keys=True, separators=(",", ":")), batch_id),
+                )
             conn.execute(
                 "UPDATE batches SET plan_stage = ?, updated_at = ? WHERE batch_id = ?",
                 (stage, updated_at, batch_id),
             )
+            _insert_control(conn, control)
+
+    def update_scope(
+        self,
+        batch_id: str,
+        scope: dict[str, Any],
+        updated_at: str,
+        *,
+        control: dict[str, Any] | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE batches SET scope_json = ?, updated_at = ? WHERE batch_id = ?",
+                (json.dumps(scope, sort_keys=True, separators=(",", ":")), updated_at, batch_id),
+            )
+
+            _insert_control(conn, control)
 
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         return self._one("SELECT * FROM batches WHERE batch_id = ?", (batch_id,))
@@ -213,12 +290,27 @@ class Ledger:
         )
 
     def set_batch_status(
-        self, batch_id: str, status: str, updated_at: str, error: str | None = None
+        self,
+        batch_id: str,
+        status: str,
+        updated_at: str,
+        error: str | None = None,
+        *,
+        control: dict[str, Any] | None = None,
     ) -> None:
         with self.transaction() as conn:
             conn.execute(
                 "UPDATE batches SET status = ?, updated_at = ?, error = ? WHERE batch_id = ?",
                 (status, updated_at, error, batch_id),
+            )
+
+            _insert_control(conn, control)
+
+    def record_batch_error(self, batch_id: str, updated_at: str, error: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE batches SET error = ?, updated_at = ? WHERE batch_id = ?",
+                (error, updated_at, batch_id),
             )
 
     def restore_batch_state(
@@ -231,16 +323,19 @@ class Ledger:
                 (status, plan_stage, updated_at, batch_id),
             )
 
-    def add_scan_attempt(self, scan: dict[str, Any]) -> None:
+    def add_scan_attempt(
+        self, scan: dict[str, Any], *, control: dict[str, Any] | None = None
+    ) -> None:
         with self.transaction() as conn:
             _insert_scans(conn, [scan])
+            _insert_control(conn, control)
 
     def set_scan_running(self, scan_id: str, started_at: str) -> None:
         """Re-open a failed scan for resume. The fetched checkpoint is left untouched."""
         with self.transaction() as conn:
             conn.execute(
-                "UPDATE scans SET status = 'running', error = NULL, started_at = ? WHERE scan_id = ?",
-                (started_at, scan_id),
+                "UPDATE scans SET status = 'running', error = NULL WHERE scan_id = ?",
+                (scan_id,),
             )
 
     def get_scan(self, scan_id: str) -> dict[str, Any] | None:
@@ -270,12 +365,28 @@ class Ledger:
         status: str,
         finished_at: str | None,
         error: str | None = None,
+        *,
+        control: dict[str, Any] | None = None,
     ) -> None:
         with self.transaction() as conn:
             conn.execute(
                 "UPDATE scans SET status = ?, finished_at = ?, error = ? WHERE scan_id = ?",
                 (status, finished_at, error, scan_id),
             )
+            _insert_control(conn, control)
+
+    def put_control(self, control: dict[str, Any]) -> None:
+        with self.transaction() as conn:
+            _insert_control(conn, control)
+
+    def pending_controls(self, batch_id: str) -> list[dict[str, Any]]:
+        return self._all(
+            "SELECT * FROM capture_controls WHERE batch_id = ? ORDER BY control_id", (batch_id,)
+        )
+
+    def clear_control(self, control_id: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM capture_controls WHERE control_id = ?", (control_id,))
 
     # Pages -----------------------------------------------------------------------
     def record_page(self, page: Mapping[str, Any], scan_id: str, finished_terminal: bool) -> None:
@@ -430,8 +541,16 @@ def _insert_scans(conn: sqlite3.Connection, scans: list[dict[str, Any]]) -> None
     for scan in scans:
         conn.execute(
             "INSERT INTO scans (scan_id, batch_id, scan_name, attempt, plan_order, kind, "
-            "endpoint, record_key, params_json, input_ids_json, status, started_at) "
+            "endpoint, record_key, params_json, input_ids_json, status, started_at, phase) "
             "VALUES (:scan_id, :batch_id, :scan_name, :attempt, :plan_order, :kind, "
-            ":endpoint, :record_key, :params_json, :input_ids_json, 'running', :started_at)",
-            scan,
+            ":endpoint, :record_key, :params_json, :input_ids_json, 'running', :started_at, :phase)",
+            {**scan, "phase": scan.get("phase", 0)},
+        )
+
+
+def _insert_control(conn: sqlite3.Connection, control: dict[str, Any] | None) -> None:
+    if control is not None:
+        conn.execute(
+            "INSERT INTO capture_controls (control_id,batch_id,payload_json,payload_sha256,previous_sha256) VALUES (:control_id,:batch_id,:payload_json,:payload_sha256,:previous_sha256)",
+            control,
         )

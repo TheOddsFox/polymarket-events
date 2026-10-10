@@ -239,3 +239,9 @@ encryption.key
 pad.db
 .pad/*
 !.pad/universal.lock.json
+
+# Installed dbt sources never contain generated files.
+src/oddsfox_catalogue/dbt/target/
+src/oddsfox_catalogue/dbt/logs/
+src/oddsfox_catalogue/dbt/dbt_packages/
+src/oddsfox_catalogue/dbt/.user.yml

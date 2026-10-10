@@ -14,6 +14,7 @@ from oddsfox_catalogue.metadata import Observation, export_metadata, project
 def market(**changes):
     return {
         "id": "123",
+        "version": "v1",
         "conditionId": "0x" + "a" * 64,
         "outcomes": ["A", "B"],
         "clobTokenIds": ["11", "12"],

@@ -9,55 +9,35 @@ load or dbt build runs.
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
 
-logger = logging.getLogger(__name__)
+from oddsfox_catalogue.config import Settings
+from oddsfox_catalogue.semantics import bounded_connection
 
 
 class BaselineMissing(RuntimeError):
     """The warehouse has no open-event baseline yet. Run bootstrap first."""
 
 
-def last_two_open_event_counts(
-    warehouse: Path, warn: Callable[..., object] | None = None
-) -> tuple[int, int] | None:
-    """``(previous, latest)`` open-event counts from ``marts.catalogue_snapshots``.
-
-    Returns None when the warehouse, the snapshot table, or two snapshots do not exist yet.
-    Any other failure (the file is held by another connection, is not a DuckDB file, or the
-    snapshot table has a different shape) also returns None, after reporting a warning
-    through ``warn`` (default: this module's logger). The warn-band check is advisory; the
-    ``assert_open_events_not_dropping`` test still enforces the error limit inside the dbt
-    build. The ordering matches that test.
-    """
-    if not warehouse.exists():
-        return None
-    report = warn or logger.warning
-    try:
-        connection = duckdb.connect(str(warehouse), read_only=True)
-    except duckdb.Error as exc:
-        report("open-event drop check skipped: cannot open %s: %s", warehouse, exc)
-        return None
-    try:
-        rows = connection.execute(
-            "SELECT open_events FROM marts.catalogue_snapshots ORDER BY captured_at DESC LIMIT 2"
-        ).fetchall()
-    except duckdb.CatalogException:
-        # The first build has not created the snapshot table yet.
-        return None
-    except duckdb.Error as exc:
-        report("open-event drop check skipped: snapshot query failed: %s", exc)
-        return None
-    finally:
-        connection.close()
-    if len(rows) < 2:
-        return None
-    latest, previous = int(rows[0][0]), int(rows[1][0])
-    return previous, latest
+@contextmanager
+def _connection(warehouse: Path, settings: Settings | None = None):
+    if settings is not None:
+        with bounded_connection(settings, warehouse) as connection:
+            yield connection
+    else:
+        with duckdb.connect(
+            str(warehouse),
+            read_only=True,
+            config={
+                "memory_limit": "2GB",
+                "threads": 1,
+                "max_temp_directory_size": "0B",
+            },
+        ) as connection:
+            yield connection
 
 
 def read_open_event_ids(warehouse: Path) -> set[str]:
@@ -73,3 +53,29 @@ def read_open_event_ids(warehouse: Path) -> set[str]:
     finally:
         connection.close()
     return {str(row[0]) for row in rows}
+
+
+def _read_refresh_ids(warehouse: Path, entity: str, settings: Settings | None = None) -> set[str]:
+    if not warehouse.exists():
+        raise BaselineMissing("daily refresh requires a built warehouse baseline")
+    try:
+        with _connection(warehouse, settings) as connection:
+            return {
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT {entity}_id FROM core.{entity}s_current WHERE venue = 'polymarket' AND closed IS NOT TRUE AND archived IS NOT TRUE"
+                ).fetchall()
+            }
+    except duckdb.Error as exc:
+        raise BaselineMissing(
+            "daily refresh requires complete event and market baseline relations"
+        ) from exc
+
+
+def read_refresh_event_ids(warehouse: Path, *, settings: Settings | None = None) -> set[str]:
+    """Records whose lifecycle remains open or unknown need direct reobservation."""
+    return _read_refresh_ids(warehouse, "event", settings)
+
+
+def read_refresh_market_ids(warehouse: Path, *, settings: Settings | None = None) -> set[str]:
+    return _read_refresh_ids(warehouse, "market", settings)

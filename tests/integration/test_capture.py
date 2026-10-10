@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from fakes.fake_gamma import FakeGamma, Rule
-from fakes.harness import FIXED_NOW, build_runtime, make_settings
+from fakes.harness import FIXED_NOW, build_runtime
 from fakes.world import demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.reader import iter_scan_pages
@@ -23,7 +23,6 @@ from oddsfox_catalogue.capture.runner import (
     rebuild_from_raw,
     run_capture,
 )
-from oddsfox_catalogue.capture.writer import read_body
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
 from oddsfox_catalogue.gamma.http import RetriesExhausted
 from oddsfox_catalogue.gamma.scans import list_scans_for
@@ -33,9 +32,7 @@ CHILD = TESTS_DIR / "fakes" / "capture_child.py"
 BOOTSTRAP_LIST_SCANS = [
     "markets_keyset_open",
     "events_ids_0001",
-    "events_ids_tail",
     "markets_closed_ids_0001",
-    "markets_closed_ids_tail",
 ]
 ONE_PER_PAGE = {"CATALOGUE_GAMMA_PAGE_LIMIT": "1"}
 
@@ -124,7 +121,9 @@ def test_resume_logs_the_saved_page(tmp_path: Path, caplog: pytest.LogCaptureFix
         fake.rules.clear()
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="oddsfox_catalogue.capture.runner"):
-            summary = run_capture(runtime, "daily")
+            summary = run_capture(
+                runtime, "daily", resume=runtime.ledger.list_batches()[0]["batch_id"]
+            )
         assert summary.resumed is True
     finally:
         runtime.ledger.close()
@@ -178,7 +177,7 @@ def test_bootstrap_captures_list_scans_and_resolves_references(tmp_path: Path) -
         runtime.ledger.close()
 
 
-def test_id_range_records_empty_windows_and_stops_the_tail(tmp_path: Path) -> None:
+def test_id_range_records_empty_windows_and_stops_at_sealed_high_water(tmp_path: Path) -> None:
     runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()))
     try:
         summary = run_capture(runtime, "bootstrap")
@@ -190,11 +189,9 @@ def test_id_range_records_empty_windows_and_stops_the_tail(tmp_path: Path) -> No
         assert any(page["record_count"] > 0 for page in pages)
         assert json.loads(event_scan["params_json"])["hi"] == 303
 
-        tail = _scans_by_name(runtime.ledger, summary.batch_id)["events_ids_tail"][0]
-        tail_pages = runtime.ledger.pages_for_scan(tail["scan_id"])
-        assert [page["record_count"] for page in tail_pages] == [0, 0, 0]
-        assert tail_pages[-1]["terminal"] == 1
-        assert tail_pages[0]["offset_start"] == 304
+        assert pages[-1]["terminal"] == 1
+        assert pages[-1]["offset_end"] == 303
+        assert not any("tail" in name for name in _scans_by_name(runtime.ledger, summary.batch_id))
     finally:
         runtime.ledger.close()
 
@@ -225,7 +222,7 @@ def test_daily_refetches_previously_open_event_that_closed(tmp_path: Path) -> No
         summary = run_capture(runtime, "daily")
         assert summary.status == "captured"
         names = [s["scan_name"] for s in runtime.ledger.list_scans(summary.batch_id)]
-        assert names == ["events_keyset_open", "events_by_id_0001"]
+        assert names == ["events_keyset_open", "markets_keyset_open", "events_by_id_0001"]
 
         follow_up = _scans_by_name(runtime.ledger, summary.batch_id)["events_by_id_0001"][0]
         assert json.loads(follow_up["input_ids_json"]) == ["202"]
@@ -241,7 +238,7 @@ def test_daily_without_baseline_refuses_to_plan_refreshes(tmp_path: Path) -> Non
     fake = FakeGamma(demo_world())
     runtime, _ = build_runtime(tmp_path, fake)
     try:
-        with pytest.raises(RuntimeError, match="open-event baseline"):
+        with pytest.raises(RuntimeError, match="event and market baselines"):
             run_capture(runtime, "daily")
     finally:
         runtime.ledger.close()
@@ -278,7 +275,7 @@ def test_exhausted_retries_fail_the_scan_and_resume_later(tmp_path: Path) -> Non
         assert failed["status"] == "failed"
 
         fake.rules.clear()
-        summary = run_capture(runtime, "daily")
+        summary = run_capture(runtime, "daily", resume=runtime.ledger.list_batches()[0]["batch_id"])
         assert summary.resumed is True
         assert summary.batch_id == batch["batch_id"]
         assert summary.status == "captured"
@@ -327,7 +324,9 @@ def test_resume_reuses_page_ids_after_ledger_commit_crash(tmp_path: Path) -> Non
 
     runtime, _ = build_runtime(crash_root, FakeGamma(demo_world()), env=serial)
     try:
-        resumed = run_capture(runtime, "bootstrap")
+        resumed = run_capture(
+            runtime, "bootstrap", resume=runtime.ledger.list_batches()[0]["batch_id"]
+        )
         assert resumed.resumed is True
         assert resumed.pages_adopted == 0, "ledger already had the crashed page"
         assert resumed.status == "captured"
@@ -364,7 +363,9 @@ def test_resume_adopts_durable_page_missing_from_ledger(tmp_path: Path) -> None:
 
     runtime, _ = build_runtime(crash_root, FakeGamma(demo_world()), env=serial)
     try:
-        resumed = run_capture(runtime, "bootstrap")
+        resumed = run_capture(
+            runtime, "bootstrap", resume=runtime.ledger.list_batches()[0]["batch_id"]
+        )
         assert resumed.pages_adopted >= 1, "durable file without ledger row must be adopted"
         assert resumed.status == "captured"
         assert _page_fingerprints(runtime.ledger, resumed.batch_id) == clean_pages
@@ -388,7 +389,7 @@ def test_ledger_can_be_rebuilt_from_raw_manifests(tmp_path: Path) -> None:
             assert counts["batches"] == 1
             assert counts["pages"] == len(original)
             batch = fresh.get_batch(summary.batch_id)
-            assert batch["status"] == "captured" and batch["plan_stage"] == 2
+            assert batch["status"] == "captured" and batch["plan_stage"] == 4
             assert _page_fingerprints(fresh, summary.batch_id) == original
         finally:
             fresh.close()
@@ -412,12 +413,20 @@ def test_operator_can_abandon_a_capturing_batch(tmp_path: Path) -> None:
         runtime.ledger.close()
 
 
-def test_daily_scan_set_is_only_the_open_list(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
-    daily = list_scans_for("daily", settings.gamma)
-    assert [s.name for s in daily] == ["events_keyset_open"]
-    assert "include_children" not in daily[0].param_dict
-    assert "order" not in daily[0].param_dict
+def test_daily_scans_are_both_open_lists_with_frozen_high_water(tmp_path: Path) -> None:
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()))
+    try:
+        daily = list_scans_for(
+            "daily", runtime.settings.gamma, capture=runtime.settings.capture, client=runtime.client
+        )
+        assert [spec.name for spec in daily] == ["events_keyset_open", "markets_keyset_open"]
+        assert [spec.param_dict["_high_water"] for spec in daily] == [303, 8001]
+        assert all(
+            spec.param_dict["order"] == "id" and spec.param_dict["ascending"] for spec in daily
+        )
+    finally:
+        runtime.ledger.close()
+        runtime.client.close()
 
 
 def test_bootstrap_plan_uses_id_ranges(tmp_path: Path) -> None:
@@ -497,7 +506,7 @@ def test_max_id_override_caps_the_plan_and_skips_the_tail(tmp_path: Path) -> Non
         runtime.ledger.close()
 
 
-def test_a_single_id_that_keeps_failing_is_marked_fetch_failed(tmp_path: Path) -> None:
+def test_a_single_id_that_keeps_failing_stays_incomplete_and_resumes(tmp_path: Path) -> None:
     from fakes.world import World
 
     world = World()
@@ -521,31 +530,31 @@ def test_a_single_id_that_keeps_failing_is_marked_fetch_failed(tmp_path: Path) -
     )
     runtime, _ = build_runtime(tmp_path, fake)
     try:
-        summary = run_capture(runtime, "bootstrap")
-        assert summary.status == "captured"
-        batch = runtime.ledger.get_batch(summary.batch_id)
-        captured: list[str] = []
-        failed_ids: list[str] = []
-        for scan in runtime.ledger.list_scans(summary.batch_id):
-            if scan["kind"] != "id_range" or scan["record_key"] != "events":
-                continue
-            directory = (
-                runtime.settings.raw_dir
-                / batch["observation_date"]
-                / batch["batch_id"]
-                / scan["scan_id"]
+        with pytest.raises(RetriesExhausted):
+            run_capture(runtime, "bootstrap")
+        batch = runtime.ledger.list_batches()[0]
+        assert batch["status"] == "capturing"
+        scan = runtime.ledger.latest_attempt(batch["batch_id"], "events_ids_0001")
+        pages = runtime.ledger.pages_for_scan(scan["scan_id"])
+        assert len(pages) == 1 and not pages[0]["terminal"]
+        fake.rules.clear()
+        summary = run_capture(runtime, "bootstrap", resume=batch["batch_id"])
+        assert summary.status == "captured" and summary.resumed
+        captured = [
+            record["id"]
+            for _, records in iter_scan_pages(
+                runtime.settings,
+                runtime.ledger.get_batch(summary.batch_id),
+                runtime.ledger.latest_attempt(summary.batch_id, "events_ids_0001"),
             )
-            for manifest, records in iter_scan_pages(runtime.settings, batch, scan):
-                captured.extend(record["id"] for record in records)
-                body = json.loads(read_body(directory, manifest))
-                failed_ids.extend(item["id"] for item in body.get("fetch_failed", []))
-        assert captured == ["50"]
-        assert failed_ids == ["150"]
+            for record in records
+        ]
+        assert captured == ["50", "150"]
     finally:
         runtime.ledger.close()
 
 
-def test_a_referenced_failed_event_is_not_fetched_again(tmp_path: Path) -> None:
+def test_a_referenced_failed_event_blocks_planning_until_recovered(tmp_path: Path) -> None:
     from fakes.world import World
 
     world = World()
@@ -564,24 +573,20 @@ def test_a_referenced_failed_event_is_not_fetched_again(tmp_path: Path) -> None:
     )
     runtime, _ = build_runtime(tmp_path, fake)
     try:
-        summary = run_capture(runtime, "bootstrap")
+        with pytest.raises(RetriesExhausted):
+            run_capture(runtime, "bootstrap")
+        batch = runtime.ledger.list_batches()[0]
+        assert batch["status"] == "capturing"
+        assert not any(
+            scan["scan_name"].startswith("events_by_id")
+            for scan in runtime.ledger.list_scans(batch["batch_id"])
+        )
+        fake.rules.clear()
+        summary = run_capture(runtime, "bootstrap", resume=batch["batch_id"])
         assert summary.status == "captured"
-        names = [scan["scan_name"] for scan in runtime.ledger.list_scans(summary.batch_id)]
-        assert not any(name.startswith("events_by_id") for name in names)
-        batch = runtime.ledger.get_batch(summary.batch_id)
-        failed_ids: list[str] = []
-        for scan in runtime.ledger.list_scans(summary.batch_id):
-            if scan["kind"] != "id_range" or scan["record_key"] != "events":
-                continue
-            directory = (
-                runtime.settings.raw_dir
-                / batch["observation_date"]
-                / batch["batch_id"]
-                / scan["scan_id"]
-            )
-            for manifest, _records in iter_scan_pages(runtime.settings, batch, scan):
-                body = json.loads(read_body(directory, manifest))
-                failed_ids.extend(item["id"] for item in body.get("fetch_failed", []))
-        assert failed_ids == ["150"]
+        assert not any(
+            scan["scan_name"].startswith("events_by_id")
+            for scan in runtime.ledger.list_scans(batch["batch_id"])
+        )
     finally:
         runtime.ledger.close()

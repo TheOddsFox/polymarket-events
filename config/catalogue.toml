@@ -7,7 +7,9 @@
 
 [gamma]
 base_url = "https://gamma-api.polymarket.com"
-requests_per_second = 5.0
+requests_per_second = 2.0
+# HTTP loopback servers are permitted only for explicit offline tests.
+allow_loopback = false
 connect_timeout_s = 10.0
 read_timeout_s = 60.0
 max_retries = 12
@@ -23,8 +25,8 @@ include_best_lines = false
 data_dir = "data"
 state_dir = ".state"
 warehouse_file = "data/warehouse/catalogue.duckdb"
-dbt_project_dir = "dbt"
-dbt_profiles_dir = "dbt"
+dbt_project_dir = ""
+dbt_profiles_dir = ""
 
 [load]
 dataset_name = "bronze"
@@ -38,18 +40,11 @@ duckdb_threads = 2
 # registered, so dbt never reads it, and refresh/replay stop before the build. A share exactly at
 # the limit passes.
 quarantine_max_ratio = 0.01
-# Maximum share of market event references that may not resolve to a captured event.
-# Above it `dbt build` fails, so nothing is published. Passed to dbt as a variable.
-unresolved_reference_max_ratio = 0.01
-# Open-event drop versus the previous build, in percent. Drops from warn up to error are
+# Open-event drop versus the last valid published release, in percent. Drops from warn up to error are
 # logged (the CLI stage row also records them); the build still passes. Above error, `dbt build`
-# fails and nothing is published. error is passed to dbt as max_open_events_drop_pct.
+# fails and nothing is published. Custom dbt variables cannot disable these checks.
 open_events_drop_warn_pct = 5.0
 open_events_drop_error_pct = 10.0
-
-[publish]
-# Number of immutable releases kept on disk besides current and previous.
-retain_releases = 5
 
 [schedule]
 daily_cron = "0 6 * * 1-6"
@@ -61,4 +56,12 @@ id_partition_size = 50000
 # 0 uses the server high-water mark. A positive value caps a smoke run and skips the tail.
 max_id_override = 0
 # Scans from the same plan stage run together. They share the Gamma rate limit.
-workers = 4
+workers = 1
+
+# One finite allowance per invocation, including planning, retries and follow-ups.
+max_requests = 25000
+max_download_bytes = 4294967296
+max_duration_s = 14400.0
+max_response_bytes = 16777216
+max_retained_bytes = 68719476736
+max_temp_bytes = 8589934592

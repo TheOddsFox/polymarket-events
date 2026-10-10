@@ -33,8 +33,36 @@ catalogue = "oddsfox_catalogue.cli:main"
 requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "**/__pycache__/**", "**/dbt/target/**", "**/dbt/logs/**",
+    "**/dbt/dbt_packages/**", "**/dbt/.user.yml", "**/data/**", "**/.state/**",
+]
+include = [
+    "src/oddsfox_catalogue/**/*.py",
+    "src/oddsfox_catalogue/dbt/dbt_project.yml",
+    "src/oddsfox_catalogue/dbt/profiles.yml",
+    "src/oddsfox_catalogue/dbt/models/**/*.sql",
+    "src/oddsfox_catalogue/dbt/models/**/*.yml",
+    "src/oddsfox_catalogue/dbt/macros/**/*.sql",
+    "src/oddsfox_catalogue/dbt/tests/**/*.sql",
+]
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/oddsfox_catalogue"]
+sources = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/oddsfox_catalogue/**/*.py",
+    "src/oddsfox_catalogue/dbt/dbt_project.yml",
+    "src/oddsfox_catalogue/dbt/profiles.yml",
+    "src/oddsfox_catalogue/dbt/models/**/*.sql",
+    "src/oddsfox_catalogue/dbt/models/**/*.yml",
+    "src/oddsfox_catalogue/dbt/macros/**/*.sql",
+    "src/oddsfox_catalogue/dbt/tests/**/*.sql",
+    "pyproject.toml", "uv.lock", "README.md", "LICENSE",
+    "config/catalogue.toml", "docs/**/*.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

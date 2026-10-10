@@ -2,12 +2,15 @@
 
 Lifecycle of a batch:
 
-1. ``capturing``. List scans are planned at creation (stage 0).
-2. Once list scans complete, reference IDs are planned as ``keyset_ids``
-   chunks (stage 1). Daily mode plans re-fetches of previously open events.
-3. Once those complete, IDs they did not return are planned as ``single_ids``
-   lookups (stage 2).
-4. ``captured`` when every scan's latest attempt is complete.
+1. Persist finite selected scope or discover and commit fixed source high-water marks.
+2. Capture the committed list/direct-ID scans (phase 0).
+3. Daily mode reobserves missing market baseline IDs (phase 1).
+4. Capture referenced parent and missing baseline events (phases 2 and 3).
+5. Mark captured only when the sealed plan and every latest scan are complete.
+
+SQLite transitions and their exact marker bytes share a pending-control journal.
+Explicit named resume repairs a proven pending write, then verifies committed evidence
+before any source request. Deliberate new acquisitions never resume older work.
 
 Durability order per page: raw gz, manifest, ledger commit. A crash between
 steps leaves at most an orphan file, which the next run adopts (if its
@@ -21,21 +24,30 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.reader import iter_scan_pages, scan_dir_for
+from oddsfox_catalogue.capture.reader import (
+    DurabilityError,
+    iter_scan_pages,
+    read_page_records,
+    scan_dir_for,
+    validate_page_identity,
+)
 from oddsfox_catalogue.capture.writer import (
     batch_marker_path,
     manifest_path,
     read_body,
     read_manifest,
+    read_regular_bytes,
     scan_marker_path,
     verify_page,
     write_marker,
@@ -43,7 +55,13 @@ from oddsfox_catalogue.capture.writer import (
 )
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.faults import fault_point
-from oddsfox_catalogue.gamma.http import CaptureStopped, CursorExpired, GammaClient, ScanFailed
+from oddsfox_catalogue.gamma.http import (
+    CaptureStopped,
+    CursorExpired,
+    GammaClient,
+    RequestBudgetExceeded,
+    ScanFailed,
+)
 from oddsfox_catalogue.gamma.paginators import (
     PageResult,
     PageState,
@@ -56,9 +74,11 @@ from oddsfox_catalogue.gamma.paginators import (
 from oddsfox_catalogue.gamma.scans import (
     ScanSpec,
     chunk,
+    high_water,
     id_chunk_scan,
-    list_scans_for,
+    native_single_scan,
     scan_spec_from_row,
+    sealed_plan,
     single_id_scan,
 )
 from oddsfox_catalogue.ids import (
@@ -68,8 +88,11 @@ from oddsfox_catalogue.ids import (
     make_page_id,
     make_scan_id,
     observation_date,
+    parse_batch_id,
+    sha256_bytes,
     utc_now,
 )
+from oddsfox_catalogue.limits import enforce_storage_limits, retained_bytes, temporary_bytes
 from oddsfox_catalogue.signals import SIGNALS, Terminated
 
 logger = logging.getLogger(__name__)
@@ -84,6 +107,91 @@ def page_progress_due(seq: int) -> bool:
     return seq == 1 or seq % PROGRESS_EVERY_PAGES == 0
 
 
+MAX_PLAN_SCANS = 20_000
+MAX_MARKER_BYTES = 16 * 1024**2
+
+
+@dataclass
+class StorageBudget:
+    settings: Settings
+    allocated: int
+    existing_temporary: int
+    held_temporary: dict[str, int] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def reserve(self, size: int, token: str) -> None:
+        # Conservative reservations count write copies; no refunds hide partial writes.
+        with self.lock:
+            if self.allocated + size > self.settings.capture.max_retained_bytes:
+                raise RequestBudgetExceeded("retained storage allowance exhausted")
+            if token in self.held_temporary:
+                raise RuntimeError("capture write already holds a temporary reservation")
+            if (
+                self.existing_temporary + sum(self.held_temporary.values()) + size
+                > self.settings.capture.max_temp_bytes
+            ):
+                raise RequestBudgetExceeded("temporary storage allowance exhausted")
+            self.allocated += size
+            self.held_temporary[token] = size
+
+    def release_temporary(self, token: str) -> None:
+        with self.lock:
+            self.held_temporary.pop(token, None)
+
+
+def _storage_budget(settings: Settings) -> StorageBudget:
+    enforce_storage_limits(settings)
+    return StorageBudget(settings, retained_bytes(settings), temporary_bytes(settings))
+
+
+def _reserve(rt: CaptureRuntime, size: int, token: str) -> None:
+    if rt.storage is not None:
+        rt.storage.reserve(size, token)
+
+
+def _release_temporary(rt: CaptureRuntime, token: str) -> None:
+    if rt.storage is not None:
+        rt.storage.release_temporary(token)
+
+
+def _explicit_ids(values: Any) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError("selected IDs must be an explicit sequence")
+    values = list(islice(values, 101))
+    if len(values) > 100:
+        raise ValueError("selected mode permits at most 100 IDs per entity")
+    if any(
+        not isinstance(v, str)
+        or not v.isascii()
+        or not v.isdecimal()
+        or len(v) > 20
+        or int(v) <= 0
+        or str(int(v)) != v
+        for v in values
+    ):
+        raise ValueError("selected IDs must be canonical positive decimal IDs")
+    return sorted(set(values), key=int)
+
+
+def _scope(batch: dict[str, Any]) -> dict[str, Any]:
+    scope = json.loads(batch.get("scope_json") or "{}")
+    if scope.get("revision") != 2 or scope.get("kind") not in {"selected", "catalogue"}:
+        raise ValueError("unsupported capture scope; start a fresh acquisition")
+    return scope
+
+
+def _read_marker(path: Path, settings: Settings) -> dict[str, Any]:
+    try:
+        result = json.loads(
+            read_regular_bytes(path, max_bytes=MAX_MARKER_BYTES, trusted_root=settings.raw_dir)
+        )
+    except (OSError, ValueError) as exc:
+        raise DurabilityError("capture marker is missing, unsafe or malformed") from exc
+    if not isinstance(result, dict):
+        raise DurabilityError("capture marker is not an object")
+    return result
+
+
 @dataclass
 class CaptureRuntime:
     settings: Settings
@@ -92,6 +200,8 @@ class CaptureRuntime:
     now: Callable[[], datetime] = utc_now
     # Returns event IDs open at the last loaded state. Used only by daily mode.
     open_event_ids: Callable[[], set[str]] | None = None
+    open_market_ids: Callable[[], set[str]] | None = None
+    storage: StorageBudget | None = None
     git_sha: str | None = None
     max_scan_attempts: int = MAX_SCAN_ATTEMPTS
 
@@ -105,6 +215,9 @@ class CaptureSummary:
     pages_adopted: int = 0
     records: int = 0
     scans: list[str] = field(default_factory=list)
+    http_attempts: int = 0
+    downloaded_bytes: int = 0
+    duration_s: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def note_scan(self, scan_id: str) -> None:
@@ -130,12 +243,14 @@ def _scan_row(
     attempt: int,
     plan_order: int,
     started_at: str,
+    phase: int = 0,
 ) -> dict[str, Any]:
     return {
         "scan_id": make_scan_id(batch_id, spec.name, attempt),
         "batch_id": batch_id,
         "scan_name": spec.name,
         "attempt": attempt,
+        "phase": phase,
         "plan_order": plan_order,
         "kind": spec.kind,
         "endpoint": spec.endpoint,
@@ -146,22 +261,138 @@ def _scan_row(
     }
 
 
-def _start_batch(rt: CaptureRuntime, mode: str) -> dict[str, Any]:
+def _start_batch(
+    rt: CaptureRuntime, mode: str, market_ids: list[str], event_ids: list[str]
+) -> dict[str, Any]:
     now = rt.now()
     started = iso_utc(now)
-    batch_id = make_batch_id(mode, now)
-    obs_date = observation_date(now)
-    specs = list_scans_for(mode, rt.settings.gamma, capture=rt.settings.capture, client=rt.client)
-    rows = [
-        _scan_row(batch_id, spec, attempt=1, plan_order=index, started_at=started)
-        for index, spec in enumerate(specs, start=1)
-    ]
-    rt.ledger.create_batch(batch_id, mode, obs_date, started, rt.git_sha, rows)
+    base = make_batch_id(mode, now)
+    batch_id = base
+    suffix = 2
+    while (
+        rt.ledger.get_batch(batch_id) is not None
+        or _batch_dir(rt.settings, observation_date(now), batch_id).exists()
+    ):
+        batch_id = f"{base}-{suffix}"
+        suffix += 1
+    baseline = {"events": [], "markets": []}
+    if mode == "daily":
+        if rt.open_event_ids is None or rt.open_market_ids is None:
+            raise RuntimeError("daily mode requires open-or-unknown event and market baselines")
+        baseline = {
+            "events": sorted(rt.open_event_ids(), key=int),
+            "markets": sorted(rt.open_market_ids(), key=int),
+        }
+    scope = {
+        "revision": 2,
+        "kind": "selected" if mode == "selected" else "catalogue",
+        "market_ids": market_ids,
+        "event_ids": event_ids,
+        "parent_event_ids": [],
+        "high_water": {},
+        "baseline": baseline,
+        "sealed": mode == "selected",
+    }
+    if len(canonical_json(scope).encode()) > MAX_MARKER_BYTES // 2:
+        raise ValueError("capture scope exceeds the manifest allowance")
+    # Persist the incomplete acquisition before any source discovery request.
+    initial = {
+        "batch_id": batch_id,
+        "mode": mode,
+        "observation_date": observation_date(now),
+        "status": "capturing",
+        "plan_stage": -1,
+        "started_at": started,
+        "git_sha": rt.git_sha,
+        "scope_json": canonical_json(scope),
+    }
+    payload = _batch_payload(rt, initial)
+    control = _prepare_control(
+        rt, batch_marker_path(_batch_dir(rt.settings, observation_date(now), batch_id)), payload
+    )
+    rt.ledger.create_batch(
+        batch_id,
+        mode,
+        observation_date(now),
+        started,
+        rt.git_sha,
+        [],
+        scope=scope,
+        plan_stage=-1,
+        control=control,
+    )
     batch = rt.ledger.get_batch(batch_id)
     assert batch is not None
     _write_batch_marker(rt, batch)
-    _mark_planned(rt, batch, rows)
     return batch
+
+
+def _seal_plan(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
+    scope = _scope(batch)
+    if batch["mode"] == "selected":
+        specs = []
+        if scope["market_ids"]:
+            specs.append(native_single_scan("markets_selected", scope["market_ids"], "markets"))
+        if scope["event_ids"]:
+            specs.append(native_single_scan("events_selected", scope["event_ids"], "events"))
+    else:
+        for entity in ("events", "markets"):
+            if entity not in scope["high_water"]:
+                scope["high_water"][entity] = high_water(rt.client, entity)
+                if rt.settings.capture.max_id_override:
+                    scope["high_water"][entity] = min(
+                        scope["high_water"][entity], rt.settings.capture.max_id_override
+                    )
+                proposed = {**batch, "scope_json": canonical_json(scope)}
+                control = _prepare_control(
+                    rt,
+                    batch_marker_path(
+                        _batch_dir(rt.settings, batch["observation_date"], batch["batch_id"])
+                    ),
+                    _batch_payload(rt, proposed),
+                )
+                rt.ledger.update_scope(batch["batch_id"], scope, iso_utc(rt.now()), control=control)
+                batch = rt.ledger.get_batch(batch["batch_id"])
+                assert batch is not None
+                _write_batch_marker(rt, batch)
+        specs = sealed_plan(
+            batch["mode"], rt.settings.gamma, rt.settings.capture, scope["high_water"]
+        )
+    scope["sealed"] = True
+    rows = [
+        _scan_row(batch["batch_id"], spec, attempt=1, plan_order=i, started_at=iso_utc(rt.now()))
+        for i, spec in enumerate(specs, 1)
+    ]
+    _commit_plan(rt, batch, 0, rows, scope)
+
+
+def _commit_plan(
+    rt: CaptureRuntime,
+    batch: dict[str, Any],
+    phase: int,
+    rows: list[dict[str, Any]],
+    scope: dict[str, Any] | None = None,
+) -> None:
+    planned = [s for s in rt.ledger.list_scans(batch["batch_id"]) if s["attempt"] == 1]
+    if (
+        len(planned) + len(rows) > MAX_PLAN_SCANS
+        or len(canonical_json([_plan_entry(s) for s in planned + rows]).encode())
+        > MAX_MARKER_BYTES // 2
+    ):
+        raise ValueError("capture plan exceeds the finite manifest allowance")
+    proposed = {**batch, "plan_stage": phase, "scope_json": canonical_json(scope or _scope(batch))}
+    control = _prepare_control(
+        rt,
+        batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch["batch_id"])),
+        _batch_payload(rt, proposed, additional_plan=rows),
+    )
+    rt.ledger.add_plan(
+        batch["batch_id"], phase, rows, iso_utc(rt.now()), scope=scope, control=control
+    )
+    committed = rt.ledger.get_batch(batch["batch_id"])
+    assert committed is not None
+    _write_batch_marker(rt, committed)
+    _mark_planned(rt, committed, rows)
 
 
 def _plan_entry(scan: dict[str, Any]) -> dict[str, Any]:
@@ -175,6 +406,7 @@ def _plan_entry(scan: dict[str, Any]) -> dict[str, Any]:
     return {
         "scan_name": scan["scan_name"],
         "plan_order": scan["plan_order"],
+        "phase": scan.get("phase", 0),
         "kind": scan["kind"],
         "endpoint": scan["endpoint"],
         "record_key": scan["record_key"],
@@ -184,31 +416,134 @@ def _plan_entry(scan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _write_batch_marker(rt: CaptureRuntime, batch: dict[str, Any], **fields: Any) -> None:
-    """Write the batch marker with every attempt-1 scan planned so far, in one atomic write.
-
-    The write runs before the scan markers for the same plan. A crash therefore leaves
-    either the old plan or the new one, never a scan marker that the plan does not list.
-    ``fields`` override the defaults, as the captured marker does for its status.
-    """
+def _batch_payload(
+    rt: CaptureRuntime,
+    batch: dict[str, Any],
+    *,
+    additional_plan: list[dict[str, Any]] = (),
+    **fields: Any,
+) -> dict[str, Any]:
     planned = sorted(
         (s for s in rt.ledger.list_scans(batch["batch_id"]) if s["attempt"] == 1),
         key=lambda s: s["plan_order"],
     )
-    payload: dict[str, Any] = {
+    return {
         "batch_id": batch["batch_id"],
         "mode": batch["mode"],
         "observation_date": batch["observation_date"],
-        "status": "capturing",
+        "status": batch["status"],
+        "scope": _scope(batch),
+        "plan_stage": batch["plan_stage"],
         "started_at": batch["started_at"],
         "git_sha": batch["git_sha"],
-        "plan": [_plan_entry(scan) for scan in planned],
+        "plan": [_plan_entry(scan) for scan in planned + list(additional_plan)],
         **fields,
     }
-    write_marker(
-        batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch["batch_id"])),
-        payload,
+
+
+def _prepare_control(rt: CaptureRuntime, path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    encoded = (canonical_json(payload) + "\n").encode()
+    if len(encoded) > MAX_MARKER_BYTES:
+        raise ValueError("capture manifest exceeds the finite allowance")
+    control_id = path.relative_to(rt.settings.raw_dir).as_posix()
+    _reserve(rt, 3 * len(encoded) + 4096, control_id)
+    previous = None
+    if path.exists() or path.is_symlink():
+        previous = sha256_bytes(
+            read_regular_bytes(path, max_bytes=MAX_MARKER_BYTES, trusted_root=rt.settings.raw_dir)
+        )
+    return {
+        "control_id": control_id,
+        "batch_id": payload["batch_id"],
+        "payload_json": encoded.decode(),
+        "payload_sha256": sha256_bytes(encoded),
+        "previous_sha256": previous,
+    }
+
+
+def _promote_control(rt: CaptureRuntime, control: dict[str, Any]) -> None:
+    payload_bytes = control["payload_json"].encode()
+    if (
+        len(payload_bytes) > MAX_MARKER_BYTES
+        or sha256_bytes(payload_bytes) != control["payload_sha256"]
+    ):
+        raise DurabilityError("pending capture control is corrupt")
+    target = Path(control["control_id"])
+    if (
+        target.is_absolute()
+        or target.as_posix() != control["control_id"]
+        or any(part in {"", ".", ".."} for part in target.parts)
+    ):
+        raise DurabilityError("pending capture control has an unsafe path")
+    path = rt.settings.raw_dir / target
+    existing = None
+    if path.exists() or path.is_symlink():
+        existing = sha256_bytes(
+            read_regular_bytes(path, max_bytes=MAX_MARKER_BYTES, trusted_root=rt.settings.raw_dir)
+        )
+    if existing not in {control["previous_sha256"], control["payload_sha256"]}:
+        raise DurabilityError("pending capture control does not match committed marker bytes")
+    payload = json.loads(payload_bytes)
+    batch = rt.ledger.get_batch(control["batch_id"])
+    if batch is None:
+        raise DurabilityError("pending capture control has no ledger batch")
+    if path.name == "_batch.json":
+        if path != batch_marker_path(
+            _batch_dir(rt.settings, batch["observation_date"], batch["batch_id"])
+        ):
+            raise DurabilityError("pending batch control is outside its canonical path")
+        expected = _batch_payload(rt, batch)
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise DurabilityError("pending batch control does not match ledger state")
+    elif path.name == "_scan.json":
+        scan = rt.ledger.get_scan(payload.get("scan_id", ""))
+        if scan is not None and path != scan_marker_path(
+            scan_dir_for(rt.settings, batch["observation_date"], batch["batch_id"], scan["scan_id"])
+        ):
+            raise DurabilityError("pending scan control is outside its canonical path")
+        if (
+            scan is None
+            or payload
+            != _scan_payload(
+                rt,
+                batch,
+                scan,
+                payload["status"],
+                payload.get("error"),
+                finished_at=payload.get("finished_at"),
+            )
+            or scan["status"] != payload["status"]
+        ):
+            raise DurabilityError("pending scan control does not match ledger state")
+    else:
+        raise DurabilityError("unsupported pending capture control")
+    write_marker(path, payload)
+    _release_temporary(rt, control["control_id"])
+    fault_point("after_control_marker_commit")
+    rt.ledger.clear_control(control["control_id"])
+
+
+def _recover_controls(rt: CaptureRuntime, batch_id: str) -> None:
+    for control in rt.ledger.pending_controls(batch_id):
+        _reserve(rt, 2 * len(control["payload_json"].encode()) + 4096, control["control_id"])
+        _promote_control(rt, control)
+
+
+def _write_batch_marker(rt: CaptureRuntime, batch: dict[str, Any], **fields: Any) -> None:
+    path = batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch["batch_id"]))
+    pending = next(
+        (
+            c
+            for c in rt.ledger.pending_controls(batch["batch_id"])
+            if c["control_id"] == path.relative_to(rt.settings.raw_dir).as_posix()
+        ),
+        None,
     )
+    if pending is None:
+        pending = _prepare_control(rt, path, _batch_payload(rt, batch, **fields))
+        rt.ledger.put_control(pending)
+    fault_point("after_control_ledger_commit")
+    _promote_control(rt, pending)
 
 
 def _batch_dir(settings: Settings, obs_date: str, batch_id: str) -> Path:
@@ -231,12 +566,6 @@ def _all_complete(scans: list[dict[str, Any]]) -> bool:
 OPEN_MARKETS_SCAN = "markets_keyset_open"
 CLOSED_MARKET_WINDOW_PREFIX = "markets_closed_ids_"
 ID_RANGE_MODES = frozenset({"bootstrap", "reconcile"})
-# Scan names the id-range plan produces. A deep-keyset or offset plan uses other names, and its
-# coverage cannot be shown, so a batch with any other name is not resumed.
-ID_RANGE_SCAN_NAME = re.compile(
-    r"markets_keyset_open|events_ids_(\d{4,}|tail)|markets_closed_ids_(\d{4,}|tail)"
-    r"|events_by_id_(single_)?\d{4,}"
-)
 # Seconds the pool waits before it looks again. The main thread runs signal handlers only
 # between waits, so a bounded wait keeps a signal from sitting behind a busy worker.
 POOL_POLL_S = 1.0
@@ -260,37 +589,14 @@ def _held_closed_windows(scans: list[dict[str, Any]]) -> set[str]:
     return {s["scan_id"] for s in scans if s["scan_name"].startswith(CLOSED_MARKET_WINDOW_PREFIX)}
 
 
-def _unsafe_to_resume(scans: list[dict[str, Any]]) -> bool:
-    """True when an id-range batch cannot be resumed on a plan that shows every market is seen.
-
-    Four shapes qualify. A batch with no list scans was never planned, and the planner refuses
-    to plan from it. A batch holding a scan name the id-range plan does not produce came from a
-    deep-keyset or offset plan. A batch planned before the market-race fix runs its closed windows
-    ahead of the open crawl, and a closed window that finished first can pass a market the crawl
-    never returns. A batch with scans but no open crawl has nothing to cover its closed windows.
-    """
-    if not scans:
-        return True
-    if any(ID_RANGE_SCAN_NAME.fullmatch(s["scan_name"]) is None for s in scans):
-        return True
-    latest = _latest_by_name(scans)
-    open_scan = latest.get(OPEN_MARKETS_SCAN)
-    if open_scan is None:
-        return True
-    return any(
-        name.startswith(CLOSED_MARKET_WINDOW_PREFIX) and s["plan_order"] < open_scan["plan_order"]
-        for name, s in latest.items()
-    )
-
-
 def _durable_records(
     rt: CaptureRuntime,
     batch: dict[str, Any],
     predicate: Callable[[dict[str, Any]], bool],
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
     """Yield ``(scan, (manifest, records))`` for every attempt matching ``predicate``."""
-    for scan in rt.ledger.list_scans(batch["batch_id"]):
-        if not predicate(scan):
+    for scan in _latest_by_name(rt.ledger.list_scans(batch["batch_id"])).values():
+        if scan["status"] != "complete" or not predicate(scan):
             continue
         for manifest, records in iter_scan_pages(rt.settings, batch, scan):
             yield scan, {"manifest": manifest, "records": records}
@@ -319,15 +625,22 @@ def _fetch_failed_ids(
 ) -> set[str]:
     """Ids a list scan could not read. They must not be fetched again by keyset."""
     failed: set[str] = set()
-    for scan in rt.ledger.list_scans(batch["batch_id"]):
-        if not predicate(scan):
+    for scan in _latest_by_name(rt.ledger.list_scans(batch["batch_id"])).values():
+        if scan["status"] != "complete" or not predicate(scan):
             continue
         directory = scan_dir_for(
             rt.settings, batch["observation_date"], batch["batch_id"], scan["scan_id"]
         )
         for manifest, _records in iter_scan_pages(rt.settings, batch, scan):
             try:
-                body = json.loads(read_body(directory, manifest))
+                body = json.loads(
+                    read_body(
+                        directory,
+                        manifest,
+                        trusted_root=rt.settings.raw_dir,
+                        max_body_bytes=rt.settings.capture.max_response_bytes,
+                    )
+                )
             except json.JSONDecodeError:
                 continue
             if not isinstance(body, dict):
@@ -339,99 +652,113 @@ def _fetch_failed_ids(
 
 
 def _market_stub_ids(rt: CaptureRuntime, batch: dict[str, Any]) -> set[str]:
-    """Event IDs referenced by ``market.events`` stubs, in both market shapes."""
+    scope = _scope(batch)
     stubs: set[str] = set()
-    for _, page in _durable_records(rt, batch, lambda s: s["kind"] not in FOLLOW_UP_KINDS):
-        record_key = page["manifest"]["record_key"]
+    for scan, page in _durable_records(rt, batch, lambda s: s.get("phase", 0) <= 1):
         for record in page["records"]:
             if not isinstance(record, dict):
                 continue
-            markets = [record] if record_key == "markets" else record.get("markets", [])
+            markets = [record] if scan["record_key"] == "markets" else record.get("markets", [])
             for market in markets if isinstance(markets, list) else []:
                 if not isinstance(market, dict):
                     continue
+                value = str(market.get("id", ""))
+                if scope["kind"] == "selected" and value not in scope["market_ids"]:
+                    continue
+                if (
+                    scope["kind"] == "catalogue"
+                    and value.isascii()
+                    and value.isdecimal()
+                    and int(value) > scope["high_water"]["markets"]
+                    and value not in scope["baseline"]["markets"]
+                ):
+                    continue
                 for stub in market.get("events", []) or []:
-                    if isinstance(stub, dict) and "id" in stub:
-                        stubs.add(str(stub["id"]))
+                    if isinstance(stub, dict):
+                        event_id = str(stub.get("id", ""))
+                        if (
+                            event_id.isascii()
+                            and event_id.isdecimal()
+                            and 0 < len(event_id) <= 20
+                            and int(event_id) > 0
+                            and str(int(event_id)) == event_id
+                        ):
+                            stubs.add(event_id)
     return stubs
 
 
-def _plan_stage0_ids(rt: CaptureRuntime, batch: dict[str, Any]) -> list[str]:
-    """Event IDs that must be fetched by ID after the list scans."""
-    if batch["mode"] == "daily":
-        if rt.open_event_ids is None:
-            raise RuntimeError("daily mode requires an open-event baseline")
-        baseline = rt.open_event_ids()
-        returned = _event_ids_from(rt, batch, lambda s: s["scan_name"] == "events_keyset_open")
-        return sorted(baseline - returned, key=int)
-
-    def event_scans(scan: dict[str, Any]) -> bool:
-        return scan["kind"] == "id_range" and scan["record_key"] == "events"
-
-    known = _event_ids_from(rt, batch, event_scans)
-    known.update(_fetch_failed_ids(rt, batch, event_scans))
-    stubs = _market_stub_ids(rt, batch)
-    candidates = {i for i in stubs if i.isdigit()}
-    return sorted(candidates - known, key=int)
-
-
 def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
-    """Plan the next stage if the current stage has completed. Returns True if it advanced."""
     batch = rt.ledger.get_batch(batch_id)
     assert batch is not None
-    stage = batch["plan_stage"]
+    phase = batch["plan_stage"]
+    if phase == -1:
+        _seal_plan(rt, batch)
+        return True
+    if phase >= 4:
+        return False
     latest = _latest_by_name(rt.ledger.list_scans(batch_id))
-    now = iso_utc(rt.now())
-
-    if stage == 0:
-        list_scans = [s for s in latest.values() if s["kind"] not in FOLLOW_UP_KINDS]
-        # A batch with no list scans is corrupt. Planning from it would "capture" nothing.
-        if not list_scans or not _all_complete(list_scans):
-            return False
-        ids = _plan_stage0_ids(rt, batch)
-        start = rt.ledger.max_plan_order(batch_id)
-        rows = [
-            _scan_row(
-                batch_id,
-                id_chunk_scan(index, ids_chunk),
-                attempt=1,
-                plan_order=start + index,
-                started_at=now,
-            )
-            for index, ids_chunk in enumerate(chunk(ids), start=1)
+    active = [s for s in latest.values() if s.get("phase", 0) == phase]
+    if not _all_complete(active):
+        return False
+    scope = _scope(batch)
+    specs: list[ScanSpec] = []
+    next_phase = phase + 1
+    if phase == 0 and batch["mode"] == "daily":
+        returned = _event_ids_from(
+            rt, batch, lambda s: s["record_key"] == "markets" and s.get("phase", 0) == 0
+        )
+        missing = sorted(set(scope["baseline"]["markets"]) - returned, key=int)
+        specs = [
+            native_single_scan(f"markets_refresh_{i:04d}", ids, "markets")
+            for i, ids in enumerate(chunk(missing), 1)
         ]
-        rt.ledger.add_plan(batch_id, 1, rows, now)
-        _write_batch_marker(rt, batch)
-        _mark_planned(rt, batch, rows)
-        return True
-
-    if stage == 1:
-        id_scans = [s for s in latest.values() if s["kind"] == "keyset_ids"]
-        if not _all_complete(id_scans):
-            return False
-        requested: list[str] = []
-        for scan in id_scans:
-            requested.extend(json.loads(scan["input_ids_json"] or "[]"))
-        returned = _event_ids_from(rt, batch, lambda s: s["kind"] == "keyset_ids")
-        # An id already quarantined in stage one must not be fetched and quarantined again.
-        failed = _fetch_failed_ids(rt, batch, lambda s: s["kind"] == "keyset_ids")
-        missing = sorted(set(requested) - returned - failed, key=int)
-        start = rt.ledger.max_plan_order(batch_id)
-        rows = [
-            _scan_row(
-                batch_id,
-                single_id_scan(index, ids_chunk),
-                attempt=1,
-                plan_order=start + index,
-                started_at=now,
+    elif phase == 1:
+        known = _event_ids_from(
+            rt, batch, lambda s: s["record_key"] == "events" and s.get("phase", 0) == 0
+        )
+        known.update(
+            _fetch_failed_ids(
+                rt, batch, lambda s: s["record_key"] == "events" and s.get("phase", 0) == 0
             )
-            for index, ids_chunk in enumerate(chunk(missing), start=1)
-        ]
-        rt.ledger.add_plan(batch_id, 2, rows, now)
-        _write_batch_marker(rt, batch)
-        _mark_planned(rt, batch, rows)
-        return True
-    return False
+        )
+        parents = _market_stub_ids(rt, batch)
+        scope["parent_event_ids"] = sorted(parents - set(scope["event_ids"]), key=int)
+        candidates = parents | set(scope["baseline"]["events"])
+        ids = sorted(candidates - known, key=int)
+        if scope["kind"] == "selected":
+            specs = [
+                native_single_scan(f"events_parents_{i:04d}", values, "events")
+                for i, values in enumerate(chunk(ids), 1)
+            ]
+        else:
+            specs = [id_chunk_scan(i, values) for i, values in enumerate(chunk(ids), 1)]
+    elif phase == 2:
+        requested = {v for s in active for v in json.loads(s["input_ids_json"] or "[]")}
+        returned = _event_ids_from(rt, batch, lambda s: s.get("phase", 0) == 2)
+        failed = _fetch_failed_ids(rt, batch, lambda s: s.get("phase", 0) == 2)
+        # Individual 404s are confirmed absence, not a reason to request twice.
+        singles = {
+            v
+            for s in active
+            if s["kind"] == "single_ids"
+            for v in json.loads(s["input_ids_json"] or "[]")
+        }
+        missing = sorted(requested - returned - failed - singles, key=int)
+        specs = [single_id_scan(i, values) for i, values in enumerate(chunk(missing), 1)]
+    start = rt.ledger.max_plan_order(batch_id)
+    rows = [
+        _scan_row(
+            batch_id,
+            spec,
+            attempt=1,
+            plan_order=start + i,
+            started_at=iso_utc(rt.now()),
+            phase=next_phase,
+        )
+        for i, spec in enumerate(specs, 1)
+    ]
+    _commit_plan(rt, batch, next_phase, rows, scope)
+    return True
 
 
 def _resume_orphaned_attempts(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
@@ -448,9 +775,16 @@ def _resume_orphaned_attempts(rt: CaptureRuntime, batch: dict[str, Any]) -> None
             scan_spec_from_row(row),
             attempt=row["attempt"] + 1,
             plan_order=row["plan_order"],
+            phase=row.get("phase", 0),
             started_at=iso_utc(rt.now()),
         )
-        rt.ledger.add_scan_attempt(successor)
+        directory = scan_dir_for(
+            rt.settings, batch["observation_date"], batch["batch_id"], successor["scan_id"]
+        )
+        control = _prepare_control(
+            rt, scan_marker_path(directory), _scan_payload(rt, batch, successor, "running")
+        )
+        rt.ledger.add_scan_attempt(successor, control=control)
         _mark_planned(rt, batch, [successor])
         logger.info("capture scan %s resumed as attempt %s", row["scan_name"], successor["attempt"])
 
@@ -463,16 +797,21 @@ def _finalise_if_complete(rt: CaptureRuntime, batch_id: str) -> str:
     latest = _latest_by_name(rt.ledger.list_scans(batch_id))
     # A market-list batch is captured only once its open-market crawl has completed.
     crawl_ok = batch["mode"] not in ID_RANGE_MODES or _open_crawl_complete(latest)
-    if batch["plan_stage"] == 2 and _all_complete(list(latest.values())) and crawl_ok:
+    if batch["plan_stage"] == 4 and _all_complete(list(latest.values())) and crawl_ok:
         finished = iso_utc(rt.now())
-        rt.ledger.set_batch_status(batch_id, "captured", finished)
-        _write_batch_marker(
+        payload = _batch_payload(
             rt,
-            batch,
-            status="captured",
+            {**batch, "status": "captured"},
             finished_at=finished,
             scans={name: s["scan_id"] for name, s in latest.items()},
         )
+        control = _prepare_control(
+            rt,
+            batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch_id)),
+            payload,
+        )
+        rt.ledger.set_batch_status(batch_id, "captured", finished, control=control)
+        _write_batch_marker(rt, {**batch, "status": "captured"})
         return "captured"
     return "capturing"
 
@@ -493,14 +832,18 @@ def _iterate(rt: CaptureRuntime, spec: ScanSpec, start: PageState) -> Iterator[P
     if spec.kind == "offset":
         return offset_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
     if spec.kind == "single_ids":
-        return _single_iter(client, list(spec.input_ids), start.seq)
+        return _single_iter(client, list(spec.input_ids), start.seq, spec.record_key)
     raise ValueError(f"unknown scan kind {spec.kind!r}")
 
 
-def _single_iter(client: GammaClient, ids: list[str], done: int) -> Iterator[PageResult]:
+def _single_iter(
+    client: GammaClient, ids: list[str], done: int, record_key: str
+) -> Iterator[PageResult]:
     last = len(ids) - 1
     for index in range(done, len(ids)):
-        yield single_event_page(client, ids[index], seq=index + 1, terminal=index == last)
+        yield single_event_page(
+            client, ids[index], seq=index + 1, terminal=index == last, record_key=record_key
+        )
 
 
 def _state_from_row(rt: CaptureRuntime, scan: dict[str, Any]) -> PageState:
@@ -561,13 +904,24 @@ def _adopt_durable_pages(
         path = manifest_path(directory, expected)
         if not path.exists():
             break
-        manifest = read_manifest(path)
+        manifest = read_manifest(path, trusted_root=rt.settings.raw_dir)
         if (
             manifest is None
             or manifest.get("seq") != expected
-            or not verify_page(directory, manifest)
+            or not verify_page(
+                directory,
+                manifest,
+                trusted_root=rt.settings.raw_dir,
+                max_body_bytes=rt.settings.capture.max_response_bytes,
+            )
         ):
-            break
+            raise DurabilityError("orphan page is corrupt")
+        prior = rt.ledger.pages_for_scan(scan["scan_id"])
+        previous = prior[-1] if prior else None
+        validate_page_identity(batch, scan, manifest, seq=expected, previous=previous)
+        read_page_records(
+            rt.settings, directory, manifest, scan["record_key"], scan=scan, previous=previous
+        )
         rt.ledger.record_page(
             _row_from_manifest(manifest, batch["batch_id"], scan["scan_id"]),
             scan["scan_id"],
@@ -610,7 +964,10 @@ def _persist_page(
         "ids_hash": page.ids_hash,
         "observed_at": iso_utc(page.response.received_at),
     }
+    write_token = "page:" + manifest_fields["page_id"]
+    _reserve(rt, 2 * len(page.response.body) + 16_384, write_token)
     written = write_page(directory, page.seq, page.response.body, manifest_fields)
+    _release_temporary(rt, write_token)
     fault_point("after_page_rename")
     row = {
         **manifest_fields,
@@ -625,6 +982,36 @@ def _persist_page(
     fault_point("after_ledger_commit")
 
 
+def _scan_payload(
+    rt: CaptureRuntime,
+    batch: dict[str, Any],
+    scan: dict[str, Any],
+    status: str,
+    error: str | None = None,
+    *,
+    finished_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "scan_id": scan["scan_id"],
+        "batch_id": batch["batch_id"],
+        "scan_name": scan["scan_name"],
+        "attempt": scan["attempt"],
+        "plan_order": scan["plan_order"],
+        "phase": scan.get("phase", 0),
+        "kind": scan["kind"],
+        "endpoint": scan["endpoint"],
+        "record_key": scan["record_key"],
+        "params": json.loads(scan["params_json"]),
+        "input_ids": json.loads(scan["input_ids_json"] or "[]"),
+        "status": status,
+        "error": error,
+        "started_at": scan["started_at"],
+        "finished_at": finished_at
+        if finished_at is not None
+        else (iso_utc(rt.now()) if status != "running" else None),
+    }
+
+
 def _write_scan_marker(
     rt: CaptureRuntime,
     batch: dict[str, Any],
@@ -633,25 +1020,20 @@ def _write_scan_marker(
     status: str,
     error: str | None = None,
 ) -> None:
-    write_marker(
-        scan_marker_path(directory),
-        {
-            "scan_id": scan["scan_id"],
-            "batch_id": batch["batch_id"],
-            "scan_name": scan["scan_name"],
-            "attempt": scan["attempt"],
-            "plan_order": scan["plan_order"],
-            "kind": scan["kind"],
-            "endpoint": scan["endpoint"],
-            "record_key": scan["record_key"],
-            "params": json.loads(scan["params_json"]),
-            "input_ids": json.loads(scan["input_ids_json"] or "[]"),
-            "status": status,
-            "error": error,
-            "started_at": scan["started_at"],
-            "finished_at": iso_utc(rt.now()) if status != "running" else None,
-        },
+    path = scan_marker_path(directory)
+    pending = next(
+        (
+            c
+            for c in rt.ledger.pending_controls(batch["batch_id"])
+            if c["control_id"] == path.relative_to(rt.settings.raw_dir).as_posix()
+        ),
+        None,
     )
+    if pending is None:
+        pending = _prepare_control(rt, path, _scan_payload(rt, batch, scan, status, error))
+        rt.ledger.put_control(pending)
+    fault_point("after_control_ledger_commit")
+    _promote_control(rt, pending)
 
 
 def _mark_planned(rt: CaptureRuntime, batch: dict[str, Any], rows: list[dict[str, Any]]) -> None:
@@ -732,6 +1114,10 @@ def _run_scan(
     except CursorExpired as exc:
         _abandon(rt, batch, scan_id, directory, str(exc))
     except Exception as exc:
+        target = scan_marker_path(directory).relative_to(rt.settings.raw_dir).as_posix()
+        if any(c["control_id"] == target for c in rt.ledger.pending_controls(batch["batch_id"])):
+            # A committed pending transition must keep the exact state its journal proves.
+            raise
         message = f"{type(exc).__name__}: {exc}"[:500]
         rt.ledger.set_scan_status(scan_id, "failed", None, message)
         scan = rt.ledger.get_scan(scan_id)
@@ -747,7 +1133,13 @@ def _finish(
     directory: Path,
     status: str,
 ) -> None:
-    rt.ledger.set_scan_status(scan["scan_id"], status, iso_utc(rt.now()), None)
+    finished = iso_utc(rt.now())
+    control = _prepare_control(
+        rt,
+        scan_marker_path(directory),
+        _scan_payload(rt, batch, scan, status, finished_at=finished),
+    )
+    rt.ledger.set_scan_status(scan["scan_id"], status, finished, None, control=control)
     refreshed = rt.ledger.get_scan(scan["scan_id"])
     assert refreshed is not None
     logger.info(
@@ -786,15 +1178,22 @@ def _abandon(
     abandoned = rt.ledger.get_scan(scan_id)
     assert abandoned is not None
     _write_scan_marker(rt, batch, abandoned, directory, "abandoned", reason[:500])
-    rt.ledger.add_scan_attempt(
-        _scan_row(
-            batch["batch_id"],
-            scan_spec_from_row(old),
-            attempt=old["attempt"] + 1,
-            plan_order=old["plan_order"],
-            started_at=iso_utc(rt.now()),
-        )
+    successor = _scan_row(
+        batch["batch_id"],
+        scan_spec_from_row(old),
+        attempt=old["attempt"] + 1,
+        plan_order=old["plan_order"],
+        phase=old.get("phase", 0),
+        started_at=iso_utc(rt.now()),
     )
+    new_directory = scan_dir_for(
+        rt.settings, batch["observation_date"], batch["batch_id"], successor["scan_id"]
+    )
+    control = _prepare_control(
+        rt, scan_marker_path(new_directory), _scan_payload(rt, batch, successor, "running")
+    )
+    rt.ledger.add_scan_attempt(successor, control=control)
+    _mark_planned(rt, batch, [successor])
 
 
 # ---------------------------------------------------------------------------
@@ -810,10 +1209,15 @@ def _record_capture_stage(
     started: str,
     summary: CaptureSummary | None,
     error: str | None,
+    requests_before: int = 0,
+    bytes_before: int = 0,
 ) -> None:
     """Write the single ``stage_runs`` row for one capture attempt, success or failure."""
     captured = summary is not None and summary.status == "captured" and error is None
-    counts: dict[str, Any] = {"mode": mode, "http": rt.client.stats.as_dict()}
+    http = rt.client.stats.as_dict()
+    http["requests"] -= requests_before
+    http["downloaded_bytes"] -= bytes_before
+    counts: dict[str, Any] = {"mode": mode, "http": http}
     if summary is not None:
         counts.update(
             {
@@ -844,6 +1248,8 @@ def _runtime_for(rt: CaptureRuntime, client: GammaClient) -> CaptureRuntime:
         ledger=rt.ledger,
         now=rt.now,
         open_event_ids=rt.open_event_ids,
+        open_market_ids=rt.open_market_ids,
+        storage=rt.storage,
         git_sha=rt.git_sha,
         max_scan_attempts=rt.max_scan_attempts,
     )
@@ -895,7 +1301,8 @@ def _run_ready_scans(
         futures = []
         try:
             rt.client._limiter.bind_stop(stop)
-            futures = [executor.submit(run_row, row) for row in rows]
+            remaining = iter(rows)
+            futures = [executor.submit(run_row, row) for row in islice(remaining, worker_count)]
             pending = set(futures)
             while pending:
                 if SIGNALS.pending is not None:
@@ -903,6 +1310,11 @@ def _run_ready_scans(
                 done, pending = wait(pending, timeout=POOL_POLL_S, return_when=FIRST_COMPLETED)
                 for future in done:
                     future.result()
+                    row = next(remaining, None)
+                    if row is not None:
+                        successor = executor.submit(run_row, row)
+                        futures.append(successor)
+                        pending.add(successor)
         except BaseException as exc:
             failure = exc
             stop.set()
@@ -942,35 +1354,161 @@ def _run_ready_scans(
         raise failure
 
 
-def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
-    """Start, or resume, a capture batch for ``mode`` until it is captured or a scan fails.
+def _verify_resume(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
+    scope = _scope(batch)
+    marker = _read_marker(
+        batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch["batch_id"])),
+        rt.settings,
+    )
+    if (
+        marker.get("batch_id") != batch["batch_id"]
+        or marker.get("mode") != batch["mode"]
+        or marker.get("scope") != scope
+        or marker.get("plan_stage") != batch["plan_stage"]
+    ):
+        raise DurabilityError("committed capture scope does not match the ledger")
+    planned = sorted(
+        (s for s in rt.ledger.list_scans(batch["batch_id"]) if s["attempt"] == 1),
+        key=lambda s: s["plan_order"],
+    )
+    if marker.get("plan") != [_plan_entry(s) for s in planned]:
+        raise DurabilityError("committed capture plan does not match the ledger")
+    if batch["status"] in {"captured", "loaded"}:
+        expected_latest = {
+            name: scan["scan_id"]
+            for name, scan in _latest_by_name(rt.ledger.list_scans(batch["batch_id"])).items()
+        }
+        if marker.get("status") != "captured" or marker.get("scans") != expected_latest:
+            raise DurabilityError("completed batch marker does not identify its complete attempts")
+    for scan in rt.ledger.list_scans(batch["batch_id"]):
+        directory = scan_dir_for(
+            rt.settings, batch["observation_date"], batch["batch_id"], scan["scan_id"]
+        )
+        pages = rt.ledger.pages_for_scan(scan["scan_id"])
+        scan_path = scan_marker_path(directory)
+        if scan_path.exists() or pages:
+            scan_marker = _read_marker(scan_path, rt.settings)
+            expected = {
+                "scan_id": scan["scan_id"],
+                "batch_id": batch["batch_id"],
+                "scan_name": scan["scan_name"],
+                "attempt": scan["attempt"],
+                "plan_order": scan["plan_order"],
+                "phase": scan.get("phase", 0),
+                "kind": scan["kind"],
+                "endpoint": scan["endpoint"],
+                "record_key": scan["record_key"],
+                "params": json.loads(scan["params_json"]),
+                "input_ids": json.loads(scan["input_ids_json"] or "[]"),
+            }
+            if any(scan_marker.get(k) != v for k, v in expected.items()):
+                raise DurabilityError("committed scan marker differs from its ledger plan")
+            if scan["status"] == "complete" and scan_marker.get("status") != "complete":
+                raise DurabilityError("completed scan marker has inconsistent status")
+        previous_manifest = None
+        for page in pages:
+            manifest = read_manifest(
+                manifest_path(directory, page["seq"]), trusted_root=rt.settings.raw_dir
+            )
+            if manifest is None or not verify_page(
+                directory,
+                manifest,
+                trusted_root=rt.settings.raw_dir,
+                max_body_bytes=rt.settings.capture.max_response_bytes,
+            ):
+                raise DurabilityError("committed capture page is missing or corrupt")
+            validate_page_identity(
+                batch, scan, manifest, seq=page["seq"], previous=previous_manifest
+            )
+            read_page_records(
+                rt.settings,
+                directory,
+                manifest,
+                scan["record_key"],
+                scan=scan,
+                previous=previous_manifest,
+            )
+            previous_manifest = manifest
+            actual = _row_from_manifest(manifest, batch["batch_id"], scan["scan_id"])
+            if any(actual[key] != page[key] for key in actual if key != "ids_hash"):
+                raise DurabilityError("committed capture page differs from its ledger evidence")
+        expected_seq = len(pages) + 1
+        while manifest_path(directory, expected_seq).exists():
+            orphan = read_manifest(
+                manifest_path(directory, expected_seq), trusted_root=rt.settings.raw_dir
+            )
+            if orphan is None or not verify_page(
+                directory,
+                orphan,
+                trusted_root=rt.settings.raw_dir,
+                max_body_bytes=rt.settings.capture.max_response_bytes,
+            ):
+                raise DurabilityError("orphan capture page is corrupt")
+            validate_page_identity(
+                batch, scan, orphan, seq=expected_seq, previous=previous_manifest
+            )
+            read_page_records(
+                rt.settings,
+                directory,
+                orphan,
+                scan["record_key"],
+                scan=scan,
+                previous=previous_manifest,
+            )
+            previous_manifest = orphan
+            expected_seq += 1
+        if scan["status"] == "complete" and (not pages or not pages[-1]["terminal"]):
+            raise DurabilityError("completed scan has no committed terminal page")
 
-    Writes exactly one ``stage_runs`` row (stage ``capture:<mode>``) whether the batch
-    captures, ends short of captured, or raises.
-    """
+
+def run_capture(
+    rt: CaptureRuntime, mode: str, *, market_ids=(), event_ids=(), resume: str | None = None
+) -> CaptureSummary:
+    """Start a deliberate new acquisition, or explicitly resume a verified named batch."""
     started = iso_utc(rt.now())
+    began = time.monotonic()
+    requests_before = rt.client.stats.requests
+    bytes_before = rt.client.stats.downloaded_bytes
     batch_id: str | None = None
     summary: CaptureSummary | None = None
     try:
-        resumable = rt.ledger.find_resumable_batch(mode)
-        if (
-            resumable is not None
-            and mode in ID_RANGE_MODES
-            and _unsafe_to_resume(rt.ledger.list_scans(resumable["batch_id"]))
-        ):
-            reason = "not resumed: its plan is not the current id-range plan"
-            logger.warning("abandoning batch %s: %s", resumable["batch_id"], reason)
-            abandon_batch(rt.ledger, resumable["batch_id"], rt.now(), reason)
-            resumable = None
-        resumed = resumable is not None
-        batch = resumable if resumable is not None else _start_batch(rt, mode)
-        batch_id = batch["batch_id"]
-        # A crash between a stage's plan commit and its batch marker leaves the ledger ahead of
-        # the marker. Rewriting the marker before any scan runs keeps every planned scan in it.
-        _write_batch_marker(rt, batch)
-        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=resumed)
-
-        try:
+        if mode not in {"bootstrap", "daily", "reconcile", "selected"}:
+            raise ValueError("unsupported capture mode")
+        selected_markets, selected_events = _explicit_ids(market_ids), _explicit_ids(event_ids)
+        if mode != "selected" and (selected_markets or selected_events):
+            raise ValueError("explicit IDs require selected mode")
+        if mode == "selected" and resume is None and not (selected_markets or selected_events):
+            raise ValueError("selected mode requires at least one explicit ID")
+        if resume is not None:
+            batch = rt.ledger.get_batch(resume)
+            if (
+                batch is None
+                or batch["mode"] != mode
+                or batch["status"] not in {"capturing", "captured", "loaded"}
+            ):
+                raise ValueError("resume requires an existing batch of the same mode")
+            batch_id = batch["batch_id"]
+            scope = _scope(batch)
+            if (selected_markets and selected_markets != scope["market_ids"]) or (
+                selected_events and selected_events != scope["event_ids"]
+            ):
+                raise ValueError("resume cannot change committed selection")
+            rt.storage = _storage_budget(rt.settings)
+            _recover_controls(rt, batch_id)
+            batch = rt.ledger.get_batch(batch_id)
+            assert batch is not None
+            _verify_resume(rt, batch)
+            summary = CaptureSummary(
+                batch_id,
+                "captured" if batch["status"] in {"captured", "loaded"} else "capturing",
+                True,
+            )
+        else:
+            rt.storage = _storage_budget(rt.settings)
+            batch = _start_batch(rt, mode, selected_markets, selected_events)
+            batch_id = batch["batch_id"]
+            summary = CaptureSummary(batch_id, "capturing", False)
+        if summary.status != "captured":
             while True:
                 progressed = _advance_plan(rt, batch_id)
                 batch = rt.ledger.get_batch(batch_id)
@@ -980,7 +1518,7 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
                 held = _held_closed_windows(listed)
                 runnable = [
                     s
-                    for s in listed
+                    for s in _latest_by_name(listed).values()
                     if s["status"] in {"running", "failed"} and s["scan_id"] not in held
                 ]
                 if runnable:
@@ -992,14 +1530,17 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
                     continue
                 if not progressed:
                     break
-        except Exception as exc:
-            rt.ledger.set_batch_status(
-                batch_id, "capturing", iso_utc(rt.now()), f"{type(exc).__name__}: {exc}"[:500]
-            )
-            raise
-
-        summary.status = _finalise_if_complete(rt, batch_id)
+            summary.status = _finalise_if_complete(rt, batch_id)
     except BaseException as exc:
+        if batch_id is None:
+            candidate = rt.ledger.find_resumable_batch(mode)
+            if candidate is not None and candidate["started_at"] == started:
+                batch_id = candidate["batch_id"]
+        if batch_id is not None:
+            exc.batch_id = batch_id
+            rt.ledger.record_batch_error(
+                batch_id, iso_utc(rt.now()), f"{type(exc).__name__}: {exc}"[:500]
+            )
         _record_capture_stage(
             rt,
             mode=mode,
@@ -1007,14 +1548,24 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
             started=started,
             summary=summary,
             error=f"{type(exc).__name__}: {exc}"[:2000],
+            requests_before=requests_before,
+            bytes_before=bytes_before,
         )
         raise
-
-    error = None
-    if summary.status != "captured":
-        error = f"capture ended with status {summary.status}"
+    assert summary is not None
+    summary.http_attempts = rt.client.stats.requests - requests_before
+    summary.downloaded_bytes = rt.client.stats.downloaded_bytes - bytes_before
+    summary.duration_s = time.monotonic() - began
+    error = None if summary.status == "captured" else f"capture ended with status {summary.status}"
     _record_capture_stage(
-        rt, mode=mode, batch_id=batch_id, started=started, summary=summary, error=error
+        rt,
+        mode=mode,
+        batch_id=batch_id,
+        started=started,
+        summary=summary,
+        error=error,
+        requests_before=requests_before,
+        bytes_before=bytes_before,
     )
     return summary
 
@@ -1038,6 +1589,7 @@ def _planned_row(batch_id: str, entry: dict[str, Any]) -> dict[str, Any]:
         "scan_name": entry["scan_name"],
         "attempt": 1,
         "plan_order": entry["plan_order"],
+        "phase": entry.get("phase", 0),
         "kind": entry["kind"],
         "endpoint": entry["endpoint"],
         "record_key": entry["record_key"],
@@ -1058,8 +1610,18 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
         return counts
     for batch_marker in sorted(settings.raw_dir.glob("*/*/_batch.json")):
         batch_dir = batch_marker.parent
-        meta = json.loads(batch_marker.read_text(encoding="utf-8"))
+        meta = _read_marker(batch_marker, settings)
+        if meta.get("scope", {}).get("revision") != 2:
+            raise DurabilityError("raw recovery requires a supported committed capture scope")
         batch_id = meta["batch_id"]
+        started, mode = parse_batch_id(batch_id)
+        if (
+            batch_id != batch_dir.name
+            or meta["mode"] != mode
+            or meta["observation_date"] != observation_date(started)
+            or batch_dir.parent.name != observation_date(started)
+        ):
+            raise DurabilityError("raw batch marker is outside its declared identity")
         if ledger.get_batch(batch_id) is None:
             ledger.create_batch(
                 batch_id,
@@ -1068,6 +1630,8 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
                 meta["started_at"],
                 meta.get("git_sha"),
                 [],
+                scope=meta["scope"],
+                plan_stage=meta["plan_stage"],
             )
             counts["batches"] += 1
 
@@ -1083,8 +1647,15 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
             marker = scan_dir / "_scan.json"
             if not marker.exists():
                 continue
-            scan_meta = json.loads(marker.read_text(encoding="utf-8"))
+            scan_meta = _read_marker(marker, settings)
             scan_id = scan_meta["scan_id"]
+            if (
+                not re.fullmatch(r"[a-z][a-z0-9_]*", scan_meta["scan_name"])
+                or scan_meta["batch_id"] != batch_id
+                or scan_id != make_scan_id(batch_id, scan_meta["scan_name"], scan_meta["attempt"])
+                or scan_id != scan_dir.name
+            ):
+                raise DurabilityError("raw scan marker is outside its declared identity")
             if ledger.get_scan(scan_id) is None:
                 ledger.add_scan_attempt(
                     {
@@ -1093,6 +1664,7 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
                         "scan_name": scan_meta["scan_name"],
                         "attempt": scan_meta["attempt"],
                         "plan_order": scan_meta["plan_order"],
+                        "phase": scan_meta.get("phase", 0),
                         "kind": scan_meta["kind"],
                         "endpoint": scan_meta["endpoint"],
                         "record_key": scan_meta["record_key"],
@@ -1107,14 +1679,41 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
             known_seqs = {p["seq"] for p in ledger.pages_for_scan(scan_id)}
             seq = 0
             terminal_adopted = False
+            previous_manifest = None
             while True:
                 seq += 1
                 path = manifest_path(scan_dir, seq)
                 if not path.exists():
                     break
-                manifest = read_manifest(path)
-                if manifest is None or not verify_page(scan_dir, manifest):
-                    break
+                manifest = read_manifest(path, trusted_root=settings.raw_dir)
+                if manifest is None or not verify_page(
+                    scan_dir,
+                    manifest,
+                    trusted_root=settings.raw_dir,
+                    max_body_bytes=settings.capture.max_response_bytes,
+                ):
+                    raise DurabilityError("raw recovery encountered a corrupt page")
+                if (
+                    manifest["seq"] != seq
+                    or manifest["batch_id"] != batch_id
+                    or manifest["scan_id"] != scan_id
+                    or manifest["page_id"] != make_page_id(scan_id, seq)
+                ):
+                    raise DurabilityError("raw page manifest is outside its declared identity")
+                recovered_scan = ledger.get_scan(scan_id)
+                assert recovered_scan is not None
+                validate_page_identity(
+                    meta, recovered_scan, manifest, seq=seq, previous=previous_manifest
+                )
+                read_page_records(
+                    settings,
+                    scan_dir,
+                    manifest,
+                    recovered_scan["record_key"],
+                    scan=recovered_scan,
+                    previous=previous_manifest,
+                )
+                previous_manifest = manifest
                 terminal_adopted = bool(manifest["terminal"])
                 if seq in known_seqs:
                     continue
@@ -1130,7 +1729,7 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
             status = scan_meta["status"]
             finished_at, error = scan_meta.get("finished_at"), scan_meta.get("error")
             if status == "complete" and not terminal_adopted:
-                status, finished_at, error = "running", None, None
+                raise DurabilityError("completed raw scan has no terminal page")
             ledger.set_scan_status(scan_id, status, finished_at, error)
 
         _restore_batch_state(ledger, batch_id, meta)
@@ -1140,23 +1739,14 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
 def _restore_batch_state(ledger: Ledger, batch_id: str, meta: dict[str, Any]) -> None:
     """Infer the plan stage from the scans on disk and apply the batch marker's status."""
     scans = ledger.list_scans(batch_id)
-    kinds = {s["kind"] for s in scans}
-    if "single_ids" in kinds:
-        stage = 2
-    elif "keyset_ids" in kinds:
-        stage = 1
-    else:
-        stage = 0
-    # A captured marker is believed only while every latest scan is complete. A scan whose
-    # terminal page is missing runs again, so the batch goes back to capturing with it.
     captured = meta.get("status") == "captured" and _all_complete(
         list(_latest_by_name(scans).values())
     )
-    if captured:
-        stage = 2
+    if meta.get("status") == "captured" and not captured:
+        raise DurabilityError("captured raw batch has incomplete scans")
     status = "captured" if captured else "capturing"
     ledger.restore_batch_state(
-        batch_id, status, stage, meta.get("finished_at") or meta["started_at"]
+        batch_id, status, meta["plan_stage"], meta.get("finished_at") or meta["started_at"]
     )
 
 

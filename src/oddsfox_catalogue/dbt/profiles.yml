@@ -1,0 +1,16 @@
+# Profile used by the local pipeline. The warehouse path comes from the environment so
+# the same project works for the real warehouse and for test warehouses.
+#
+#   CATALOGUE_WAREHOUSE=/abs/path/catalogue.duckdb dbt build --project-dir dbt --profiles-dir dbt
+oddsfox_catalogue:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('CATALOGUE_WAREHOUSE') }}"
+      schema: main
+      threads: "{{ env_var('CATALOGUE_DUCKDB_THREADS', '1') | int }}"
+      settings:
+        memory_limit: "{{ env_var('CATALOGUE_DUCKDB_MEMORY_LIMIT', '2GB') }}"
+        temp_directory: "{{ env_var('CATALOGUE_DUCKDB_TEMP_DIRECTORY') }}"
+        max_temp_directory_size: "{{ env_var('CATALOGUE_DUCKDB_MAX_TEMP_BYTES', '8589934592') }}B"

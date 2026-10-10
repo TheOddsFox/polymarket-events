@@ -2,6 +2,9 @@
 #
 # QueuedRunCoordinator holds runs in a queue and starts at most one at a time, so scheduled
 # daily and weekly runs can never overlap, even when a manual run is also requested.
+telemetry:
+  enabled: false
+
 run_coordinator:
   module: dagster._core.run_coordinator.queued_run_coordinator
   class: QueuedRunCoordinator

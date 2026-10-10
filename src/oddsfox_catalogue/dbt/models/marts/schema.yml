@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: mart_event_catalogue
+    description: Published event catalogue. Current state only.
+    columns:
+      - name: event_id
+        tests: [not_null]
+      - name: market_count
+        tests: [not_null]
+    tests:
+      - unique:
+          arguments:
+            column_name: "venue || '|' || event_id"
+
+  - name: catalogue_snapshots
+    description: Headline counts per dbt invocation. Used by the regression test.
+    columns:
+      - name: snapshot_id
+        tests: [not_null]

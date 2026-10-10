@@ -15,10 +15,18 @@ unit-testable. Rules:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
-from oddsfox_catalogue.ids import observation_id, payload_hash, sha256_text
+from oddsfox_catalogue.ids import iso_utc, observation_id, payload_hash, sha256_text
+from oddsfox_catalogue.normalization import (
+    ID_RE,
+    NormalizationError,
+    exact_json,
+    normalize_event,
+    normalize_market,
+    parse_timestamp,
+)
 
 VENUE = "polymarket"
 SOURCE_EVENT_EMBEDDED = "event_embedded"
@@ -36,6 +44,7 @@ class PageContext:
     endpoint: str
     observed_at: datetime
     record_key: str
+    body_sha256: str | None = None
 
 
 @dataclass
@@ -48,22 +57,6 @@ class RowSet:
         self.events.extend(other.events)
         self.markets.extend(other.markets)
         self.quarantine.extend(other.quarantine)
-
-
-def parse_timestamp(value: Any) -> datetime | None:
-    """Parse an ISO-8601 timestamp to aware UTC. Unparseable or missing values give None."""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def _quarantine_id(page_id: str, pointer: str) -> str:
@@ -86,7 +79,7 @@ def _quarantine(
         "json_pointer": pointer,
         "reason": reason,
         "observed_at": ctx.observed_at,
-        "payload": payload,
+        "payload": exact_json(payload),
     }
 
 
@@ -106,7 +99,7 @@ def _envelope(
         "source_updated_at": parse_timestamp(record.get("updatedAt")),
         "endpoint": ctx.endpoint,
         "payload_hash": payload_hash(record),
-        "payload": record,
+        "payload": exact_json(record),
     }
 
 
@@ -115,6 +108,8 @@ def _check_record(record: Any) -> str | None:
         return "record is not an object"
     if record.get("id") in (None, ""):
         return "record has no id"
+    if not ID_RE.fullmatch(str(record["id"])):
+        return "record has an invalid id"
     return None
 
 
@@ -124,6 +119,7 @@ def _market_rows(
     pointer: str,
     source_kind: str,
     out: RowSet,
+    enclosing_event_id: str | None = None,
 ) -> None:
     problem = _check_record(market)
     if problem:
@@ -132,6 +128,20 @@ def _market_rows(
     row = _envelope(ctx, market, pointer, str(market["id"]))
     row["source_kind"] = source_kind
     row["json_pointer"] = pointer
+    provenance = {
+        "observation_id": row["observation_id"],
+        "page_id": ctx.page_id,
+        "capture_id": ctx.batch_id,
+        "received_at": iso_utc(ctx.observed_at),
+        "source_kind": source_kind,
+        "json_pointer": pointer,
+        "payload_sha256": ctx.body_sha256 or row["payload_hash"],
+    }
+    try:
+        row["normalized"] = normalize_market(market, provenance, enclosing_event_id)
+    except NormalizationError as exc:
+        out.quarantine.append(_quarantine(ctx, "market", pointer, str(exc), market))
+        return
     out.markets.append(row)
 
 
@@ -139,6 +149,8 @@ def rows_for_page(
     ctx: PageContext,
     records: list[Any],
     fetch_failed: list[Any] | None = None,
+    *,
+    scope: dict[str, Any] | None = None,
 ) -> RowSet:
     """Envelope rows for every record on one page. Records are already envelope-checked.
 
@@ -146,7 +158,32 @@ def rows_for_page(
     quarantine rows with reason ``fetch_failed`` and count toward the load gate.
     """
     out = RowSet()
+
+    def selected(record: Any, entity: str) -> bool:
+        if scope is None:
+            return True
+        if not isinstance(record, dict):
+            return scope["kind"] != "selected"
+        value = str(record.get("id", ""))
+        if scope["kind"] == "selected":
+            allowed = set(
+                scope["market_ids"]
+                if entity == "markets"
+                else scope["event_ids"] + scope["parent_event_ids"]
+            )
+            return value in allowed
+        mark = scope["high_water"].get(entity)
+        if mark is None or not value.isascii() or not value.isdecimal():
+            return True
+        if value in scope["baseline"][entity] or (
+            entity == "events" and value in scope["parent_event_ids"]
+        ):
+            return True
+        return int(value) <= mark
+
     for index, record in enumerate(records):
+        if not selected(record, ctx.record_key):
+            continue
         if ctx.record_key == "markets":
             _market_rows(ctx, record, f"/markets/{index}", SOURCE_MARKET_DIRECT, out)
             continue
@@ -156,23 +193,34 @@ def rows_for_page(
         if problem:
             out.quarantine.append(_quarantine(ctx, "event", pointer, problem, record))
             continue
-        out.events.append(_envelope(ctx, record, pointer, str(record["id"])))
+        event_row = _envelope(ctx, record, pointer, str(record["id"]))
+        try:
+            event_row["normalized"] = normalize_event(record)
+        except NormalizationError as exc:
+            out.quarantine.append(_quarantine(ctx, "event", pointer, str(exc), record))
+            continue
+        out.events.append(event_row)
 
         nested = record.get("markets", [])
         if nested is None:
             continue
         if not isinstance(nested, list):
+            if scope is not None and scope["kind"] == "selected":
+                continue
             out.quarantine.append(
                 _quarantine(ctx, "market", f"{pointer}/markets", "markets is not a list", nested)
             )
             continue
         for market_index, market in enumerate(nested):
+            if not selected(market, "markets"):
+                continue
             _market_rows(
                 ctx,
                 market,
                 f"{pointer}/markets/{market_index}",
                 SOURCE_EVENT_EMBEDDED,
                 out,
+                str(record["id"]),
             )
     entity = "market" if ctx.record_key == "markets" else "event"
     for index, failed in enumerate(fetch_failed or []):
