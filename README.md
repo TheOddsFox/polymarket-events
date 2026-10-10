@@ -149,3 +149,67 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
 
 Every test runs against synthetic fixtures and never calls the live Gamma API. Run
 `tools/record_gamma_fixtures.py` from a machine with access to refresh the optional live samples.
+
+## Targeted metadata handoffs
+
+The independent market-data and Polygon collectors consume
+`oddsfox.polymarket.metadata.v1`. These commands select at most 100 explicit Gamma
+market IDs and write a new immutable directory:
+
+```sh
+catalogue metadata refresh --market-id 123 --market-id 456 --output data/metadata/bundles/run-1
+catalogue metadata export --market-id 123 --market-id 456 --output data/metadata/bundles/offline-1
+```
+
+`refresh` requests only `/markets/<id>`, stores checksummed JSON.gz pages under
+`data/metadata/raw`, and indexes request outcomes in the existing SQLite ledger.
+`export` makes no requests and uses verified local raw observations. Neither
+command loads bronze, builds dbt, changes the six existing exports, or updates the
+global `current.json`. Set `CATALOGUE_ROOT` to the catalogue checkout when invoking
+the installed executable from elsewhere. The normal catalogue writer lock applies.
+
+The bundle contains JSON-array relations `markets.json`, `outcomes.json`,
+`memberships.json`, `identity_history.json`, and `coverage.json`. Its `manifest.json`
+declares the contract, targeted coverage, content-derived `source_release_id`,
+receipt time and each literal filename's SHA-256 and byte size. Decimal values are
+strings. Consumers pin the manifest digest and copy the bundle before acquisition;
+the producer's path is not a durable downstream dependency.
+
+Identity projection does not require prices. Outcome ordinals remain 1-based;
+`chain_index_set` remains null until a chain collector establishes it independently.
+CTF token IDs and Protocol V2 position IDs are separate fields. Explicit `v2`/`2`
+metadata selects `positionIds`; missing/v1 metadata selects CTF IDs only when no
+positions are present. Unknown versions, duplicate/misaligned IDs and conflicting
+owners are unusable, with `identity_error` evidence. Metadata protocol names do not
+establish an exchange ABI. Equal IDs in different asset kinds are distinct.
+
+Direct market observations outrank event-embedded summaries; ties use receipt time
+and observation ID. Selection takes the entire observation, preserving nulls. An
+explicit empty `events` array removes memberships; an absent field can use recorded
+enclosing event identity. History records observations and receipts, never invented
+historical validity intervals. URLs in descriptions remain plain source text.
+
+Coverage distinguishes `found`, source-confirmed `absent` (404), and `failed`.
+An unobserved market in offline export is `failed/no_observation`, not absent. A
+fresh refresh never fills a failed/absent lookup with stale metadata. CLI stdout
+reports the bundle path, release ID, manifest SHA-256, requested/found/absent/failed
+counts, `http_attempts` and `downloaded_bytes`; any failed ID returns exit 2 with
+those metrics. Input/busy/contract failures return exit 3.
+Identity quarantine is inspectable in a successful handoff and consumers must
+reject unusable targets.
+
+Targeted refresh permits only the Gamma HTTPS host or an explicit loopback test
+server, disables ambient HTTP credentials/proxies and redirects, bounds each
+response to 8 MiB, rejects compressed responses before decoding, and allows at
+most four retries per selected ID. Immutable bundles are capped at 128 MiB;
+`--max-output-bytes` and refresh-only `--max-response-bytes` can lower those limits.
+Refresh also defaults to `--max-requests 500` and
+`--max-download-bytes 134217728`. These cumulative budgets count retries, HTTP
+error bodies and partial downloads. The chunk crossing a byte limit is counted
+before aborting, so actual download metrics can exceed the limit by that received
+chunk. Zero allowance fails selected lookups without HTTP. Delegating collectors
+pass their remaining invocation allowance and debit the returned metrics.
+
+The handoff does not promise automatic whole-catalogue discovery or membership
+refresh beyond selected records. Retain raw evidence and consumer copies for
+offline replay.

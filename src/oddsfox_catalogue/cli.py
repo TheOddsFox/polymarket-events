@@ -29,8 +29,9 @@ from oddsfox_catalogue.capture.runner import (
 )
 from oddsfox_catalogue.config import Settings, load_settings, settings_as_dict
 from oddsfox_catalogue.gamma.http import GammaClient
-from oddsfox_catalogue.ids import MODES
+from oddsfox_catalogue.ids import MODES, sha256_bytes
 from oddsfox_catalogue.load.runner import LoadBlocked
+from oddsfox_catalogue.metadata import MetadataError, export_metadata, refresh_metadata
 from oddsfox_catalogue.pipeline import dbt_stage, load_stage, publish_stage, refresh
 from oddsfox_catalogue.publish import PublishBlocked, current_release
 from oddsfox_catalogue.rebuild import rebuild_and_verify
@@ -273,6 +274,38 @@ def _cmd_status(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_metadata(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    with run_lock(settings.run_lock_path):
+        function = refresh_metadata if args.metadata_command == "refresh" else export_metadata
+        options = {"max_output_bytes": args.max_output_bytes}
+        if args.metadata_command == "refresh":
+            options["max_body_bytes"] = args.max_response_bytes
+            options["max_requests"] = args.max_requests
+            options["max_download_bytes"] = args.max_download_bytes
+        manifest = function(settings, args.market_id, args.output, **options)
+    coverage = json.loads((args.output / "coverage.json").read_text())
+    counts = {
+        status: sum(row["status"] == status for row in coverage)
+        for status in ("found", "absent", "failed")
+    }
+    print(
+        json.dumps(
+            {
+                "source_release_id": manifest["source_release_id"],
+                "manifest_sha256": sha256_bytes((args.output / "manifest.json").read_bytes()),
+                "path": str(args.output),
+                "requested": len(coverage),
+                "http_attempts": manifest.get("http_attempts", 0),
+                "downloaded_bytes": manifest.get("downloaded_bytes", 0),
+                **counts,
+            },
+            indent=2,
+        )
+    )
+    return 2 if counts["failed"] else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="catalogue", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -303,6 +336,31 @@ def build_parser() -> argparse.ArgumentParser:
     abandon.set_defaults(handler=_cmd_batch_abandon)
 
     sub.add_parser("status", help="list batches and their states").set_defaults(handler=_cmd_status)
+
+    metadata = sub.add_parser("metadata", help="targeted immutable metadata handoffs")
+    metadata_sub = metadata.add_subparsers(dest="metadata_command", required=True)
+    for operation in ("refresh", "export"):
+        command = metadata_sub.add_parser(
+            operation,
+            help="fetch selected markets"
+            if operation == "refresh"
+            else "export from local evidence without network",
+        )
+        command.add_argument(
+            "--market-id",
+            action="append",
+            required=True,
+            help="explicit Gamma market ID; repeat for more",
+        )
+        command.add_argument(
+            "--output", type=Path, required=True, help="new immutable bundle directory"
+        )
+        command.add_argument("--max-output-bytes", type=int, default=128 * 1024**2)
+        if operation == "refresh":
+            command.add_argument("--max-response-bytes", type=int, default=8 * 1024**2)
+            command.add_argument("--max-requests", type=int, default=500)
+            command.add_argument("--max-download-bytes", type=int, default=128 * 1024**2)
+        command.set_defaults(handler=_cmd_metadata)
 
     load = sub.add_parser("load", help="load captured pages into bronze (idempotent)")
     load.add_argument("--batch-id", default=None, help="load only this batch")
@@ -365,7 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # This covers a signal during argument parsing as well as during a stage.
             print(f"error: terminated by {exc}", file=sys.stderr)
             return 128 + exc.signum
-        except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked) as exc:
+        except (RunBusy, PublishBlocked, BaselineMissing, LoadBlocked, MetadataError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 3
     finally:

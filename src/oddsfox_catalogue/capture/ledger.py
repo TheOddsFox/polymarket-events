@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS quarantine (
     reason           TEXT NOT NULL,
     recorded_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS metadata_requests (
+    capture_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    manifest_path TEXT,
+    error TEXT,
+    PRIMARY KEY (capture_id, market_id)
+);
 """
 
 
@@ -404,6 +414,16 @@ class Ledger:
     def quarantine_count(self, batch_id: str) -> int:
         row = self._one("SELECT COUNT(*) AS n FROM quarantine WHERE batch_id = ?", (batch_id,))
         return int(row["n"]) if row else 0
+
+    def record_metadata_request(self, record: Mapping[str, Any]) -> None:
+        """Index targeted captures without adding them to the catalogue batch plan."""
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO metadata_requests "
+                "(capture_id, market_id, status, received_at, manifest_path, error) "
+                "VALUES (:capture_id, :market_id, :status, :received_at, :manifest_path, :error)",
+                record,
+            )
 
 
 def _insert_scans(conn: sqlite3.Connection, scans: list[dict[str, Any]]) -> None:

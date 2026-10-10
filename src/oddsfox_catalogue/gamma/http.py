@@ -50,6 +50,10 @@ class CaptureStopped(GammaError):
     """The worker pool was asked to drain. The scan stays running for resume."""
 
 
+class RequestBudgetExceeded(GammaError):
+    """An invocation exhausted its shared request or download allowance."""
+
+
 @dataclass(frozen=True)
 class Response:
     endpoint: str
@@ -177,6 +181,7 @@ def encode_params(params: Mapping[str, Any]) -> dict[str, Any]:
 @dataclass
 class RequestStats:
     requests: int = 0
+    downloaded_bytes: int = 0
     retries: int = 0
     rate_limited: int = 0
     server_errors: int = 0
@@ -187,6 +192,7 @@ class RequestStats:
     def as_dict(self) -> dict[str, float | int]:
         return {
             "requests": self.requests,
+            "downloaded_bytes": self.downloaded_bytes,
             "retries": self.retries,
             "rate_limited": self.rate_limited,
             "server_errors": self.server_errors,
@@ -211,6 +217,10 @@ class GammaClient:
         limiter: TokenBucket | None = None,
         stats: RequestStats | None = None,
         stats_lock: threading.Lock | None = None,
+        max_body_bytes: int | None = None,
+        max_requests: int | None = None,
+        max_download_bytes: int | None = None,
+        trust_env: bool = True,
     ) -> None:
         self._settings = settings
         self._now = now
@@ -218,6 +228,18 @@ class GammaClient:
         self._clock = clock
         self._rng = rng or random.Random()
         self._transport = transport
+        self._max_body_bytes = max_body_bytes
+        for name, limit in (
+            ("max_requests", max_requests),
+            ("max_download_bytes", max_download_bytes),
+        ):
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+            ):
+                raise ValueError(f"{name} must be a nonnegative integer")
+        self._max_requests = max_requests
+        self._max_download_bytes = max_download_bytes
+        self._trust_env = trust_env
         self._limiter = limiter or TokenBucket(
             settings.requests_per_second, clock=clock, sleep=sleep
         )
@@ -235,6 +257,7 @@ class GammaClient:
             transport=transport,
             limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
             follow_redirects=False,
+            trust_env=trust_env,
         )
 
     def close(self) -> None:
@@ -264,12 +287,39 @@ class GammaClient:
             limiter=self._limiter,
             stats=self.stats,
             stats_lock=self._stats_lock,
+            max_body_bytes=self._max_body_bytes,
+            max_requests=self._max_requests,
+            max_download_bytes=self._max_download_bytes,
+            trust_env=self._trust_env,
         )
 
     def _add(self, **amounts: float) -> None:
         with self._stats_lock:
             for name, amount in amounts.items():
                 setattr(self.stats, name, getattr(self.stats, name) + amount)
+
+    def _check_budget_locked(self) -> None:
+        if self._max_requests is not None and self.stats.requests >= self._max_requests:
+            raise RequestBudgetExceeded("Gamma request allowance exhausted")
+        if (
+            self._max_download_bytes is not None
+            and self.stats.downloaded_bytes >= self._max_download_bytes
+        ):
+            raise RequestBudgetExceeded("Gamma download allowance exhausted")
+
+    def _reserve_request(self) -> None:
+        with self._stats_lock:
+            self._check_budget_locked()
+            self.stats.requests += 1
+
+    def _count_download(self, size: int) -> None:
+        with self._stats_lock:
+            self.stats.downloaded_bytes += size
+            if (
+                self._max_download_bytes is not None
+                and self.stats.downloaded_bytes > self._max_download_bytes
+            ):
+                raise RequestBudgetExceeded("Gamma download allowance exceeded")
 
     def get(
         self,
@@ -289,11 +339,42 @@ class GammaClient:
         backoff_cap = self._settings.backoff_cap_s if backoff_cap_s is None else backoff_cap_s
         retries = 0
         while True:
+            with self._stats_lock:
+                self._check_budget_locked()
             self._limiter.acquire()
             started = self._clock()
-            self._add(requests=1)
+            self._reserve_request()
             try:
-                raw = self._client.get(endpoint, params=clean)
+                if self._max_body_bytes is None and self._max_download_bytes is None:
+                    raw = self._client.get(endpoint, params=clean)
+                    self._count_download(len(raw.content))
+                else:
+                    with self._client.stream(
+                        "GET", endpoint, params=clean, headers={"Accept-Encoding": "identity"}
+                    ) as streamed:
+                        if (
+                            streamed.headers.get("content-encoding", "identity").lower()
+                            != "identity"
+                        ):
+                            raise MalformedResponse(f"{endpoint}: compressed response forbidden")
+                        chunks = bytearray()
+                        for chunk in streamed.iter_bytes():
+                            self._count_download(len(chunk))
+                            if (
+                                self._max_body_bytes is not None
+                                and len(chunks) + len(chunk) > self._max_body_bytes
+                            ):
+                                raise MalformedResponse(f"{endpoint}: response exceeds byte limit")
+                            chunks.extend(chunk)
+                        raw = httpx.Response(
+                            streamed.status_code,
+                            headers={
+                                key: value
+                                for key, value in streamed.headers.items()
+                                if key.lower() not in {"content-encoding", "content-length"}
+                            },
+                            content=bytes(chunks),
+                        )
             except (httpx.TransportError, httpx.DecodingError) as exc:
                 # A body that will not decode is a failed request, as a dropped connection is.
                 self._add(transport_errors=1)

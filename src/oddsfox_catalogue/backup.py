@@ -5,6 +5,7 @@ A backup holds everything needed to rebuild the catalogue without Gamma:
 - ``ledger.sqlite``: the capture ledger, copied with SQLite's online backup API.
 - ``catalogue.duckdb``: the warehouse, checkpointed first so the file is complete.
 - ``raw/``: immutable raw pages and manifests (copied, never rewritten).
+- ``metadata/``: targeted metadata captures and repo-local handoff bundles.
 - ``published/``: releases and the ``current.json`` pointer.
 - ``dlt_pipelines/``: dlt state, so loads resume where they stopped.
 - ``backup.json``: SHA-256 and size of every file above, plus the git SHA it was taken at.
@@ -86,6 +87,7 @@ def create_backup(
         _checkpoint_warehouse(settings.warehouse_path)
         shutil.copy2(settings.warehouse_path, dest / "catalogue.duckdb")
     _copy_tree(settings.raw_dir, dest / "raw")
+    _copy_tree(settings.data_dir / "metadata", dest / "metadata")
     _copy_tree(settings.published_dir, dest / "published")
     _copy_tree(settings.dlt_pipelines_dir, dest / "dlt_pipelines")
 

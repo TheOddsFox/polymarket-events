@@ -4,4 +4,4 @@ cd "$(dirname "$0")/.."
 git diff --check
 env UV_LINK_MODE=copy uv run --locked ruff check .
 env UV_LINK_MODE=copy uv run --locked ruff format --check .
-env UV_LINK_MODE=copy CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9 uv run --locked pytest -q -n auto --dist loadscope
+env UV_LINK_MODE=copy CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9 uv run --locked pytest -q
