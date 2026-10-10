@@ -243,6 +243,100 @@ def test_a_stage_one_chunk_with_a_rejected_id_is_split_and_captured(tmp_path: Pa
         runtime.ledger.close()
 
 
+def test_a_single_id_chunk_resumed_after_its_first_page_requests_the_rest(tmp_path: Path) -> None:
+    """Only a chunk's last page is terminal. A resume after page one fetches the other ids."""
+    fake = FakeGamma(_world_with_ghost_references(3))
+    fake.raise_on("/events/990001", RuntimeError("injected failure"))
+    runtime, _ = build_runtime(tmp_path, fake, env=SERIAL)
+    try:
+        with pytest.raises(RuntimeError):
+            run_capture(runtime, "bootstrap")
+        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
+        scan = runtime.ledger.latest_attempt(batch_id, "events_by_id_single_0001")
+        assert scan["status"] == "failed"
+        assert [page["terminal"] for page in runtime.ledger.pages_for_scan(scan["scan_id"])] == [0]
+    finally:
+        runtime.ledger.close()
+
+    resumed_runtime, _ = build_runtime(
+        tmp_path, FakeGamma(_world_with_ghost_references(3)), env=SERIAL
+    )
+    try:
+        summary = run_capture(resumed_runtime, "bootstrap")
+        assert summary.status == "captured"
+        scan = resumed_runtime.ledger.latest_attempt(batch_id, "events_by_id_single_0001")
+        pages = resumed_runtime.ledger.pages_for_scan(scan["scan_id"])
+        assert [page["terminal"] for page in pages] == [0, 0, 1]
+    finally:
+        resumed_runtime.ledger.close()
+
+
+def test_a_marker_that_missed_a_planned_chunk_is_repaired_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between a stage's plan commit and its batch marker must not lose a planned chunk.
+
+    The ledger commits both stage-one chunks, and the crash stops the marker write. The first
+    chunk then runs, so its scan markers land. Resume rewrites the marker before any scan runs,
+    so a rebuild after a lost ledger still restores the second chunk.
+    """
+
+    def make_world() -> World:
+        return _world_with_ghost_references(101)
+
+    clean_names, clean_pages = _clean_run(tmp_path / "clean", make_world)
+    root = tmp_path / "crash"
+    runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
+    real_write = runner._write_batch_marker
+
+    def crash_before_the_stage_one_marker(rt, batch, **fields):
+        kinds = {scan["kind"] for scan in rt.ledger.list_scans(batch["batch_id"])}
+        if not fields and "keyset_ids" in kinds:
+            raise SystemExit("simulated crash between the plan commit and the batch marker")
+        real_write(rt, batch, **fields)
+
+    monkeypatch.setattr(runner, "_write_batch_marker", crash_before_the_stage_one_marker)
+    try:
+        with pytest.raises(SystemExit):
+            run_capture(runtime, "bootstrap")
+        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
+    finally:
+        runtime.ledger.close()
+    monkeypatch.undo()
+
+    real_run_scan = runner._run_scan
+
+    def crash_after_the_first_chunk(rt, batch, row, *args, **kwargs):
+        real_run_scan(rt, batch, row, *args, **kwargs)
+        if row["scan_name"] == "events_by_id_0001":
+            raise SystemExit("simulated crash after the first chunk")
+
+    monkeypatch.setattr(runner, "_run_scan", crash_after_the_first_chunk)
+    resumed_runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
+    try:
+        with pytest.raises(SystemExit):
+            run_capture(resumed_runtime, "bootstrap")
+    finally:
+        resumed_runtime.ledger.close()
+    monkeypatch.undo()
+
+    fresh = _lose_ledger(root)
+    try:
+        rebuild_from_raw(resumed_runtime.settings, fresh)
+        assert {"events_by_id_0001", "events_by_id_0002"} <= _scan_names(fresh, batch_id)
+    finally:
+        fresh.close()
+
+    final_runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
+    try:
+        summary = run_capture(final_runtime, "bootstrap")
+        assert summary.status == "captured"
+        assert _scan_names(final_runtime.ledger, summary.batch_id) == clean_names
+        assert _page_fingerprints(final_runtime.ledger, summary.batch_id) == clean_pages
+    finally:
+        final_runtime.ledger.close()
+
+
 def test_a_complete_marker_without_its_terminal_page_runs_again(tmp_path: Path) -> None:
     """A scan marked complete is trusted only with its terminal page. Without it, the scan resumes."""
     clean_names, clean_pages = _clean_run(tmp_path / "clean")
@@ -973,10 +1067,10 @@ def test_a_single_event_that_keeps_failing_is_quarantined(tmp_path: Path) -> Non
     assert failed == ["999999"]
 
 
-def test_a_non_terminated_error_during_shutdown_still_reopens_unstarted_scans(
+def test_a_shutdown_interrupt_does_not_skip_cleanup_or_replace_the_first_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cleanup still runs when shutdown raises something other than Terminated."""
+    """After a broken pool, an interrupt in shutdown is logged, and cleanup still runs."""
     runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
     batch_id = "20261008T080000Z-bootstrap"
     stamp = "2026-10-08T08:00:00Z"
@@ -1006,6 +1100,50 @@ def test_a_non_terminated_error_during_shutdown_still_reopens_unstarted_scans(
         monkeypatch.setattr(runtime.client, "spawn", no_worker_client)
         monkeypatch.setattr(ThreadPoolExecutor, "shutdown", interrupted_shutdown)
         summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=True)
+        # Catch any BaseException, so an escaped interrupt fails the assertion and not the session.
+        with pytest.raises(BaseException) as raised:
+            _run_ready_scans(
+                runtime,
+                runtime.ledger.get_batch(batch_id),
+                runtime.ledger.list_scans(batch_id),
+                summary,
+            )
+        assert isinstance(raised.value, BrokenThreadPool)
+
+        statuses = [scan["status"] for scan in runtime.ledger.list_scans(batch_id)]
+        assert statuses == ["running", "running"]
+        assert shutdowns["n"] >= 2
+    finally:
+        runtime.ledger.close()
+
+
+def test_an_interrupt_during_shutdown_is_raised_when_nothing_failed_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no earlier failure, an interrupt in shutdown is raised once the drain has finished."""
+    runtime, _ = build_runtime(tmp_path, FakeGamma(demo_world()), env=SERIAL)
+    batch_id = "20261008T070000Z-bootstrap"
+    stamp = "2026-10-08T07:00:00Z"
+    try:
+        rows = [
+            _scan_row(
+                batch_id, id_chunk_scan(index, ["1"]), attempt=1, plan_order=index, started_at=stamp
+            )
+            for index in (1, 2)
+        ]
+        runtime.ledger.create_batch(batch_id, "bootstrap", "2026-10-08", stamp, None, rows)
+
+        real_shutdown = ThreadPoolExecutor.shutdown
+        shutdowns = {"n": 0}
+
+        def interrupted_shutdown(self, wait=True, *, cancel_futures=False):
+            shutdowns["n"] += 1
+            real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
+            if shutdowns["n"] == 1:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(ThreadPoolExecutor, "shutdown", interrupted_shutdown)
+        summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=False)
         with pytest.raises(KeyboardInterrupt):
             _run_ready_scans(
                 runtime,
@@ -1014,7 +1152,9 @@ def test_a_non_terminated_error_during_shutdown_still_reopens_unstarted_scans(
                 summary,
             )
 
+        # The drain finished before the interrupt was raised, so every scan reached a terminal state.
         statuses = [scan["status"] for scan in runtime.ledger.list_scans(batch_id)]
-        assert statuses == ["running", "running"]
+        assert statuses == ["complete", "complete"]
+        assert shutdowns["n"] >= 2
     finally:
         runtime.ledger.close()

@@ -465,11 +465,15 @@ def id_list_pages(
     )
 
 
-def single_event_page(client: GammaClient, event_id: str, seq: int) -> PageResult:
-    """Fetch ``/events/{id}``. A 404 is a terminal, empty page. A failing id is quarantined.
+def single_event_page(
+    client: GammaClient, event_id: str, seq: int, *, terminal: bool = True
+) -> PageResult:
+    """Fetch ``/events/{id}``. A 404 is an empty page. A failing id is quarantined.
 
     Retries use the id-window policy, so a bad id cannot stall the batch on the global
     retry budget. An id that still fails becomes a ``fetch_failed`` body, as a window does.
+    ``terminal`` is true only for the last id of a chunk, so a resume after an earlier page
+    still fetches the rest.
     """
     if not event_id.isdigit():
         raise ValueError(f"event ids are numeric: {event_id!r}")
@@ -502,6 +506,6 @@ def single_event_page(client: GammaClient, event_id: str, seq: int) -> PageResul
         output_offset=None,
         records=records,
         response=response,
-        terminal=True,
+        terminal=terminal,
         ids_hash=ids_hash(_ids(records)),
     )

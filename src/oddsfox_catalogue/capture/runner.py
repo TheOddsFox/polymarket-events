@@ -496,8 +496,9 @@ def _iterate(rt: CaptureRuntime, spec: ScanSpec, start: PageState) -> Iterator[P
 
 
 def _single_iter(client: GammaClient, ids: list[str], done: int) -> Iterator[PageResult]:
+    last = len(ids) - 1
     for index in range(done, len(ids)):
-        yield single_event_page(client, ids[index], seq=index + 1)
+        yield single_event_page(client, ids[index], seq=index + 1, terminal=index == last)
 
 
 def _state_from_row(rt: CaptureRuntime, scan: dict[str, Any]) -> PageState:
@@ -854,12 +855,13 @@ def _run_ready_scans(
 ) -> None:
     """Run every runnable scan in this stage, up to ``capture.workers`` at once.
 
-    A failure or a signal sets the stop event. Scans that have not started are
-    left ``running`` and are not fetched, and a previously failed scan the pool
-    never started is reopened as ``running``. A scan already on a page finishes
-    that page, then returns still ``running`` so resume continues it. The scan
-    that raised is marked failed by ``_run_scan``. The drain waits for every
-    worker, even if more signals arrive, and then re-raises the first signal.
+    A failure or a stop signal sets the stop event. Scans that have not started are left
+    ``running`` and are not fetched, and a previously failed scan the pool never started is
+    reopened as ``running``. A scan on a page finishes that page, unless it is waiting out a
+    rate-limit pause, which it abandons. Either way it returns still ``running`` so resume
+    continues it. The scan that raised is marked failed by ``_run_scan``. The drain waits for
+    every worker, even if more signals or interrupts arrive, and then raises the first failure.
+    A signal recorded in the hold is raised only when nothing else failed.
     """
     stop = threading.Event()
     worker_count = min(rt.settings.capture.workers, len(rows))
@@ -880,63 +882,62 @@ def _run_ready_scans(
             started.add(row["scan_id"])
         _run_scan(_runtime_for(rt, local.client), batch, row, summary, stop)
 
-    rt.client._limiter.bind_stop(stop)
-    executor = ThreadPoolExecutor(
-        max_workers=worker_count, thread_name_prefix="capture", initializer=init_worker
-    )
-    futures = []
-    body_signal: BaseException | None = None
-    try:
-        futures = [executor.submit(run_row, row) for row in rows]
-        pending = set(futures)
-        while pending:
-            done, pending = wait(pending, timeout=POOL_POLL_S, return_when=FIRST_COMPLETED)
-            for future in done:
-                future.result()
-    except BaseException as exc:
-        # Record the signal first, so no later statement in this handler can lose it.
-        if not isinstance(exc, Exception):
-            body_signal = exc
-        stop.set()
-        for future in futures:
-            future.cancel()
-        raise
-    finally:
-        # The drain and the cleanup run under a signal hold: a signal is recorded, not raised.
-        # Releasing the ledger or the run lock while a worker still runs would let a second run
-        # write beside it, so the join keeps going whatever arrives. The first signal, even one
-        # raised above, is re-raised once the drain and the cleanup are both complete.
-        with SIGNALS.hold() as held:
-            interrupted: BaseException | None = body_signal
-            try:
-                while True:
-                    try:
-                        executor.shutdown(wait=True, cancel_futures=True)
-                        break
-                    except BaseException as exc:
-                        stop.set()
-                        if interrupted is None:
-                            interrupted = exc
-            finally:
-                rt.client._limiter.bind_stop(None)
-                for client in spawned:
-                    try:
-                        client.close()
-                    except Exception:
-                        # A failing close must not skip the other clients or the reopen below.
-                        logger.warning("closing a capture worker client failed", exc_info=True)
-                with started_lock:
-                    ran = set(started)
+    # The hold covers the whole pool, from before the first worker starts. A signal is then
+    # recorded and never raised inside the pool's own bookkeeping. The wait loop raises the
+    # recorded signal at its next tick, so the drain and the cleanup always run to the end.
+    failure: BaseException | None = None
+    with SIGNALS.hold() as held:
+        executor = ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="capture", initializer=init_worker
+        )
+        futures = []
+        try:
+            rt.client._limiter.bind_stop(stop)
+            futures = [executor.submit(run_row, row) for row in rows]
+            pending = set(futures)
+            while pending:
+                if SIGNALS.pending is not None:
+                    raise Terminated(SIGNALS.pending)
+                done, pending = wait(pending, timeout=POOL_POLL_S, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+        except BaseException as exc:
+            failure = exc
+            stop.set()
+            for future in futures:
+                future.cancel()
+        finally:
+            stop.set()
+            # A ledger or run lock released while a worker still runs would let a second run
+            # write beside it, so the join goes on whatever arrives in the meantime.
+            while True:
                 try:
-                    _reopen_unstarted(rt, rows, ran)
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    break
+                except BaseException as exc:
+                    # Only an interrupt that bypasses the hold (Ctrl-C) gets here. The join goes
+                    # on. The first failure stays the one raised, so a later interrupt is logged.
+                    if failure is None:
+                        failure = exc
+                    else:
+                        logger.warning("interrupted while capture workers stopped", exc_info=exc)
+            rt.client._limiter.bind_stop(None)
+            with started_lock:
+                ran = set(started)
+            try:
+                _reopen_unstarted(rt, rows, ran)
+            except Exception:
+                logger.warning("reopening unstarted scans failed; resume runs them", exc_info=True)
+            for client in spawned:
+                try:
+                    client.close()
                 except Exception:
-                    logger.warning(
-                        "reopening unstarted scans failed; resume runs them", exc_info=True
-                    )
-        if interrupted is None and held.signum is not None:
-            interrupted = Terminated(held.signum)
-        if interrupted is not None:
-            raise interrupted
+                    # A failing close must not skip the other clients.
+                    logger.warning("closing a capture worker client failed", exc_info=True)
+    if failure is None and held.signum is not None:
+        failure = Terminated(held.signum)
+    if failure is not None:
+        raise failure
 
 
 def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
@@ -962,6 +963,9 @@ def run_capture(rt: CaptureRuntime, mode: str) -> CaptureSummary:
         resumed = resumable is not None
         batch = resumable if resumable is not None else _start_batch(rt, mode)
         batch_id = batch["batch_id"]
+        # A crash between a stage's plan commit and its batch marker leaves the ledger ahead of
+        # the marker. Rewriting the marker before any scan runs keeps every planned scan in it.
+        _write_batch_marker(rt, batch)
         summary = CaptureSummary(batch_id=batch_id, status="capturing", resumed=resumed)
 
         try:

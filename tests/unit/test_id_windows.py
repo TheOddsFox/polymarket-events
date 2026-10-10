@@ -1,4 +1,4 @@
-"""Id-window fetches: tail termination, single-id failures, resume state, and Retry-After caps."""
+"""Id-window fetches: tail termination, single-id failures, resume state, and Retry-After ceilings."""
 
 from __future__ import annotations
 
@@ -118,14 +118,17 @@ def test_id_window_sends_the_event_include_flags() -> None:
     assert "include_template" not in seen[0]
 
 
-def test_id_window_retry_after_is_capped_at_the_window_cap() -> None:
-    """One long Retry-After must not hold the shared bucket for an hour."""
+@pytest.mark.parametrize(("retry_after", "waited"), [("3600", 900.0), ("60", 60.0)])
+def test_retry_after_is_honoured_up_to_the_ceiling_not_the_window_cap(
+    retry_after: str, waited: float
+) -> None:
+    """A long throttle is waited out up to the ceiling. The window's 30 s cap does not shorten it."""
     calls = {"n": 0}
 
     def handler(_: httpx.Request) -> httpx.Response:
         calls["n"] += 1
         if calls["n"] == 1:
-            return httpx.Response(429, headers={"Retry-After": "3600"})
+            return httpx.Response(429, headers={"Retry-After": retry_after})
         return httpx.Response(200, json={"events": []})
 
     client, clock = _client(handler)
@@ -135,7 +138,7 @@ def test_id_window_retry_after_is_capped_at_the_window_cap() -> None:
         client.close()
 
     assert response.status == 200
-    assert clock.sleeps == [30.0]
+    assert clock.sleeps == [waited]
 
 
 def test_single_id_that_returns_another_record_is_quarantined() -> None:
@@ -195,6 +198,26 @@ def _rejects_id_two(request: httpx.Request) -> httpx.Response:
 def test_a_multi_id_window_rejected_with_422_is_split_and_its_bad_id_quarantined() -> None:
     """A 422 on a multi-id window is not fatal. The window splits, and only the bad id is lost."""
     client, _ = _client(_rejects_id_two)
+    try:
+        (page,) = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+    finally:
+        client.close()
+
+    assert [record["id"] for record in page.records] == ["1"]
+    assert page.response.json["fetch_failed"] == [{"id": "2", "reason": "fetch_failed"}]
+
+
+def _undecodable_for_id_two(request: httpx.Request) -> httpx.Response:
+    """Gamma claims a gzip body for any window or lookup that holds id 2. The body is not gzip."""
+    ids = request.url.params.get_list("id")
+    if request.url.path == "/events/2" or "2" in ids:
+        return httpx.Response(200, content=b"not gzip", headers={"Content-Encoding": "gzip"})
+    return httpx.Response(200, json={"events": [{"id": i} for i in ids]})
+
+
+def test_a_body_that_does_not_decode_is_split_and_its_bad_id_quarantined() -> None:
+    """A body that fails to decode is a failed request, as a dropped connection is. Only id 2 is lost."""
+    client, _ = _client(_undecodable_for_id_two)
     try:
         (page,) = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
     finally:

@@ -141,8 +141,8 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
 - Up to 4 scans in the current plan stage run at once (`capture.workers`). They share a limit of
   5 requests per second (`gamma.requests_per_second`), with a 10 s connect timeout and a 60 s read
   timeout. Keyset requests retry up to 12 times (`backoff_base_s` 5, `backoff_cap_s` 300). An id
-  window and a by-ID lookup retry 4 times with backoff capped at 30 s. Both honour `Retry-After`,
-  but never wait longer than their own cap.
+  window and a by-ID lookup retry 4 times with backoff capped at 30 s. Every request honours
+  `Retry-After` up to 15 min (`RETRY_AFTER_CEILING_S`); a longer value is cut to 15 min.
 
 ## Status
 

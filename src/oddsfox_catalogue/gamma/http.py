@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 DEFAULT_USER_AGENT = "oddsfox-catalogue/0.1 (+local batch pipeline)"
+# The longest pause a Retry-After header can impose. A longer header is cut to this, so one
+# response cannot stall the shared bucket for hours. The retry budget still applies.
+RETRY_AFTER_CEILING_S = 900.0
 
 
 class GammaError(Exception):
@@ -79,7 +82,10 @@ class TokenBucket:
         self._stop: threading.Event | None = None
 
     def bind_stop(self, stop: threading.Event | None) -> None:
-        """When set, a long pause wakes often enough for the pool to drain."""
+        """Once ``stop`` is set, a pause raises ``CaptureStopped`` instead of sleeping on.
+
+        A real sleep checks ``stop`` every 0.25 s, so a rate-limit pause cannot hold the drain.
+        """
         self._stop = stop
 
     def _pause(self, seconds: float) -> None:
@@ -288,7 +294,8 @@ class GammaClient:
             self._add(requests=1)
             try:
                 raw = self._client.get(endpoint, params=clean)
-            except httpx.TransportError as exc:
+            except (httpx.TransportError, httpx.DecodingError) as exc:
+                # A body that will not decode is a failed request, as a dropped connection is.
                 self._add(transport_errors=1)
                 if retries >= retry_budget:
                     raise RetriesExhausted(f"{endpoint}: transport error: {exc}") from exc
@@ -372,13 +379,13 @@ class GammaClient:
     ) -> float:
         """Retry-After when the server sends one, otherwise jittered backoff from base.
 
-        Either way the wait never exceeds ``backoff_cap``. One long Retry-After
-        penalises the shared bucket, so it cannot stall every worker for an hour.
-        A 429 without Retry-After waits at least the base backoff. Full jitter can
-        return almost nothing, and a near-zero penalty would not slow the pool.
+        A Retry-After is honoured up to ``RETRY_AFTER_CEILING_S``, whatever the window cap, so
+        a long throttle is waited out instead of being cut short at the cap. Jittered backoff
+        never exceeds ``backoff_cap``. A 429 without Retry-After waits at least the base backoff.
+        Full jitter can return almost nothing, and a near-zero penalty would not slow the pool.
         """
         if retry_after is not None:
-            return min(retry_after, backoff_cap)
+            return min(retry_after, RETRY_AFTER_CEILING_S)
         delay = backoff_delay(
             retry_number - 1,
             self._settings.backoff_base_s,

@@ -42,6 +42,11 @@ class SignalHold:
         self._depth = 0
         self._first: int | None = None
 
+    @property
+    def pending(self) -> int | None:
+        """The first signal recorded in the current hold, or ``None``. Read on the main thread."""
+        return self._first
+
     def receive(self, signum: int) -> None:
         """Handle one stop signal. Raises ``Terminated`` unless a hold is active."""
         if self._depth == 0:

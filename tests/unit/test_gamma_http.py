@@ -2,6 +2,7 @@ import json
 import random
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from fakes.harness import FakeClock
 from oddsfox_catalogue.config import GammaSettings, load_settings
 from oddsfox_catalogue.gamma.http import (
+    CaptureStopped,
     CursorExpired,
     GammaClient,
     MalformedResponse,
@@ -73,6 +75,40 @@ def test_token_bucket_spaces_requests() -> None:
     for _ in range(4):
         bucket.acquire()
     assert clock.t == pytest.approx(1.5)  # four requests at 2/s need three 0.5s gaps
+
+
+def test_a_stop_during_a_429_pause_raises_capture_stopped() -> None:
+    """A stop that lands during a real 30 s pause ends the wait, rather than waiting it out."""
+    stop = threading.Event()
+    limiter = TokenBucket(1000.0, sleep=time.sleep)
+    limiter.bind_stop(stop)
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "30"}, json={"error": "slow"})
+        return httpx.Response(200, json={"events": []})
+
+    settings = GammaSettings(base_url="https://gamma.fake.test", requests_per_second=1000.0)
+    client = GammaClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+        limiter=limiter,
+        now=lambda: NOW,
+        rng=random.Random(7),
+    )
+    timer = threading.Timer(0.1, stop.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(CaptureStopped):
+            client.get("/events/keyset", {"limit": 1})
+    finally:
+        timer.cancel()
+        client.close()
+    assert time.monotonic() - started < 5.0  # the pause was cut short, not waited out
+    assert calls["n"] == 1  # the stopped wait sent no second request
 
 
 def test_grants_from_several_threads_stay_one_interval_apart() -> None:
