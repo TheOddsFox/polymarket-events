@@ -331,10 +331,17 @@ def _fetch_id_window(
 
     def _fetch_single(entity_id: int) -> tuple[list[Any], list[int], list[Response]]:
         path = _single_path(endpoint, entity_id)
+        # The by-id route must ask for the same payload the window asked for. A market
+        # without include_tag comes back with no tags.
+        query: dict[str, Any] = {}
+        if record_key == "markets":
+            query["include_tag"] = True
+        if extra:
+            query.update(extra)
         try:
             response = client.get(
                 path,
-                {},
+                query,
                 max_retries=ID_WINDOW_MAX_RETRIES,
                 backoff_cap_s=ID_WINDOW_BACKOFF_CAP_S,
             )

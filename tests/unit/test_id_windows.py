@@ -141,6 +141,28 @@ def test_retry_after_is_honoured_up_to_the_ceiling_not_the_window_cap(
     assert clock.sleeps == [waited]
 
 
+def test_a_market_answered_by_id_still_asks_for_its_tags() -> None:
+    """A window that falls back to /markets/{id} must send include_tag, or the market has no tags."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets/7":
+            seen.append(request.url.params.get("include_tag"))
+            return httpx.Response(200, json={"id": "7", "tags": [{"id": "2"}]})
+        return httpx.Response(500, json={"error": "down"})
+
+    client, _ = _client(handler)
+    try:
+        (page,) = id_range_pages(
+            client, "/markets/keyset", {"lo": 7, "step": 1, "hi": 7, "closed": True}, "markets"
+        )
+    finally:
+        client.close()
+
+    assert seen == ["true"]
+    assert page.records == [{"id": "7", "tags": [{"id": "2"}]}]
+
+
 def test_single_id_that_returns_another_record_is_quarantined() -> None:
     """A 200 for id 7 that describes record 8 does not answer for 7. It is quarantined."""
 

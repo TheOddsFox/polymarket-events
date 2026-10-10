@@ -413,7 +413,9 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
         for scan in id_scans:
             requested.extend(json.loads(scan["input_ids_json"] or "[]"))
         returned = _event_ids_from(rt, batch, lambda s: s["kind"] == "keyset_ids")
-        missing = sorted(set(requested) - returned, key=int)
+        # An id already quarantined in stage one must not be fetched and quarantined again.
+        failed = _fetch_failed_ids(rt, batch, lambda s: s["kind"] == "keyset_ids")
+        missing = sorted(set(requested) - returned - failed, key=int)
         start = rt.ledger.max_plan_order(batch_id)
         rows = [
             _scan_row(

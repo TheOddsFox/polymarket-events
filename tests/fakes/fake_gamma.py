@@ -177,7 +177,7 @@ class FakeGamma:
             return self._event_by_id(match.group(1))
         market_match = MARKET_BY_ID.match(path)
         if market_match:
-            return self._market_by_id(market_match.group(1))
+            return self._market_by_id(market_match.group(1), params)
         return httpx.Response(404, json={"type": "not found", "error": "no such route"})
 
     def _too_many_ids(self, params: dict[str, list[str]]) -> httpx.Response | None:
@@ -339,7 +339,10 @@ class FakeGamma:
             return httpx.Response(404, json={"type": "not found", "error": "Event not found"})
         return httpx.Response(200, json=self._render_event(event_id))
 
-    def _market_by_id(self, market_id: str) -> httpx.Response:
+    def _market_by_id(self, market_id: str, params: dict[str, list[str]]) -> httpx.Response:
         if market_id not in self.world.markets:
             return httpx.Response(404, json={"type": "not found", "error": "Market not found"})
-        return httpx.Response(200, json=json.loads(json.dumps(self.world.markets[market_id])))
+        item = json.loads(json.dumps(self.world.markets[market_id]))
+        if params.get("include_tag") != ["true"]:
+            item.pop("tags", None)
+        return httpx.Response(200, json=item)

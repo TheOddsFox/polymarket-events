@@ -239,6 +239,11 @@ def test_a_stage_one_chunk_with_a_rejected_id_is_split_and_captured(tmp_path: Pa
             body = json.loads(read_body(directory / scan["scan_id"], manifest))
             failed.extend(item["id"] for item in body.get("fetch_failed", []))
         assert failed == [poison]
+        # Stage two must not fetch an id stage one already quarantined.
+        for follow_up in runtime.ledger.list_scans(summary.batch_id):
+            if follow_up["kind"] != "single_ids":
+                continue
+            assert poison not in json.loads(follow_up["input_ids_json"] or "[]")
     finally:
         runtime.ledger.close()
 
