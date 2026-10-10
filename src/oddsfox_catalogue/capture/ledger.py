@@ -418,6 +418,9 @@ class Ledger:
     def pages_for_scan(self, scan_id: str) -> list[dict[str, Any]]:
         return self._all("SELECT * FROM pages WHERE scan_id = ? ORDER BY seq", (scan_id,))
 
+    def page_for_scan(self, scan_id: str, seq: int) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM pages WHERE scan_id = ? AND seq = ?", (scan_id, seq))
+
     def pages_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
         return self._all(
             "SELECT p.*, s.scan_name, s.attempt, s.status AS scan_status, s.kind AS scan_kind, "

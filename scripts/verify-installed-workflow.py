@@ -114,7 +114,17 @@ def run_command(argv: list[str], cwd: Path, env: dict[str, str], log: Path, time
             if stopped.signum is not None:
                 raise Terminated(stopped.signum)
     if code:
-        raise ValueError(f"command failed ({code}); inspect {log}")
+        with log.open("rb") as diagnostics:
+            diagnostics.seek(0, os.SEEK_END)
+            diagnostics.seek(max(0, diagnostics.tell() - 8192))
+            tail = diagnostics.read(8192).lower()
+        reason = ""
+        if b"not found in the cache" in tail or b"needs to be downloaded from a registry" in tail:
+            reason = "; diagnostic: offline_cache_miss"
+        elif b"hash mismatch" in tail:
+            reason = "; diagnostic: dependency_hash_mismatch"
+        # Subprocess output may contain credentials; expose only fixed diagnostic codes.
+        raise ValueError(f"command failed ({code}); inspect {log}{reason}")
 
 
 def verify(output: Path) -> dict:

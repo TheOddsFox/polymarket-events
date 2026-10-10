@@ -33,6 +33,14 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked
 
+      - name: Prepare hash-locked production dependencies for offline installation
+        env:
+          UV_LINK_MODE: copy
+        run: |
+          uv export --locked --offline --no-dev --no-emit-project --output-file "$RUNNER_TEMP/catalogue-production-requirements.txt"
+          uv venv --offline --python 3.12 "$RUNNER_TEMP/catalogue-dependency-preparation"
+          uv pip install --default-index https://pypi.org/simple --python "$RUNNER_TEMP/catalogue-dependency-preparation/bin/python" --require-hashes -r "$RUNNER_TEMP/catalogue-production-requirements.txt"
+
       - name: Lint
         run: |
           uv run ruff check .

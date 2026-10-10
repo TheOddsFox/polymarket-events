@@ -29,7 +29,11 @@ from oddsfox_catalogue.contract import (
 from oddsfox_catalogue.faults import fault_point
 from oddsfox_catalogue.fingerprints import SEMANTIC_DIGEST_REVISION, semantic_fingerprint
 from oddsfox_catalogue.ids import iso_utc, parse_batch_id, utc_now
-from oddsfox_catalogue.inventory import capture_inventory
+from oddsfox_catalogue.inventory import (
+    COVERAGE_SCHEMA_REVISION,
+    capture_inventory,
+    expand_coverage_id_range,
+)
 from oddsfox_catalogue.limits import enforce_storage_limits
 from oddsfox_catalogue.semantics import bounded_connection, canonical_json_chunks, json_descriptor
 from oddsfox_catalogue.warehouse import BaselineMissing
@@ -144,6 +148,12 @@ def _descriptor(path: Path, declared, root: Path, *, max_bytes=None) -> None:
 
 
 def _validate_coverage(coverage, inventory, batch_ids) -> None:
+    if (
+        not isinstance(coverage, dict)
+        or type(coverage.get("coverage_schema_revision")) is not int
+        or coverage["coverage_schema_revision"] != COVERAGE_SCHEMA_REVISION
+    ):
+        raise ValueError("unsupported coverage schema revision")
     if not isinstance(inventory, list) or not inventory:
         raise ValueError("release capture inventory is missing")
     paths = []
@@ -209,6 +219,10 @@ def _validate_coverage(coverage, inventory, batch_ids) -> None:
         _utc_timestamp(unit.get("received_at"))
         if not isinstance(unit.get("params"), dict) or not isinstance(unit.get("endpoint"), str):
             raise ValueError("coverage has invalid request provenance")
+        if "id_range" in unit:
+            if "id" in unit["params"]:
+                raise ValueError("coverage has conflicting ID representations")
+            expand_coverage_id_range(unit["id_range"])
         key = unit.get("page_id")
         if not isinstance(key, str) or key in seen:
             raise ValueError("coverage unit identities must be distinct")

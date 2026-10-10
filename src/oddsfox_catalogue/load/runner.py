@@ -186,8 +186,7 @@ def _rows_for_chunk(
         scan = rt.ledger.get_scan(page["scan_id"])
         if scan is None:
             raise LoadBlocked("raw page has no committed scan")
-        prior = rt.ledger.pages_for_scan(page["scan_id"])
-        previous = next((value for value in prior if value["seq"] == page["seq"] - 1), None)
+        previous = rt.ledger.page_for_scan(page["scan_id"], page["seq"] - 1)
         validate_page_identity(batch, scan, manifest, seq=page["seq"], previous=previous)
         durable_fields = (
             "page_id",

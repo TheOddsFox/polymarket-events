@@ -916,8 +916,7 @@ def _adopt_durable_pages(
             )
         ):
             raise DurabilityError("orphan page is corrupt")
-        prior = rt.ledger.pages_for_scan(scan["scan_id"])
-        previous = prior[-1] if prior else None
+        previous = rt.ledger.page_for_scan(scan["scan_id"], expected - 1)
         validate_page_identity(batch, scan, manifest, seq=expected, previous=previous)
         read_page_records(
             rt.settings, directory, manifest, scan["record_key"], scan=scan, previous=previous

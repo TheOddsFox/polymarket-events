@@ -56,6 +56,16 @@ It excludes `_dlt*`, `loaded_at`, `load_id`, `batch_loaded_at`, `built_through` 
 `marts.catalogue_snapshots` contents. These exclusions describe processing rather than source facts.
 Backup restoration verifies every inventoried file before copying into a fresh root.
 
+Coverage uses integer `coverage_schema_revision: 1` and retains one unit per response.
+For validated contiguous ID-range requests, `id_range.start` and `id_range.end` are
+inclusive canonical decimal strings spanning at most 100 IDs; other request filters
+remain in `params`. The producer applies this encoding only to ID-range scans. Other
+scan kinds retain their exact parameters, and immutable raw manifests always retain
+the complete HTTP request. Range size describes requested IDs, not returned records
+or individual absence. Bounds reduce cumulative coverage size; the unchanged 128 MiB
+allowance still applies as all units accumulate. Unrevisioned development releases require
+their original package for verification; new proofs use fresh roots.
+
 Live storage measurements tolerate temporary files removed by active jobs. Missing immutable
 evidence still fails inventory verification; unreadable paths, symlinks and special files fail
 storage checks. The catalogue smoke runs semantic verification and report queries in bounded

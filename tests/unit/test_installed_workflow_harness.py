@@ -76,6 +76,47 @@ def test_fixture_accounting_proves_only_acquisition_used_network():
         harness.assert_accounting(report, measured, {"/markets/1"})
 
 
+@pytest.mark.parametrize(
+    ("message", "diagnostic"),
+    [
+        ("Because agate was not found in the cache", "offline_cache_miss"),
+        ("pathspec needs to be downloaded from a registry", "offline_cache_miss"),
+        ("Hash mismatch for required package", "dependency_hash_mismatch"),
+        ("unrecognized subprocess failure", None),
+    ],
+)
+def test_command_failure_exposes_only_fixed_diagnostics(tmp_path, message, diagnostic):
+    secret = "synthetic-secret-not-for-diagnostics"
+    output = f"https://username:{secret}@registry.example/package?token={secret}\n{message}"
+    with pytest.raises(ValueError) as error:
+        harness.run_command(
+            [sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(1)", output],
+            tmp_path,
+            os.environ.copy(),
+            tmp_path / "failure.log",
+        )
+    assert "command failed (1)" in str(error.value)
+    assert secret not in str(error.value)
+    assert "registry.example" not in str(error.value)
+    assert "username" not in str(error.value)
+    if diagnostic is None:
+        assert "diagnostic:" not in str(error.value)
+    else:
+        assert str(error.value).endswith(f"diagnostic: {diagnostic}")
+
+
+def test_command_failure_reads_only_bounded_tail(tmp_path):
+    output = "Because agate was not found in the cache\n" + "x" * 8192
+    with pytest.raises(ValueError) as error:
+        harness.run_command(
+            [sys.executable, "-c", "import sys; print(sys.argv[1]); sys.exit(1)", output],
+            tmp_path,
+            os.environ.copy(),
+            tmp_path / "failure.log",
+        )
+    assert "diagnostic:" not in str(error.value)
+
+
 def test_timeout_stops_term_ignoring_descendant_after_parent_exits(tmp_path):
     heartbeat = tmp_path / "heartbeat"
     child = """

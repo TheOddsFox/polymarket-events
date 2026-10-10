@@ -16,9 +16,59 @@ from oddsfox_catalogue.capture.reader import (
 from oddsfox_catalogue.capture.runner import _plan_entry, _row_from_manifest
 from oddsfox_catalogue.capture.writer import manifest_path, read_manifest, read_regular_bytes
 from oddsfox_catalogue.config import Settings
+from oddsfox_catalogue.gamma.scans import ID_STEP
 from oddsfox_catalogue.ids import parse_batch_id
+from oddsfox_catalogue.normalization import ID_RE
 
 JSON_LIMIT = 128 * 1024**2
+COVERAGE_SCHEMA_REVISION = 1
+
+
+def expand_coverage_id_range(value: Any) -> list[str]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"start", "end"}
+        or any(not isinstance(bound, str) or not ID_RE.fullmatch(bound) for bound in value.values())
+    ):
+        raise ValueError("invalid coverage ID range")
+    start, end = int(value["start"]), int(value["end"])
+    if not 1 <= end - start + 1 <= ID_STEP:
+        raise ValueError("coverage ID range exceeds its request unit")
+    return [str(identifier) for identifier in range(start, end + 1)]
+
+
+def coverage_unit(manifest: dict[str, Any], kind: str) -> dict[str, Any]:
+    unit = {
+        "batch_id": manifest["batch_id"],
+        "page_id": manifest["page_id"],
+        "endpoint": manifest["endpoint"],
+        "params": manifest["params"],
+        "received_at": manifest["observed_at"],
+        "records": manifest["record_count"],
+        "status": "absent"
+        if manifest["http_status"] == 404
+        else "success_empty"
+        if manifest["record_count"] == 0
+        else "success",
+    }
+    if kind == "id_range":
+        requested = manifest["params"].get("id")
+        if (
+            not isinstance(requested, list)
+            or not 1 <= len(requested) <= ID_STEP
+            or any(
+                type(identifier) is not int or not 0 < identifier < 10**20
+                for identifier in requested
+            )
+        ):
+            raise ValueError("coverage range requires a finite explicit ID list")
+        interval = {"start": str(requested[0]), "end": str(requested[-1])}
+        if [str(identifier) for identifier in requested] != expand_coverage_id_range(interval):
+            raise ValueError("coverage range IDs are not ordered and contiguous")
+        # Exact request arrays remain in raw manifests; bounds keep cumulative coverage finite.
+        unit["params"] = {key: value for key, value in manifest["params"].items() if key != "id"}
+        unit["id_range"] = interval
+    return unit
 
 
 def _append_bounded(items, value, used):
@@ -189,19 +239,7 @@ def _capture_inventory(settings: Settings, batch_ids: list[str], page_counts=Non
                     expected_bodies.add(body_path.name)
                     coverage_bytes = _append_bounded(
                         units,
-                        {
-                            "batch_id": batch_id,
-                            "page_id": manifest["page_id"],
-                            "endpoint": manifest["endpoint"],
-                            "params": manifest["params"],
-                            "received_at": manifest["observed_at"],
-                            "records": manifest["record_count"],
-                            "status": "absent"
-                            if manifest["http_status"] == 404
-                            else "success_empty"
-                            if manifest["record_count"] == 0
-                            else "success",
-                        },
+                        coverage_unit(manifest, scan["kind"]),
                         coverage_bytes,
                     )
                 if (
@@ -222,6 +260,7 @@ def _capture_inventory(settings: Settings, batch_ids: list[str], page_counts=Non
                     files, _file_descriptor(member, settings.raw_dir), file_bytes
                 )
     coverage = {
+        "coverage_schema_revision": COVERAGE_SCHEMA_REVISION,
         "batches": batches,
         "units": units,
         "declared_scans_complete": True,
