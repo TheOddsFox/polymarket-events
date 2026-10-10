@@ -41,7 +41,7 @@ make test-dev  # fast dev loop: lint, then the full test suite
 
 Each stage takes the run lock. A second writer fails immediately (exit 3) instead of racing.
 Refresh commands log scan progress and Gamma retries to stderr. The JSON result is still printed to stdout when the command finishes.
-A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. SIGHUP, SIGTERM, and SIGINT also stop immediately: the wrapper logs the signal and exits 128 plus the signal number. A SIGHUP or SIGTERM that arrives while a catalogue stage is running is recorded on that stage's row, and the process exits the same way. A pooled capture stops waiting on a rate-limit pause. Unstarted scans are not fetched, and each running scan finishes its current page and stays `running` for resume. While the pool drains, further signals are held and do not cut the drain short. The first signal is re-raised once every worker has stopped and every client is closed. On resume, a market batch is abandoned rather than resumed, and its raw pages are kept, when its plan has no scans, has a scan name the id-range plan does not produce, has no open-market crawl, or plans a closed-market window before the open-market crawl. Logs are written under `.state/logs/`.
+A crashed bootstrap (exit 1, including Gamma retries exhausted) can be resumed with `scripts/bootstrap-until-done`. That wrapper retries only exit 1. Exit 2 (a later stage failed) and exit 3 (the run lock, or a blocked stage) stop immediately. SIGHUP, SIGTERM, and SIGINT also stop immediately: the wrapper logs the signal and exits 128 plus the signal number. A SIGHUP or SIGTERM that arrives while a catalogue stage is running is recorded on that stage's row, and the process exits the same way. A pooled capture stops waiting on a rate-limit pause. Unstarted scans are not fetched, and each running scan finishes its current page and stays `running` for resume. While the pool drains, further signals are held and do not cut the drain short. Once every worker has stopped and every client is closed, the run raises the first failure, or the first held signal when nothing else failed. On resume, a market batch is abandoned rather than resumed, and its raw pages are kept, when its plan has no scans, has a scan name the id-range plan does not produce, has no open-market crawl, or plans a closed-market window before the open-market crawl. Logs are written under `.state/logs/`.
 Every stage writes a row to `stage_runs` in the ledger (status, counts, error).
 
 Lower-level commands: `uv run catalogue --help`.
@@ -126,9 +126,10 @@ The open-event limits are passed to dbt as `max_open_events_drop_pct` and
   completes, so a market that closes mid-batch is captured by one of them. By-ID lookups fill in
   events referenced from markets that those scans did not return. A window that fails, for any
   reason, is split in half until single ids remain. A one-id window that still fails is answered by
-  ID instead. A single id that still fails is quarantined as `fetch_failed`. The same
+  ID instead. A single id that still fails is quarantined as `fetch_failed` and is not requested again. The same
   applies to a by-ID lookup, and a 200 that describes a different record counts as a failure. A 404
-  is recorded as absent, not failed.
+  is recorded as absent, not failed. A market answered by ID requests `include_tag`, as a market
+  window does.
 - Gamma's list and id-window endpoints return only active events. Inactive events are reached only
   by ID, and only when a captured market references them. Known gap: an inactive event that no
   captured market references is not captured. Event 5364 is one example. In a sample of ids 1 to
