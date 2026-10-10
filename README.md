@@ -213,3 +213,15 @@ pass their remaining invocation allowance and debit the returned metrics.
 The handoff does not promise automatic whole-catalogue discovery or membership
 refresh beyond selected records. Retain raw evidence and consumer copies for
 offline replay.
+
+## Repeatable live smoke test
+
+Run from this repository after `uv sync --locked`. This is opt-in; ordinary tests and CI stay offline.
+
+```sh
+uv run --locked python -m oddsfox_catalogue.smoke --market-id 5234660
+```
+
+Every invocation creates a fresh ignored `data/smoke/<uuid>` root and prints the absolute `report.json` path. Use `--output <fresh-path>` to name a run. Never reuse an output directory. Reports retain the steps, measured requests/bytes, configured limits and coverage. Failed/timed-out commands make `accounting_complete` false; their totals are known lower bounds. No paid requests are made. Run the events smoke first and pass its report to the consumers; consumers validate and pin its metadata bundle. Select an explicit currently active, unambiguous market when the example market closes.
+
+A pass requires one usable market, verified bundle checksums, an identical offline metadata replay (coverage observation timestamps excluded), zero replay HTTP requests and no global catalogue pointer. Existing `CATALOGUE_*` settings are cleared to isolate the run. This checks the targeted handoff, not a full catalogue crawl or warehouse build.
