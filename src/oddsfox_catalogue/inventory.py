@@ -53,6 +53,22 @@ def coverage_unit(manifest: dict[str, Any], kind: str) -> dict[str, Any]:
     }
     if kind == "id_range":
         requested = manifest["params"].get("id")
+        if manifest.get("page_unit_revision") == 2:
+            start, end = manifest.get("offset_start"), manifest.get("offset_end")
+            if type(start) is not int or type(end) is not int:
+                raise ValueError("coverage range requires verified native leaf bounds")
+            interval = {"start": str(start), "end": str(end)}
+            expected = expand_coverage_id_range(interval)
+            if requested is None:
+                if start != end or manifest["endpoint"].rsplit("/", 1)[-1] != str(start):
+                    raise ValueError("native fallback coverage requires a singleton target")
+            elif requested != expected:
+                raise ValueError("coverage range differs from its native request IDs")
+            unit["params"] = {
+                key: value for key, value in manifest["params"].items() if key != "id"
+            }
+            unit["id_range"] = interval
+            return unit
         if (
             not isinstance(requested, list)
             or not 1 <= len(requested) <= ID_STEP

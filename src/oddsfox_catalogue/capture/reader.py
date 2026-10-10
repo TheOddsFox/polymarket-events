@@ -10,7 +10,7 @@ from typing import Any
 
 from oddsfox_catalogue.capture.writer import manifest_path, read_body, read_manifest
 from oddsfox_catalogue.config import Settings
-from oddsfox_catalogue.gamma.http import MalformedResponse
+from oddsfox_catalogue.gamma.http import MalformedResponse, encode_params
 from oddsfox_catalogue.gamma.paginators import (
     _describes,
     _ids,
@@ -18,8 +18,8 @@ from oddsfox_catalogue.gamma.paginators import (
     _window_params,
     unpack,
 )
-from oddsfox_catalogue.gamma.scans import scan_spec_from_row
-from oddsfox_catalogue.ids import ids_hash, make_page_id
+from oddsfox_catalogue.gamma.scans import ScanSpec, scan_spec_from_row
+from oddsfox_catalogue.ids import canonical_json, ids_hash, make_page_id
 
 
 class DurabilityError(RuntimeError):
@@ -28,6 +28,68 @@ class DurabilityError(RuntimeError):
 
 def scan_dir_for(settings: Settings, observation_date: str, batch_id: str, scan_id: str) -> Path:
     return settings.raw_dir / observation_date / batch_id / scan_id
+
+
+def read_indexed_manifest(settings: Settings, directory: Path, page: dict[str, Any] | None):
+    """Read the actual page revision while binding its position to the ledger index."""
+    if page is None:
+        return None
+    manifest = read_manifest(manifest_path(directory, page["seq"]), trusted_root=settings.raw_dir)
+    fields = (
+        "page_id",
+        "batch_id",
+        "scan_id",
+        "seq",
+        "endpoint",
+        "input_cursor",
+        "output_cursor",
+        "offset_start",
+        "offset_end",
+        "record_count",
+        "http_status",
+        "retries",
+        "latency_s",
+        "body_sha256",
+        "gz_sha256",
+        "observed_at",
+    )
+    if (
+        manifest is None
+        or any(manifest.get(key) != page[key] for key in fields)
+        or bool(manifest["terminal"]) != bool(page["terminal"])
+        or canonical_json(manifest["params"]) != page["params_json"]
+    ):
+        raise DurabilityError("raw page manifest differs from the committed ledger evidence")
+    return manifest
+
+
+def _page_revision(manifest: dict[str, Any], spec: ScanSpec) -> int:
+    revision = manifest.get("page_unit_revision", 1)
+    if type(revision) is not int or revision not in {1, 2}:
+        raise DurabilityError("unsupported capture page unit revision")
+    if revision == 2 and (
+        spec.kind not in {"id_range", "keyset_ids"} or spec.param_dict.get("tail")
+    ):
+        raise DurabilityError("native leaf pages require a finite ID scan")
+    return revision
+
+
+def _leaf_ids(spec: ScanSpec, manifest: dict[str, Any]) -> list[int]:
+    start, end = manifest.get("offset_start"), manifest.get("offset_end")
+    if type(start) is not int or type(end) is not int:
+        raise DurabilityError("native leaf positions must be integers")
+    if spec.kind == "id_range":
+        params = spec.param_dict
+        lo, hi, step = params["lo"], params.get("hi"), params["step"]
+        if hi is None or not lo <= start <= end <= hi:
+            raise DurabilityError("native leaf is outside the sealed ID interval")
+        boundary = min(lo + ((start - lo) // step + 1) * step - 1, hi)
+        if end > boundary or not 1 <= end - start + 1 <= step <= 100:
+            raise DurabilityError("native leaf crosses its committed request window")
+        return list(range(start, end + 1))
+    if not 0 <= start < end <= len(spec.input_ids) or end - start > 100:
+        raise DurabilityError("native leaf is outside its frozen input list")
+    return [int(value) for value in spec.input_ids[start:end]]
 
 
 def validate_page_identity(
@@ -53,12 +115,49 @@ def validate_page_identity(
         "record_key": scan["record_key"],
     }
     spec = scan_spec_from_row(scan)
+    revision = _page_revision(manifest, spec)
+    if seq > 1 and (
+        previous is None
+        or previous.get("seq") != seq - 1
+        or previous.get("scan_id") != scan["scan_id"]
+        or previous.get("page_id") != make_page_id(scan["scan_id"], seq - 1)
+    ):
+        raise DurabilityError("capture page has no verified contiguous predecessor")
+    if previous is not None and _page_revision(previous, spec) > revision:
+        raise DurabilityError("capture page unit revision cannot be downgraded")
     params = spec.param_dict
     cursor = None if previous is None else previous["output_cursor"]
     endpoint = spec.endpoint
     input_cursor = None
     offset = None
-    if spec.kind == "single_ids":
+    if revision == 2:
+        wanted = _leaf_ids(spec, manifest)
+        if spec.kind == "id_range":
+            offset = params["lo"] if previous is None else previous["offset_end"] + 1
+            terminal = manifest["offset_end"] == params["hi"]
+            closed = params.get("closed")
+            extra = {
+                key: True
+                for key in ("include_chat", "include_template", "include_best_lines")
+                if params.get(key)
+            }
+        else:
+            offset = 0 if previous is None else previous["offset_end"]
+            terminal = manifest["offset_end"] == len(spec.input_ids)
+            closed, extra = None, {}
+        params = _window_params(wanted, spec.record_key, closed, extra)
+        native_single = "/" + spec.record_key + "/" + str(wanted[0])
+        if len(wanted) == 1 and manifest.get("endpoint") == native_single:
+            endpoint = native_single
+            params = {"include_tag": True} if spec.record_key == "markets" else {}
+            params.update(extra)
+        expected.update(
+            {"terminal": terminal, "output_cursor": None, "offset_end": manifest["offset_end"]}
+        )
+        params = encode_params(params)
+        if type(manifest.get("seq")) is not int or type(manifest.get("terminal")) is not bool:
+            raise DurabilityError("native leaf has invalid sequence or terminal accounting")
+    elif spec.kind == "single_ids":
         if seq < 1 or seq > len(spec.input_ids):
             raise DurabilityError("single-ID page sequence is outside its committed inputs")
         endpoint = "/" + spec.record_key + "/" + spec.input_ids[seq - 1]
@@ -108,7 +207,9 @@ def validate_page_identity(
             "offset_start": offset,
         }
     )
-    if any(manifest.get(key) != value for key, value in expected.items()):
+    if any(manifest.get(key) != value for key, value in expected.items()) or canonical_json(
+        manifest.get("params")
+    ) != canonical_json(params):
         raise DurabilityError("page manifest does not match its committed scan identity")
 
 
@@ -150,6 +251,10 @@ def read_page_records(
             raise DurabilityError("confirmed absence cannot contain declared records")
         if manifest.get("ids_hash") != ids_hash([]):
             raise DurabilityError("confirmed absence has inconsistent identity accounting")
+        if _page_revision(manifest, spec) == 2:
+            wanted = _leaf_ids(spec, manifest)
+            if len(wanted) != 1 or manifest["endpoint"] != f"/{record_key}/{wanted[0]}":
+                raise DurabilityError("native absence requires a singleton by-ID response")
         return []
 
     def reject_constant(value: str):
@@ -173,8 +278,16 @@ def read_page_records(
             if next_cursor is not None or not _describes(records, target):
                 raise MalformedResponse("single-ID evidence does not describe its target")
         elif spec.kind in {"id_range", "keyset_ids"}:
-            wanted = manifest["params"]["id"]
-            _reject_window_mismatch(spec.endpoint, wanted, records, next_cursor)
+            wanted = (
+                _leaf_ids(spec, manifest)
+                if _page_revision(manifest, spec) == 2
+                else manifest["params"]["id"]
+            )
+            if manifest["endpoint"] != spec.endpoint:
+                if next_cursor is not None or not _describes(records, str(wanted[0])):
+                    raise MalformedResponse("native by-ID evidence does not describe its target")
+            else:
+                _reject_window_mismatch(spec.endpoint, wanted, records, next_cursor)
         elif spec.kind == "keyset":
             if next_cursor is not None and (
                 not records or next_cursor == manifest.get("input_cursor")

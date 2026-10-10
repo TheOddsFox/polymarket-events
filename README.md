@@ -207,8 +207,8 @@ catalogue metadata export --market-id 123 --market-id 456 --output data/metadata
 `data/metadata/raw`, and indexes request outcomes in the existing SQLite ledger.
 `export` makes no requests and uses verified local raw observations. Neither
 command loads bronze, builds dbt, changes the six existing exports, or updates the
-global `current.json`. Set `CATALOGUE_ROOT` to the catalogue checkout when invoking
-the installed executable from elsewhere. The normal catalogue writer lock applies.
+global `current.json`. Set `CATALOGUE_ROOT` to an explicit operator data root when
+invoking the installed executable from elsewhere. The normal catalogue writer lock applies.
 
 The bundle contains JSON-array relations `markets.json`, `outcomes.json`,
 `memberships.json`, `identity_history.json`, and `coverage.json`. Its `manifest.json`
@@ -292,3 +292,5 @@ A selected smoke pass establishes bounded workflow readiness. Full operational r
 requires a fresh catalogue-wide bootstrap, daily refresh and reconcile, complete named-batch
 resumes, replay/rebuild/restore evidence and passing hosted CI for the final commit. Scheduling
 remains inactive, and discovery does not exhaustively sweep inactive event IDs.
+Measured results and remaining gates are recorded in the
+[acceptance evidence](docs/acceptance-2026-10-10.md).

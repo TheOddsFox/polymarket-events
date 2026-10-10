@@ -211,8 +211,11 @@ def _rejects_id_two(request: httpx.Request) -> httpx.Response:
 def test_a_rejected_multi_id_window_splits_but_unresolved_singleton_blocks() -> None:
     client, _ = _client(_rejects_id_two)
     try:
+        pages = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        first = next(pages)
+        assert first.records == [{"id": "1"}] and not first.terminal
         with pytest.raises(RetriesExhausted):
-            next(id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events"))
+            next(pages)
     finally:
         client.close()
 
@@ -228,8 +231,11 @@ def _undecodable_for_id_two(request: httpx.Request) -> httpx.Response:
 def test_an_undecodable_singleton_blocks_a_split_window() -> None:
     client, _ = _client(_undecodable_for_id_two)
     try:
+        pages = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
+        first = next(pages)
+        assert first.records == [{"id": "1"}] and not first.terminal
         with pytest.raises(RetriesExhausted):
-            next(id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events"))
+            next(pages)
     finally:
         client.close()
 
@@ -247,14 +253,22 @@ def test_a_keyset_ids_chunk_resumes_after_provider_recovery() -> None:
     chunk = {"limit": 100, "id": [1, 2, 3]}
     client, _ = _client(handler)
     try:
+        pages = id_list_pages(client, "/events/keyset", chunk, "events")
+        first = next(pages)
+        assert first.records == [{"id": "1"}] and first.output_offset == 1
         with pytest.raises(RetriesExhausted):
-            next(id_list_pages(client, "/events/keyset", chunk, "events"))
+            next(pages)
         recovered["ready"] = True
-        (page,) = id_list_pages(client, "/events/keyset", chunk, "events")
-        assert page.seq == 1 and page.terminal
-        assert [record["id"] for record in page.records] == ["1", "2", "3"]
+        (page,) = id_list_pages(
+            client, "/events/keyset", chunk, "events", PageState(seq=1, offset=1)
+        )
+        assert page.seq == 2 and page.terminal
+        assert [record["id"] for record in page.records] == ["2", "3"]
         assert (
-            list(id_list_pages(client, "/events/keyset", chunk, "events", PageState(seq=1))) == []
+            list(
+                id_list_pages(client, "/events/keyset", chunk, "events", PageState(seq=2, offset=3))
+            )
+            == []
         )
     finally:
         client.close()

@@ -66,6 +66,20 @@ or individual absence. Bounds reduce cumulative coverage size; the unchanged 128
 allowance still applies as all units accumulate. Unrevisioned development releases require
 their original package for verification; new proofs use fresh roots.
 
+Finite ID scans write native response leaves with `page_unit_revision: 2` while
+retaining raw manifest version 1. Each split response keeps its original body,
+endpoint, encoded query, receipt and row order. Range positions are inclusive
+source IDs; frozen ID-list positions are half-open array offsets. Resume continues
+after the verified last position, within the original sealed request windows.
+Legacy fixed-window pages remain readable before new leaves in the same scan;
+revision downgrades, gaps, overlaps and premature terminal units fail validation.
+A singleton by-ID fallback retains its actual unfiltered query. Its 404 means
+confirmed absence; an empty filtered list response means successful empty coverage.
+Failed remaining leaves leave the capture incomplete. Response limits stay at 16 MiB.
+Stop the previous process before upgrading. Once revision 2 pages exist, use a
+compatible verified installation for resume, replay and rebuild; older wheels
+cannot interpret those pages. Retain the previous environment for its older evidence.
+
 Live storage measurements tolerate temporary files removed by active jobs. Missing immutable
 evidence still fails inventory verification; unreadable paths, symlinks and special files fail
 storage checks. The catalogue smoke runs semantic verification and report queries in bounded

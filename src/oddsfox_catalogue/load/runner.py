@@ -27,8 +27,12 @@ import dlt
 from dlt.sources import DltResource
 
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.reader import read_page_records, scan_dir_for, validate_page_identity
-from oddsfox_catalogue.capture.writer import manifest_path, read_manifest
+from oddsfox_catalogue.capture.reader import (
+    read_indexed_manifest,
+    read_page_records,
+    scan_dir_for,
+    validate_page_identity,
+)
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.faults import fault_point
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
@@ -175,9 +179,7 @@ def _rows_for_chunk(
         directory = scan_dir_for(
             rt.settings, batch["observation_date"], batch["batch_id"], page["scan_id"]
         )
-        manifest = read_manifest(
-            manifest_path(directory, page["seq"]), trusted_root=rt.settings.raw_dir
-        )
+        manifest = read_indexed_manifest(rt.settings, directory, page)
         if manifest is None:
             raise LoadBlocked(f"page {page['page_id']} is not durable; refusing to load it")
 
@@ -186,32 +188,10 @@ def _rows_for_chunk(
         scan = rt.ledger.get_scan(page["scan_id"])
         if scan is None:
             raise LoadBlocked("raw page has no committed scan")
-        previous = rt.ledger.page_for_scan(page["scan_id"], page["seq"] - 1)
-        validate_page_identity(batch, scan, manifest, seq=page["seq"], previous=previous)
-        durable_fields = (
-            "page_id",
-            "batch_id",
-            "scan_id",
-            "seq",
-            "endpoint",
-            "input_cursor",
-            "output_cursor",
-            "offset_start",
-            "offset_end",
-            "record_count",
-            "http_status",
-            "retries",
-            "latency_s",
-            "body_sha256",
-            "gz_sha256",
-            "observed_at",
+        previous = read_indexed_manifest(
+            rt.settings, directory, rt.ledger.page_for_scan(page["scan_id"], page["seq"] - 1)
         )
-        if (
-            any(manifest.get(key) != page[key] for key in durable_fields)
-            or bool(manifest["terminal"]) != bool(page["terminal"])
-            or canonical_json(manifest["params"]) != page["params_json"]
-        ):
-            raise LoadBlocked("raw page manifest differs from the committed ledger evidence")
+        validate_page_identity(batch, scan, manifest, seq=page["seq"], previous=previous)
         records = read_page_records(
             rt.settings, directory, manifest, page["record_key"], scan=scan, previous=previous
         )

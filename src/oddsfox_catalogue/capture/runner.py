@@ -38,6 +38,7 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.reader import (
     DurabilityError,
     iter_scan_pages,
+    read_indexed_manifest,
     read_page_records,
     scan_dir_for,
     validate_page_identity,
@@ -743,7 +744,13 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
             if s["kind"] == "single_ids"
             for v in json.loads(s["input_ids_json"] or "[]")
         }
-        missing = sorted(requested - returned - failed - singles, key=int)
+        absent = {
+            page["manifest"]["endpoint"].rsplit("/", 1)[-1]
+            for _, page in _durable_records(rt, batch, lambda s: s.get("phase", 0) == 2)
+            if page["manifest"].get("page_unit_revision") == 2
+            and page["manifest"]["http_status"] == 404
+        }
+        missing = sorted(requested - returned - failed - singles - absent, key=int)
         specs = [single_id_scan(i, values) for i, values in enumerate(chunk(missing), 1)]
     start = rt.ledger.max_plan_order(batch_id)
     rows = [
@@ -916,7 +923,9 @@ def _adopt_durable_pages(
             )
         ):
             raise DurabilityError("orphan page is corrupt")
-        previous = rt.ledger.page_for_scan(scan["scan_id"], expected - 1)
+        previous = read_indexed_manifest(
+            rt.settings, directory, rt.ledger.page_for_scan(scan["scan_id"], expected - 1)
+        )
         validate_page_identity(batch, scan, manifest, seq=expected, previous=previous)
         read_page_records(
             rt.settings, directory, manifest, scan["record_key"], scan=scan, previous=previous
@@ -941,6 +950,7 @@ def _persist_page(
 ) -> None:
     manifest_fields: dict[str, Any] = {
         "seq": page.seq,
+        "page_unit_revision": page.page_unit_revision,
         "page_id": make_page_id(scan["scan_id"], page.seq),
         "batch_id": batch["batch_id"],
         "scan_id": scan["scan_id"],

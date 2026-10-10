@@ -536,10 +536,16 @@ def test_a_single_id_that_keeps_failing_stays_incomplete_and_resumes(tmp_path: P
         assert batch["status"] == "capturing"
         scan = runtime.ledger.latest_attempt(batch["batch_id"], "events_ids_0001")
         pages = runtime.ledger.pages_for_scan(scan["scan_id"])
-        assert len(pages) == 1 and not pages[0]["terminal"]
+        assert pages and all(not page["terminal"] for page in pages)
+        assert pages[0]["offset_start"] == 1 and pages[-1]["offset_end"] == 149
+        assert all(
+            left["offset_end"] + 1 == right["offset_start"]
+            for left, right in zip(pages, pages[1:], strict=False)
+        )
         fake.rules.clear()
         summary = run_capture(runtime, "bootstrap", resume=batch["batch_id"])
         assert summary.status == "captured" and summary.resumed
+        assert runtime.ledger.pages_for_scan(scan["scan_id"])[: len(pages)] == pages
         captured = [
             record["id"]
             for _, records in iter_scan_pages(

@@ -153,7 +153,7 @@ def test_indexed_predecessor_preserves_source_cursor_validation(
     raw["input_cursor"] = "different-source-cursor"
     path.write_text(json.dumps(raw))
     monkeypatch.setattr(runtime.ledger, "pages_for_scan", no_full_scan)
-    with pytest.raises(DurabilityError, match="identity"):
+    with pytest.raises(DurabilityError, match="identity|ledger evidence"):
         if consumer == "loader":
             page = runtime.ledger.pages_for_batch(batch["batch_id"])
             chosen = next(row for row in page if row["page_id"] == pages[1]["page_id"])

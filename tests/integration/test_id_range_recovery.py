@@ -239,10 +239,13 @@ def test_a_stage_one_rejected_singleton_blocks_completion_until_recovered(tmp_pa
         batch = runtime.ledger.list_batches()[0]
         scan = runtime.ledger.latest_attempt(batch["batch_id"], "events_by_id_0001")
         assert scan["status"] == "failed"
-        assert runtime.ledger.pages_for_scan(scan["scan_id"]) == []
+        committed = runtime.ledger.pages_for_scan(scan["scan_id"])
+        assert committed and all(not page["terminal"] for page in committed)
+        assert committed[-1]["offset_end"] == 1
         fake.rules.clear()
         recovered = run_capture(runtime, "bootstrap", resume=batch["batch_id"])
         assert recovered.status == "captured" and recovered.resumed
+        assert runtime.ledger.pages_for_scan(scan["scan_id"])[: len(committed)] == committed
     finally:
         runtime.ledger.close()
 
