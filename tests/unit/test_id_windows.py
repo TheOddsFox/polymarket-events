@@ -10,8 +10,8 @@ import pytest
 
 from fakes.harness import FakeClock
 from oddsfox_catalogue.config import GammaSettings
-from oddsfox_catalogue.gamma.http import GammaClient, MalformedResponse
-from oddsfox_catalogue.gamma.paginators import PageState, id_range_pages
+from oddsfox_catalogue.gamma.http import GammaClient
+from oddsfox_catalogue.gamma.paginators import PageState, id_list_pages, id_range_pages
 
 NOW = datetime(2026, 10, 8, 6, 0, tzinfo=UTC)
 
@@ -182,23 +182,73 @@ def test_a_transient_window_error_is_retried_before_any_bisection() -> None:
     assert sum(len(page.records) for page in pages) == len(seen[0])
 
 
-def test_a_multi_id_window_rejected_with_422_fails_without_bisecting() -> None:
-    """A systematic contract error on a multi-id window stops the crawl. It is not quarantined."""
-    seen: list[tuple[str, ...]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(tuple(request.url.params.get_list("id")))
+def _rejects_id_two(request: httpx.Request) -> httpx.Response:
+    """Gamma rejects any window that holds id 2 (422), and fails id 2 alone (500)."""
+    ids = request.url.params.get_list("id")
+    if request.url.path == "/events/2" or ids == ["2"]:
+        return httpx.Response(500, json={"error": "down"})
+    if "2" in ids:
         return httpx.Response(422, json={"error": "bad window"})
+    return httpx.Response(200, json={"events": [{"id": i} for i in ids]})
 
-    client, _ = _client(handler)
+
+def test_a_multi_id_window_rejected_with_422_is_split_and_its_bad_id_quarantined() -> None:
+    """A 422 on a multi-id window is not fatal. The window splits, and only the bad id is lost."""
+    client, _ = _client(_rejects_id_two)
     try:
-        with pytest.raises(MalformedResponse):
-            list(id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events"))
+        (page,) = id_range_pages(client, "/events/keyset", {"lo": 1, "step": 2, "hi": 2}, "events")
     finally:
         client.close()
 
-    assert len(seen) == 1
-    assert len(seen[0]) >= 2
+    assert [record["id"] for record in page.records] == ["1"]
+    assert page.response.json["fetch_failed"] == [{"id": "2", "reason": "fetch_failed"}]
+
+
+def test_a_keyset_ids_chunk_gets_the_window_policy() -> None:
+    """A stage-1 chunk splits on a 422 like a window, and a bad id is quarantined by ID."""
+    chunk = {"limit": 100, "id": [1, 2, 3]}
+    client, _ = _client(_rejects_id_two)
+    try:
+        (page,) = id_list_pages(client, "/events/keyset", chunk, "events")
+        resumed = list(id_list_pages(client, "/events/keyset", chunk, "events", PageState(seq=1)))
+    finally:
+        client.close()
+
+    assert page.seq == 1 and page.terminal
+    assert sorted(record["id"] for record in page.records) == ["1", "3"]
+    assert page.response.json["fetch_failed"] == [{"id": "2", "reason": "fetch_failed"}]
+    assert resumed == [], "a durable chunk page is not fetched again"
+
+
+def test_a_429_without_retry_after_waits_at_least_the_base_backoff() -> None:
+    """Full jitter can return almost nothing. A rate limit with no Retry-After still slows the pool."""
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, json={"error": "slow down"})
+        return httpx.Response(200, json={"events": []})
+
+    settings = GammaSettings(
+        base_url="https://gamma.fake.test", requests_per_second=1000.0, backoff_base_s=5.0
+    )
+    clock = FakeClock()
+    client = GammaClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+        sleep=clock.sleep,
+        now=lambda: NOW,
+        rng=random.Random(7),
+    )
+    try:
+        response = client.get("/events/keyset", {"limit": 1}, max_retries=4, backoff_cap_s=30.0)
+    finally:
+        client.close()
+
+    assert response.status == 200
+    assert clock.sleeps == [5.0]
 
 
 def test_a_single_id_window_with_a_hard_error_is_quarantined() -> None:

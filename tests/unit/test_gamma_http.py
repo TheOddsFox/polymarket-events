@@ -1,5 +1,7 @@
 import json
 import random
+import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
@@ -71,6 +73,53 @@ def test_token_bucket_spaces_requests() -> None:
     for _ in range(4):
         bucket.acquire()
     assert clock.t == pytest.approx(1.5)  # four requests at 2/s need three 0.5s gaps
+
+
+def test_grants_from_several_threads_stay_one_interval_apart() -> None:
+    """Overlapping waits must not let two grants land inside one interval.
+
+    Each thread's last clock read is its grant time: the bucket reads the clock under its
+    lock and grants in the same step. A tiny switch interval lets threads interleave between
+    that read and the bucket's write, so a bucket without its lock grants twice at one instant.
+    """
+    clock_lock = threading.Lock()
+    now = {"t": 0.0}
+    local = threading.local()
+
+    def clock() -> float:
+        with clock_lock:
+            local.grant = now["t"]
+            return now["t"]
+
+    def sleep(seconds: float) -> None:
+        with clock_lock:
+            now["t"] += seconds
+
+    bucket = TokenBucket(5.0, clock=clock, sleep=sleep)
+    grants: list[float] = []
+    grants_lock = threading.Lock()
+
+    def worker() -> None:
+        for _ in range(100):
+            bucket.acquire()
+            with grants_lock:
+                grants.append(local.grant)
+
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=worker) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+    grants.sort()
+    assert len(grants) == 1600
+    gaps = [later - earlier for earlier, later in zip(grants, grants[1:], strict=False)]
+    assert min(gaps) >= 0.2 - 1e-9
 
 
 def test_encode_params_uses_gamma_query_conventions() -> None:

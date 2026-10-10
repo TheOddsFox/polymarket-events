@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import signal
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -15,7 +17,7 @@ from fakes.world import World, demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture import runner
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import CaptureSummary, run_capture
-from oddsfox_catalogue.gamma.http import MalformedResponse
+from oddsfox_catalogue.signals import SIGNALS, Terminated
 
 
 def _tiny_world() -> World:
@@ -88,10 +90,10 @@ def test_a_pooled_failure_then_resume_matches_a_clean_serial_run(
 ) -> None:
     clean = _capture(tmp_path / "clean", "1")
     fake = FakeGamma(demo_world())
-    fake.fail_status("/events/keyset", 422, times=1)  # a multi-id window: the scan fails
+    fake.raise_on("/events/keyset", RuntimeError("injected failure"), times=1)  # one scan fails
     runtime, _ = build_runtime(tmp_path / "pool", fake, env={"CATALOGUE_CAPTURE_WORKERS": workers})
     try:
-        with pytest.raises(MalformedResponse):
+        with pytest.raises(RuntimeError, match="injected failure"):
             run_capture(runtime, "bootstrap")
         summary = run_capture(runtime, "bootstrap")
         assert summary.status == "captured"
@@ -129,7 +131,7 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
 
     def fail_after_sibling(_: httpx.Request) -> httpx.Response:
         assert persisted.wait(5)
-        return httpx.Response(422, json={"error": "bad window"})
+        raise RuntimeError("injected failure")  # an ordinary error fails the scan
 
     fake.rules.append(Rule(is_tail, fail_after_sibling, remaining=1))
     runtime, _ = build_runtime(tmp_path, fake, env={"CATALOGUE_CAPTURE_WORKERS": "2"})
@@ -141,7 +143,7 @@ def test_a_failing_scan_leaves_the_sibling_pages(tmp_path: Path) -> None:
 
     runtime.ledger.record_page = record_page
     try:
-        with pytest.raises(MalformedResponse):
+        with pytest.raises(RuntimeError, match="injected failure"):
             run_capture(runtime, "bootstrap")
         batch = runtime.ledger.list_batches()[0]
         assert batch["status"] == "capturing"
@@ -197,13 +199,13 @@ def _two_event_world() -> World:
 
 
 def test_a_scan_that_has_not_started_is_not_fetched(tmp_path: Path) -> None:
-    # Two events, so the first events window covers two ids. A one-id window that fails is
-    # answered by ID rather than failing the scan, which this test is not about.
+    # Two events, so the first events window covers two ids. An HTTP error would be bisected
+    # rather than fail the scan, so this test injects an ordinary failure instead.
     fake = FakeGamma(_two_event_world())
-    fake.fail_status("/events/keyset", 422, times=1)
+    fake.raise_on("/events/keyset", RuntimeError("injected failure"), times=1)
     runtime, _ = build_runtime(tmp_path, fake, env={"CATALOGUE_CAPTURE_WORKERS": "2"})
     try:
-        with pytest.raises(MalformedResponse):
+        with pytest.raises(RuntimeError, match="injected failure"):
             run_capture(runtime, "bootstrap")
         batch = runtime.ledger.list_batches()[0]
         untouched = [
@@ -265,3 +267,52 @@ def test_pool_runs_two_scans_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyP
         assert not barrier.broken
     finally:
         runtime.ledger.close()
+
+
+def test_a_pooled_signal_then_resume_matches_a_clean_serial_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SIGTERM mid-pool keeps the pages already durable. A SIGHUP in the drain is held.
+
+    The stage re-raises the first signal, SIGTERM. Resume then finishes with the same content.
+    """
+    clean = _capture(tmp_path / "clean", "1")
+    root = tmp_path / "pool"
+    env = {"CATALOGUE_CAPTURE_WORKERS": "2"}
+    runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=env)
+    real_wait = runner.wait
+    real_shutdown = ThreadPoolExecutor.shutdown
+    waits = {"n": 0}
+
+    def sigterm_on_second_wait(*args, **kwargs):
+        waits["n"] += 1
+        if waits["n"] == 2:
+            raise Terminated(signal.SIGTERM)  # a stop lands while scans are still in flight
+        return real_wait(*args, **kwargs)
+
+    def sighup_during_drain(self, wait=True, *, cancel_futures=False):
+        SIGNALS.receive(signal.SIGHUP)  # held: the drain goes on, and SIGTERM stays the signal
+        return real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
+
+    monkeypatch.setattr(runner, "wait", sigterm_on_second_wait)
+    monkeypatch.setattr(ThreadPoolExecutor, "shutdown", sighup_during_drain)
+    try:
+        with pytest.raises(Terminated) as info:
+            run_capture(runtime, "bootstrap")
+        assert info.value.signum == signal.SIGTERM
+        (run,) = [r for r in runtime.ledger.stage_runs() if r["stage"] == "capture:bootstrap"]
+        assert run["status"] == "failed"
+        assert run["error"] == "Terminated: SIGTERM"
+        assert runtime.ledger.list_batches()[0]["status"] == "capturing"
+    finally:
+        runtime.ledger.close()
+
+    monkeypatch.undo()
+    resumed_runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=env)
+    try:
+        summary = run_capture(resumed_runtime, "bootstrap")
+        assert summary.status == "captured"
+        assert summary.resumed is True
+        assert _content(_manifests(resumed_runtime, summary.batch_id)) == _content(clean)
+    finally:
+        resumed_runtime.ledger.close()

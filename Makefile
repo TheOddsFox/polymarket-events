@@ -34,7 +34,7 @@ bootstrap: dagster-home
 refresh: dagster-home
 	$(CATALOGUE) refresh --mode daily
 
-# Weekly full pass: all events, archived events, and all markets, then by-ID fetches for references.
+# Weekly full pass: every event and every closed market by id range, open markets by keyset, then by-ID fetches for referenced events those scans did not return.
 reconcile: dagster-home
 	$(CATALOGUE) refresh --mode reconcile
 

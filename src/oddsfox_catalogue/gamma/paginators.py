@@ -293,10 +293,10 @@ def _fetch_id_window(
 ) -> tuple[list[Any], list[int], Response]:
     """Fetch one id window. A window that keeps failing is split down to one id.
 
-    A single id that still fails after ``/events/{id}`` or ``/markets/{id}`` is
-    returned in the failed list, whatever the hard error. A 404 means the id does
-    not exist. A non-retryable error on a multi-id window still fails the scan,
-    so a systematic contract problem stops the crawl instead of quarantining it.
+    Any failure on a window of several ids, a non-retryable error included, splits
+    it in half, so one bad id cannot fail the scan. A single id that still fails
+    after ``/events/{id}`` or ``/markets/{id}`` is returned in the failed list,
+    whatever the hard error. A 404 means the id does not exist.
     """
     params = _window_params(ids, record_key, closed, extra)
 
@@ -315,12 +315,10 @@ def _fetch_id_window(
                 raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
             records, cursor = unpack(response.json, record_key)
             _reject_window_mismatch(endpoint, wanted, records, cursor)
-        except (RetriesExhausted, MalformedResponse) as exc:
+        except (RetriesExhausted, MalformedResponse):
             if len(wanted) == 1:
                 # A one-id window that cannot answer is answered by ID, as after bisection.
                 return _fetch_single(wanted[0])
-            if isinstance(exc, MalformedResponse):
-                raise
             mid = len(wanted) // 2
             left_records, left_failed, left_parts = fetch(wanted[:mid])
             right_records, right_failed, right_parts = fetch(wanted[mid:])
@@ -430,6 +428,41 @@ def id_range_pages(
         )
         if terminal:
             return
+
+
+def id_list_pages(
+    client: GammaClient,
+    endpoint: str,
+    base_params: Mapping[str, Any],
+    record_key: str,
+    start: PageState | None = None,
+) -> Iterator[PageResult]:
+    """Fetch one ``keyset_ids`` chunk as a single id window, with the window policy.
+
+    The chunk is split in half on any failure, and a single id that still fails is
+    quarantined by ID, as an id-range window is. A chunk is one terminal page, so a
+    durable page means the chunk is done and nothing is fetched again.
+    """
+    if record_key not in RECORD_KEYS:
+        raise ValueError(f"unknown record key {record_key!r}")
+    if start is not None and start.seq >= 1:
+        return
+    ids = [int(entity_id) for entity_id in base_params["id"]]
+    records, _failed, response = _fetch_id_window(client, endpoint, record_key, ids, None)
+    yield PageResult(
+        seq=1,
+        endpoint=endpoint,
+        params=_window_params(ids, record_key, None),
+        record_key=record_key,
+        input_cursor=None,
+        output_cursor=None,
+        offset=None,
+        output_offset=None,
+        records=records,
+        response=response,
+        terminal=True,
+        ids_hash=ids_hash(_ids(records)),
+    )
 
 
 def single_event_page(client: GammaClient, event_id: str, seq: int) -> PageResult:

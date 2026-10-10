@@ -325,7 +325,7 @@ class GammaClient:
                     retry_budget,
                 )
                 retry_after = parse_retry_after(raw.headers.get("Retry-After"), self._now())
-                self._limiter.penalize(self._delay(retries, retry_after, backoff_cap))
+                self._limiter.penalize(self._delay(retries, retry_after, backoff_cap, status))
                 continue
 
             if status == 422 and "after_cursor" in clean:
@@ -363,17 +363,28 @@ class GammaClient:
                 headers=dict(raw.headers),
             )
 
-    def _delay(self, retry_number: int, retry_after: float | None, backoff_cap: float) -> float:
+    def _delay(
+        self,
+        retry_number: int,
+        retry_after: float | None,
+        backoff_cap: float,
+        status: int | None = None,
+    ) -> float:
         """Retry-After when the server sends one, otherwise jittered backoff from base.
 
         Either way the wait never exceeds ``backoff_cap``. One long Retry-After
         penalises the shared bucket, so it cannot stall every worker for an hour.
+        A 429 without Retry-After waits at least the base backoff. Full jitter can
+        return almost nothing, and a near-zero penalty would not slow the pool.
         """
         if retry_after is not None:
             return min(retry_after, backoff_cap)
-        return backoff_delay(
+        delay = backoff_delay(
             retry_number - 1,
             self._settings.backoff_base_s,
             backoff_cap,
             self._rng,
         )
+        if status == 429:
+            return max(delay, min(self._settings.backoff_base_s, backoff_cap))
+        return delay

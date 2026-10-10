@@ -57,8 +57,9 @@ def test_capture_rejects_unknown_mode() -> None:
         main(["capture", "--mode", "hourly"])
 
 
-def test_sigterm_during_capture_records_failed_stage_and_exits_143(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("signum", "exit_code"), [(signal.SIGTERM, 143), (signal.SIGHUP, 129)])
+def test_a_stop_signal_during_capture_records_failed_stage_and_exits_128_plus_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int, exit_code: int
 ) -> None:
     monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
     monkeypatch.setenv("CATALOGUE_GAMMA_BASE_URL", "http://127.0.0.1:9")
@@ -66,13 +67,13 @@ def test_sigterm_during_capture_records_failed_stage_and_exits_143(
     monkeypatch.setenv("CATALOGUE_CAPTURE_WORKERS", "4")
 
     def explode(*_args: object, **_kwargs: object) -> None:
-        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signum)
 
     # Planning reads the high-water mark before any scan. Keep that off the network.
     monkeypatch.setattr("oddsfox_catalogue.gamma.scans._high_water", lambda *_a, **_k: 1)
     monkeypatch.setattr("oddsfox_catalogue.capture.runner._run_scan", explode)
 
-    assert main(["refresh", "--mode", "bootstrap"]) == 143
+    assert main(["refresh", "--mode", "bootstrap"]) == exit_code
 
     settings = load_settings()
     ledger = Ledger(settings.ledger_path)
@@ -83,7 +84,7 @@ def test_sigterm_during_capture_records_failed_stage_and_exits_143(
     assert len(runs) == 1
     assert runs[0]["stage"] == "capture:bootstrap"
     assert runs[0]["status"] == "failed"
-    assert runs[0]["error"] == "Terminated: SIGTERM"
+    assert runs[0]["error"] == f"Terminated: {signal.Signals(signum).name}"
 
 
 def test_sigterm_during_argument_parsing_exits_143(

@@ -2,8 +2,9 @@
 
 Plan shape:
 
-* bootstrap / reconcile: id-range scans for every event and every closed market,
-  a short tail above each high-water mark, then the open-market keyset.
+* bootstrap / reconcile: the open-market keyset first, then id-range scans for
+  every event and every closed market, each with a short tail above its
+  high-water mark. Closed-market windows wait for the open crawl at run time.
   Deep keyset cursors and offset lists are not used. Gamma returns HTTP 500
   on deep cursors and HTTP 422 once an offset passes a few thousand.
 * daily: the open-event keyset, then re-fetch previously open IDs missing from it.

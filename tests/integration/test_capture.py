@@ -444,7 +444,8 @@ def test_bootstrap_plan_uses_id_ranges(tmp_path: Path) -> None:
     assert all(s.kind == "id_range" for s in bootstrap if s.name != "markets_keyset_open")
 
 
-def test_id_range_resumes_after_a_rejected_window(tmp_path: Path) -> None:
+def test_id_range_bisects_a_rejected_window_and_captures_it(tmp_path: Path) -> None:
+    """A 422 on a window of ids is split in half, so the batch still captures every record."""
     fake = FakeGamma(demo_world())
     fake.rules.append(
         Rule(
@@ -459,15 +460,15 @@ def test_id_range_resumes_after_a_rejected_window(tmp_path: Path) -> None:
     )
     runtime, _ = build_runtime(tmp_path, fake)
     try:
-        with pytest.raises(Exception, match="bad window"):
-            run_capture(runtime, "bootstrap")
-        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
-        failed = runtime.ledger.latest_attempt(batch_id, "events_ids_0001")
-        assert failed["fetched_seq"] == 1
-        assert failed["status"] == "failed"
-        fake.rules.clear()
         summary = run_capture(runtime, "bootstrap")
-        assert summary.resumed is True and summary.status == "captured"
+        assert summary.status == "captured"
+        # The rejected window was asked again in halves, and a half still holds id 101.
+        asked = [
+            params
+            for path, params in fake.requests
+            if path == "/events/keyset" and "101" in params.get("id", [])
+        ]
+        assert len(asked) >= 2
         scan = _scans_by_name(runtime.ledger, summary.batch_id)["events_ids_0001"][0]
         captured = []
         batch = runtime.ledger.get_batch(summary.batch_id)

@@ -35,28 +35,17 @@ from oddsfox_catalogue.pipeline import dbt_stage, load_stage, publish_stage, ref
 from oddsfox_catalogue.publish import PublishBlocked, current_release
 from oddsfox_catalogue.rebuild import rebuild_and_verify
 from oddsfox_catalogue.runlock import RunBusy, current_git_sha, run_lock
+from oddsfox_catalogue.signals import SIGNALS, Terminated
 from oddsfox_catalogue.warehouse import BaselineMissing, read_open_event_ids
 
 Handler = Callable[[argparse.Namespace], int]
 
 
-class Terminated(BaseException):
-    """The operator stopped the process with SIGHUP or SIGTERM.
-
-    A ``BaseException`` so the capture recorder still writes its ``stage_runs`` row,
-    and so ``except Exception`` does not treat an intentional stop as a crash worth retrying.
-    """
-
-    def __init__(self, signum: int) -> None:
-        self.signum = signum
-        super().__init__(signal.Signals(signum).name)
-
-
 def _install_termination_handlers() -> Callable[[], None]:
-    """Turn SIGHUP and SIGTERM into ``Terminated``. Returns a restore function."""
+    """Route SIGHUP and SIGTERM to ``SIGNALS``. Returns a restore function."""
 
     def handle(signum: int, _frame: object) -> None:
-        raise Terminated(signum)
+        SIGNALS.receive(signum)
 
     previous = {signum: signal.signal(signum, handle) for signum in (signal.SIGHUP, signal.SIGTERM)}
 

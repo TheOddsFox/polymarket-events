@@ -47,6 +47,7 @@ from oddsfox_catalogue.gamma.http import CaptureStopped, CursorExpired, GammaCli
 from oddsfox_catalogue.gamma.paginators import (
     PageResult,
     PageState,
+    id_list_pages,
     id_range_pages,
     keyset_pages,
     offset_pages,
@@ -69,6 +70,7 @@ from oddsfox_catalogue.ids import (
     observation_date,
     utc_now,
 )
+from oddsfox_catalogue.signals import SIGNALS, Terminated
 
 logger = logging.getLogger(__name__)
 
@@ -155,21 +157,58 @@ def _start_batch(rt: CaptureRuntime, mode: str) -> dict[str, Any]:
         for index, spec in enumerate(specs, start=1)
     ]
     rt.ledger.create_batch(batch_id, mode, obs_date, started, rt.git_sha, rows)
-    write_marker(
-        batch_marker_path(_batch_dir(rt.settings, obs_date, batch_id)),
-        {
-            "batch_id": batch_id,
-            "mode": mode,
-            "observation_date": obs_date,
-            "status": "capturing",
-            "started_at": started,
-            "git_sha": rt.git_sha,
-        },
-    )
     batch = rt.ledger.get_batch(batch_id)
     assert batch is not None
+    _write_batch_marker(rt, batch)
     _mark_planned(rt, batch, rows)
     return batch
+
+
+def _plan_entry(scan: dict[str, Any]) -> dict[str, Any]:
+    """One planned scan as the batch marker records it.
+
+    Accepts a planned row from the ledger or a scan row built for planning. The batch
+    marker keeps the whole plan, so a rebuild can recreate a planned scan whose markers
+    were never written.
+    """
+    input_ids = scan.get("input_ids_json")
+    return {
+        "scan_name": scan["scan_name"],
+        "plan_order": scan["plan_order"],
+        "kind": scan["kind"],
+        "endpoint": scan["endpoint"],
+        "record_key": scan["record_key"],
+        "params": json.loads(scan["params_json"]),
+        "input_ids": json.loads(input_ids) if input_ids else [],
+        "started_at": scan["started_at"],
+    }
+
+
+def _write_batch_marker(rt: CaptureRuntime, batch: dict[str, Any], **fields: Any) -> None:
+    """Write the batch marker with every attempt-1 scan planned so far, in one atomic write.
+
+    The write runs before the scan markers for the same plan. A crash therefore leaves
+    either the old plan or the new one, never a scan marker that the plan does not list.
+    ``fields`` override the defaults, as the captured marker does for its status.
+    """
+    planned = sorted(
+        (s for s in rt.ledger.list_scans(batch["batch_id"]) if s["attempt"] == 1),
+        key=lambda s: s["plan_order"],
+    )
+    payload: dict[str, Any] = {
+        "batch_id": batch["batch_id"],
+        "mode": batch["mode"],
+        "observation_date": batch["observation_date"],
+        "status": "capturing",
+        "started_at": batch["started_at"],
+        "git_sha": batch["git_sha"],
+        "plan": [_plan_entry(scan) for scan in planned],
+        **fields,
+    }
+    write_marker(
+        batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch["batch_id"])),
+        payload,
+    )
 
 
 def _batch_dir(settings: Settings, obs_date: str, batch_id: str) -> Path:
@@ -195,8 +234,8 @@ ID_RANGE_MODES = frozenset({"bootstrap", "reconcile"})
 # Scan names the id-range plan produces. A deep-keyset or offset plan uses other names, and its
 # coverage cannot be shown, so a batch with any other name is not resumed.
 ID_RANGE_SCAN_NAME = re.compile(
-    r"markets_keyset_open|events_ids_(\d{4}|tail)|markets_closed_ids_(\d{4}|tail)"
-    r"|events_by_id_(single_)?\d{4}"
+    r"markets_keyset_open|events_ids_(\d{4,}|tail)|markets_closed_ids_(\d{4,}|tail)"
+    r"|events_by_id_(single_)?\d{4,}"
 )
 # Seconds the pool waits before it looks again. The main thread runs signal handlers only
 # between waits, so a bounded wait keeps a signal from sitting behind a busy worker.
@@ -362,6 +401,7 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
             for index, ids_chunk in enumerate(chunk(ids), start=1)
         ]
         rt.ledger.add_plan(batch_id, 1, rows, now)
+        _write_batch_marker(rt, batch)
         _mark_planned(rt, batch, rows)
         return True
 
@@ -386,6 +426,7 @@ def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
             for index, ids_chunk in enumerate(chunk(missing), start=1)
         ]
         rt.ledger.add_plan(batch_id, 2, rows, now)
+        _write_batch_marker(rt, batch)
         _mark_planned(rt, batch, rows)
         return True
     return False
@@ -423,18 +464,12 @@ def _finalise_if_complete(rt: CaptureRuntime, batch_id: str) -> str:
     if batch["plan_stage"] == 2 and _all_complete(list(latest.values())) and crawl_ok:
         finished = iso_utc(rt.now())
         rt.ledger.set_batch_status(batch_id, "captured", finished)
-        write_marker(
-            batch_marker_path(_batch_dir(rt.settings, batch["observation_date"], batch_id)),
-            {
-                "batch_id": batch_id,
-                "mode": batch["mode"],
-                "observation_date": batch["observation_date"],
-                "status": "captured",
-                "started_at": batch["started_at"],
-                "finished_at": finished,
-                "git_sha": batch["git_sha"],
-                "scans": {name: s["scan_id"] for name, s in latest.items()},
-            },
+        _write_batch_marker(
+            rt,
+            batch,
+            status="captured",
+            finished_at=finished,
+            scans={name: s["scan_id"] for name, s in latest.items()},
         )
         return "captured"
     return "capturing"
@@ -447,8 +482,10 @@ def _finalise_if_complete(rt: CaptureRuntime, batch_id: str) -> str:
 
 def _iterate(rt: CaptureRuntime, spec: ScanSpec, start: PageState) -> Iterator[PageResult]:
     client = rt.client
-    if spec.kind == "keyset" or spec.kind == "keyset_ids":
+    if spec.kind == "keyset":
         return keyset_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
+    if spec.kind == "keyset_ids":
+        return id_list_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
     if spec.kind == "id_range":
         return id_range_pages(client, spec.endpoint, spec.param_dict, spec.record_key, start)
     if spec.kind == "offset":
@@ -857,40 +894,47 @@ def _run_ready_scans(
             for future in done:
                 future.result()
     except BaseException as exc:
+        # Record the signal first, so no later statement in this handler can lose it.
+        if not isinstance(exc, Exception):
+            body_signal = exc
         stop.set()
         for future in futures:
             future.cancel()
-        if not isinstance(exc, Exception):
-            body_signal = exc
         raise
     finally:
-        # Keep joining until every worker has stopped, whatever signal arrives. Releasing the
-        # ledger or the run lock while a worker still runs would let a second run write beside
-        # it. The first signal, even one raised above, is re-raised once the drain is complete.
-        interrupted: BaseException | None = body_signal
-        try:
-            while True:
-                try:
-                    executor.shutdown(wait=True, cancel_futures=True)
-                    break
-                except BaseException as exc:
-                    stop.set()
-                    if interrupted is None:
-                        interrupted = exc
-        finally:
-            rt.client._limiter.bind_stop(None)
-            for client in spawned:
-                try:
-                    client.close()
-                except Exception:
-                    # A failing close must not skip the other clients or the reopen below.
-                    logger.warning("closing a capture worker client failed", exc_info=True)
-            with started_lock:
-                ran = set(started)
+        # The drain and the cleanup run under a signal hold: a signal is recorded, not raised.
+        # Releasing the ledger or the run lock while a worker still runs would let a second run
+        # write beside it, so the join keeps going whatever arrives. The first signal, even one
+        # raised above, is re-raised once the drain and the cleanup are both complete.
+        with SIGNALS.hold() as held:
+            interrupted: BaseException | None = body_signal
             try:
-                _reopen_unstarted(rt, rows, ran)
-            except Exception:
-                logger.warning("reopening unstarted scans failed; resume runs them", exc_info=True)
+                while True:
+                    try:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                        break
+                    except BaseException as exc:
+                        stop.set()
+                        if interrupted is None:
+                            interrupted = exc
+            finally:
+                rt.client._limiter.bind_stop(None)
+                for client in spawned:
+                    try:
+                        client.close()
+                    except Exception:
+                        # A failing close must not skip the other clients or the reopen below.
+                        logger.warning("closing a capture worker client failed", exc_info=True)
+                with started_lock:
+                    ran = set(started)
+                try:
+                    _reopen_unstarted(rt, rows, ran)
+                except Exception:
+                    logger.warning(
+                        "reopening unstarted scans failed; resume runs them", exc_info=True
+                    )
+        if interrupted is None and held.signum is not None:
+            interrupted = Terminated(held.signum)
         if interrupted is not None:
             raise interrupted
 
@@ -979,6 +1023,24 @@ def abandon_batch(ledger: Ledger, batch_id: str, now: datetime, reason: str) -> 
     ledger.set_batch_status(batch_id, "abandoned", iso_utc(now), reason[:500])
 
 
+def _planned_row(batch_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """The attempt-1 ledger row for a scan that a batch marker plans."""
+    input_ids = entry["input_ids"]
+    return {
+        "scan_id": make_scan_id(batch_id, entry["scan_name"], 1),
+        "batch_id": batch_id,
+        "scan_name": entry["scan_name"],
+        "attempt": 1,
+        "plan_order": entry["plan_order"],
+        "kind": entry["kind"],
+        "endpoint": entry["endpoint"],
+        "record_key": entry["record_key"],
+        "params_json": canonical_json(entry["params"]),
+        "input_ids_json": canonical_json(input_ids) if input_ids else None,
+        "started_at": entry["started_at"],
+    }
+
+
 def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
     """Reconstruct batches, scans, and pages from raw markers and manifests.
 
@@ -1002,6 +1064,14 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
                 [],
             )
             counts["batches"] += 1
+
+        # The batch marker lists the whole plan. A planned scan whose markers were never written
+        # (a crash during planning) is recreated as a running attempt, so resume runs it. A batch
+        # is never captured without a scan its plan lists.
+        for entry in meta.get("plan", []):
+            if ledger.get_scan(make_scan_id(batch_id, entry["scan_name"], 1)) is None:
+                ledger.add_scan_attempt(_planned_row(batch_id, entry))
+                counts["scans"] += 1
 
         for scan_dir in sorted(p for p in batch_dir.iterdir() if p.is_dir()):
             marker = scan_dir / "_scan.json"
@@ -1028,16 +1098,9 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
                     }
                 )
                 counts["scans"] += 1
-            # The marker records the last decision for the scan (complete, abandoned, failed).
-            ledger.set_scan_status(
-                scan_id,
-                scan_meta["status"],
-                scan_meta.get("finished_at"),
-                scan_meta.get("error"),
-            )
-
             known_seqs = {p["seq"] for p in ledger.pages_for_scan(scan_id)}
             seq = 0
+            terminal_adopted = False
             while True:
                 seq += 1
                 path = manifest_path(scan_dir, seq)
@@ -1046,6 +1109,7 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
                 manifest = read_manifest(path)
                 if manifest is None or not verify_page(scan_dir, manifest):
                     break
+                terminal_adopted = bool(manifest["terminal"])
                 if seq in known_seqs:
                     continue
                 ledger.record_page(
@@ -1054,6 +1118,14 @@ def rebuild_from_raw(settings: Settings, ledger: Ledger) -> dict[str, int]:
                     bool(manifest["terminal"]),
                 )
                 counts["pages"] += 1
+            # The marker's last decision (complete, abandoned, failed) stands only if the pages
+            # back it. A complete marker without its terminal page resumes from the last durable
+            # page, instead of being skipped as finished.
+            status = scan_meta["status"]
+            finished_at, error = scan_meta.get("finished_at"), scan_meta.get("error")
+            if status == "complete" and not terminal_adopted:
+                status, finished_at, error = "running", None, None
+            ledger.set_scan_status(scan_id, status, finished_at, error)
 
         _restore_batch_state(ledger, batch_id, meta)
     return counts
@@ -1069,9 +1141,14 @@ def _restore_batch_state(ledger: Ledger, batch_id: str, meta: dict[str, Any]) ->
         stage = 1
     else:
         stage = 0
-    if meta.get("status") == "captured":
+    # A captured marker is believed only while every latest scan is complete. A scan whose
+    # terminal page is missing runs again, so the batch goes back to capturing with it.
+    captured = meta.get("status") == "captured" and _all_complete(
+        list(_latest_by_name(scans).values())
+    )
+    if captured:
         stage = 2
-    status = "captured" if meta.get("status") == "captured" else "capturing"
+    status = "captured" if captured else "capturing"
     ledger.restore_batch_state(
         batch_id, status, stage, meta.get("finished_at") or meta["started_at"]
     )

@@ -88,6 +88,10 @@ def test_a_deep_keyset_or_offset_scan_name_is_unsafe_even_with_the_open_crawl_fi
         "markets_closed_ids_tail",
         "events_by_id_0001",
         "events_by_id_single_0001",
+        # Past 9999 windows the index has five digits. The name must still count as id-range.
+        "events_ids_10000",
+        "markets_closed_ids_10000",
+        "events_by_id_10000",
     ],
 )
 def test_every_scan_name_the_id_range_plan_produces_is_safe(name: str) -> None:

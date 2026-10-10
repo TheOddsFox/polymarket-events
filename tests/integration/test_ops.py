@@ -20,7 +20,6 @@ from fakes.world import demo_world
 from oddsfox_catalogue.backup import MANIFEST, create_backup, verify_backup
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import rebuild_from_raw, run_capture
-from oddsfox_catalogue.gamma.http import MalformedResponse
 from oddsfox_catalogue.pipeline import capture_stage, dbt_stage, load_stage
 from oddsfox_catalogue.rebuild import (
     VERIFIED_TABLES,
@@ -171,9 +170,9 @@ def test_capture_stage_writes_exactly_one_row_on_success(tmp_path: Path) -> None
 def test_capture_stage_writes_one_failed_row_when_capture_raises(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     fake = FakeGamma(demo_world())
-    # A 400 is not retryable: the first list scan fails the batch immediately.
-    fake.fail_status("/events/keyset", 400)
-    with pytest.raises(MalformedResponse):
+    # An ordinary error fails the first list scan at once. An HTTP 400 would be bisected instead.
+    fake.raise_on("/events/keyset", RuntimeError("injected failure"))
+    with pytest.raises(RuntimeError, match="injected failure"):
         capture_stage(settings, "bootstrap", transport=fake.transport(), now=lambda: FIXED_NOW)
 
     rows = _capture_rows(settings)
@@ -182,7 +181,7 @@ def test_capture_stage_writes_one_failed_row_when_capture_raises(tmp_path: Path)
     assert row["stage"] == "capture:bootstrap"
     assert row["status"] == "failed"
     assert row["batch_id"] is not None
-    assert "MalformedResponse" in row["error"]
+    assert "RuntimeError" in row["error"]
 
 
 def _close_event_202_and_load(settings) -> None:

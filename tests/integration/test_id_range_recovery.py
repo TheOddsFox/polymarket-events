@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import BrokenThreadPool
 from pathlib import Path
@@ -19,10 +20,10 @@ import pytest
 
 from fakes.fake_gamma import FakeGamma, Rule
 from fakes.harness import FIXED_NOW, build_runtime
-from fakes.world import demo_world, event_stub, make_event, make_market
+from fakes.world import World, demo_world, event_stub, make_event, make_market
 from oddsfox_catalogue.capture import runner
 from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.reader import iter_scan_pages
+from oddsfox_catalogue.capture.reader import iter_scan_pages, scan_dir_for
 from oddsfox_catalogue.capture.runner import (
     CaptureSummary,
     _finalise_if_complete,
@@ -34,8 +35,7 @@ from oddsfox_catalogue.capture.runner import (
     rebuild_from_raw,
     run_capture,
 )
-from oddsfox_catalogue.capture.writer import read_body
-from oddsfox_catalogue.cli import Terminated
+from oddsfox_catalogue.capture.writer import manifest_path, read_body
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
 from oddsfox_catalogue.gamma.scans import (
     ScanSpec,
@@ -43,6 +43,7 @@ from oddsfox_catalogue.gamma.scans import (
     id_range_scan,
     markets_keyset_open,
 )
+from oddsfox_catalogue.signals import SIGNALS, Terminated
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
 CHILD = TESTS_DIR / "fakes" / "capture_child.py"
@@ -107,6 +108,173 @@ def test_rebuild_restores_planned_scans_that_never_started(tmp_path: Path) -> No
     try:
         resumed = run_capture(resumed_runtime, "bootstrap")
         assert resumed.status == "captured"
+        assert _page_fingerprints(resumed_runtime.ledger, resumed.batch_id) == clean_pages
+    finally:
+        resumed_runtime.ledger.close()
+
+
+def _scan_names(ledger: Ledger, batch_id: str) -> set[str]:
+    return {scan["scan_name"] for scan in ledger.list_scans(batch_id)}
+
+
+def _clean_run(
+    root: Path, make_world: Callable[[], World] = demo_world
+) -> tuple[set[str], list[tuple[str, str, str]]]:
+    """An uninterrupted serial capture: its scan names and page fingerprints."""
+    runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        names = _scan_names(runtime.ledger, summary.batch_id)
+        return names, _page_fingerprints(runtime.ledger, summary.batch_id)
+    finally:
+        runtime.ledger.close()
+
+
+def _lose_ledger(root: Path) -> Ledger:
+    """Delete the ledger files, as a lost or corrupt ledger would, and open an empty one."""
+    for suffix in ("", "-wal", "-shm"):
+        (root / ".state" / f"ledger.sqlite{suffix}").unlink(missing_ok=True)
+    return Ledger(root / ".state" / "ledger.sqlite")
+
+
+def _crash_while_planning(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    """The first planning that adds a scan of ``kind`` writes one scan marker, then crashes."""
+    real_mark = runner._mark_planned
+
+    def mark_then_crash(rt, batch, rows):
+        if rows and rows[0]["kind"] == kind:
+            real_mark(rt, batch, rows[:1])
+            raise SystemExit("simulated crash while planning")
+        real_mark(rt, batch, rows)
+
+    monkeypatch.setattr(runner, "_mark_planned", mark_then_crash)
+
+
+def _planning_crash_then_rebuild_and_resume(
+    root: Path, monkeypatch: pytest.MonkeyPatch, kind: str, make_world: Callable[[], World]
+) -> None:
+    """Crash while planning, lose the ledger, rebuild, and resume to the clean result."""
+    clean_names, clean_pages = _clean_run(root.parent / "clean", make_world)
+    runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
+    _crash_while_planning(monkeypatch, kind)
+    try:
+        with pytest.raises(SystemExit):
+            run_capture(runtime, "bootstrap")
+        batch_id = runtime.ledger.list_batches()[0]["batch_id"]
+        planned = _scan_names(runtime.ledger, batch_id)  # what the ledger committed
+    finally:
+        runtime.ledger.close()
+    monkeypatch.undo()
+
+    fresh = _lose_ledger(root)
+    try:
+        rebuild_from_raw(runtime.settings, fresh)
+        assert _scan_names(fresh, batch_id) == planned
+    finally:
+        fresh.close()
+
+    resumed_runtime, _ = build_runtime(root, FakeGamma(make_world()), env=SERIAL)
+    try:
+        resumed = run_capture(resumed_runtime, "bootstrap")
+        assert resumed.status == "captured"
+        assert _scan_names(resumed_runtime.ledger, resumed.batch_id) == clean_names
+        assert _page_fingerprints(resumed_runtime.ledger, resumed.batch_id) == clean_pages
+    finally:
+        resumed_runtime.ledger.close()
+
+
+def test_a_crash_while_planning_stage_zero_keeps_every_planned_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch marker lists the whole plan before any scan marker, so a lost ledger drops none."""
+    _planning_crash_then_rebuild_and_resume(tmp_path / "crash", monkeypatch, "keyset", demo_world)
+
+
+def test_a_crash_while_planning_stage_one_keeps_every_planned_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """101 markets reference events that no list holds, so stage one plans two chunks.
+
+    The crash writes only the first chunk's marker. The batch marker must keep the second.
+    """
+    _planning_crash_then_rebuild_and_resume(
+        tmp_path / "crash", monkeypatch, "keyset_ids", lambda: _world_with_ghost_references(101)
+    )
+
+
+def test_a_stage_one_chunk_with_a_rejected_id_is_split_and_captured(tmp_path: Path) -> None:
+    """Stage one shares the window policy. A rejected id is split off and quarantined by ID."""
+    poison = "990001"
+    fake = FakeGamma(_world_with_ghost_references(2))
+
+    def rejected_in_a_window(request: httpx.Request) -> bool:
+        return request.url.path == "/events/keyset" and poison in request.url.params.get_list("id")
+
+    def down_by_id(request: httpx.Request) -> bool:
+        return request.url.path == f"/events/{poison}"
+
+    fake.rules.append(
+        Rule(
+            rejected_in_a_window,
+            lambda request: httpx.Response(422, json={"error": "bad window"}),
+            remaining=10**6,
+        )
+    )
+    fake.rules.append(
+        Rule(
+            down_by_id, lambda request: httpx.Response(500, json={"error": "down"}), remaining=10**6
+        )
+    )
+    runtime, _ = build_runtime(tmp_path, fake)
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        batch = runtime.ledger.get_batch(summary.batch_id)
+        scan = runtime.ledger.latest_attempt(summary.batch_id, "events_by_id_0001")
+        assert scan["status"] == "complete"
+        directory = runtime.settings.raw_dir / batch["observation_date"] / batch["batch_id"]
+        failed: list[str] = []
+        for manifest, _records in iter_scan_pages(runtime.settings, batch, scan):
+            body = json.loads(read_body(directory / scan["scan_id"], manifest))
+            failed.extend(item["id"] for item in body.get("fetch_failed", []))
+        assert failed == [poison]
+    finally:
+        runtime.ledger.close()
+
+
+def test_a_complete_marker_without_its_terminal_page_runs_again(tmp_path: Path) -> None:
+    """A scan marked complete is trusted only with its terminal page. Without it, the scan resumes."""
+    clean_names, clean_pages = _clean_run(tmp_path / "clean")
+    root = tmp_path / "damaged"
+    runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=SERIAL)
+    try:
+        summary = run_capture(runtime, "bootstrap")
+        assert summary.status == "captured"
+        batch_id = summary.batch_id
+        batch = runtime.ledger.get_batch(batch_id)
+        scan = runtime.ledger.latest_attempt(batch_id, "events_ids_tail")
+        last_seq = max(page["seq"] for page in runtime.ledger.pages_for_scan(scan["scan_id"]))
+        directory = scan_dir_for(
+            runtime.settings, batch["observation_date"], batch_id, scan["scan_id"]
+        )
+        manifest_path(directory, last_seq).unlink()  # the terminal page is gone from disk
+    finally:
+        runtime.ledger.close()
+
+    fresh = _lose_ledger(root)
+    try:
+        rebuild_from_raw(runtime.settings, fresh)
+        assert fresh.latest_attempt(batch_id, "events_ids_tail")["status"] == "running"
+        assert fresh.get_batch(batch_id)["status"] == "capturing"
+    finally:
+        fresh.close()
+
+    resumed_runtime, _ = build_runtime(root, FakeGamma(demo_world()), env=SERIAL)
+    try:
+        resumed = run_capture(resumed_runtime, "bootstrap")
+        assert resumed.status == "captured"
+        assert _scan_names(resumed_runtime.ledger, resumed.batch_id) == clean_names
         assert _page_fingerprints(resumed_runtime.ledger, resumed.batch_id) == clean_pages
     finally:
         resumed_runtime.ledger.close()
@@ -283,6 +451,18 @@ def _world_with_missing_event() -> object:
     world.add_event(hidden)
     ghost = {"id": "999999", "ticker": None, "slug": None, "title": "gone"}
     world.add_direct_market(make_market("9002", "Ghost market?", event_stub=ghost))
+    return world
+
+
+def _world_with_ghost_references(count: int) -> World:
+    """Demo world whose ``count`` markets each reference an event that no list holds.
+
+    Stage one fetches those ids by ID, 100 to a chunk, so more than 100 of them plan two chunks.
+    """
+    world = demo_world()
+    for number in range(count):
+        ghost = {"id": str(990000 + number), "ticker": None, "slug": None, "title": "gone"}
+        world.add_direct_market(make_market(str(9100 + number), "Ghost market?", event_stub=ghost))
     return world
 
 
@@ -639,7 +819,7 @@ def test_a_signal_during_the_drain_still_closes_every_client(
     def signalled_shutdown(self, wait=True, *, cancel_futures=False):
         shutdowns["n"] += 1
         if shutdowns["n"] == 1:
-            raise Terminated(signal.SIGHUP)  # a signal lands while the pool drains
+            SIGNALS.receive(signal.SIGHUP)  # a signal lands while the pool drains: it is held
         return real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
 
     monkeypatch.setattr(runner, "_run_scan", lambda rt, batch, row, *args, **kwargs: None)
@@ -693,7 +873,7 @@ def test_the_first_signal_is_the_one_that_is_reraised(
     def sighup_shutdown(self, wait=True, *, cancel_futures=False):
         shutdowns["n"] += 1
         if shutdowns["n"] == 1:
-            raise Terminated(signal.SIGHUP)
+            SIGNALS.receive(signal.SIGHUP)  # held: the first signal (SIGTERM) is the one raised
         return real_shutdown(self, wait=wait, cancel_futures=cancel_futures)
 
     monkeypatch.setattr(runner, "_run_scan", lambda rt, batch, row, *args, **kwargs: None)

@@ -125,6 +125,18 @@ class FakeGamma:
 
         self.rules.append(Rule(lambda r: r.url.path == path, respond, times, label=f"crash {path}"))
 
+    def raise_on(self, path: str, error: Exception, times: int = 1) -> None:
+        """Raise ``error`` from the transport for the next ``times`` requests on ``path``.
+
+        An ordinary exception is not an HTTP status, so nothing retries it or bisects it.
+        It fails the scan, which is how a bug inside a scan looks from outside.
+        """
+
+        def respond(_: httpx.Request) -> httpx.Response:
+            raise error
+
+        self.rules.append(Rule(lambda r: r.url.path == path, respond, times, label=f"raise {path}"))
+
     def calls_to(self, path: str) -> int:
         return sum(1 for p, _ in self.requests if p == path)
 
