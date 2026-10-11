@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -25,6 +26,23 @@ from dlt.normalize import Normalize
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.load.runtime import CatalogueRunContext, confined_runtime
 from oddsfox_catalogue.load.source import event_resource, make_pipeline, market_resource
+
+
+def spill_pinned_owner(settings):
+    """An external connection has the same fixed spill identity as a loader-owned one."""
+    from oddsfox_catalogue.limits import remaining_temp_bytes
+
+    settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.temporary_dir.mkdir(parents=True, exist_ok=True)
+    return duckdb.connect(
+        str(settings.warehouse_path),
+        config={
+            "temp_directory": str(settings.temporary_dir),
+            "memory_limit": settings.load.duckdb_memory_limit,
+            "threads": settings.load.duckdb_threads,
+            "max_temp_directory_size": f"{remaining_temp_bytes(settings)}B",
+        },
+    )
 
 
 @pytest.fixture
@@ -454,7 +472,7 @@ def test_external_dlt_pools_preserve_owner_and_refresh_real_connection_limits(
         capture=replace(settings.capture, max_temp_bytes=16 * 1024**2),
     )
     settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
-    owner = duckdb.connect(str(settings.warehouse_path))
+    owner = spill_pinned_owner(settings)
     pools, observed = [], []
     original_borrow = DuckDbConnectionPool.borrow_conn
 
@@ -492,6 +510,7 @@ def test_external_dlt_pools_preserve_owner_and_refresh_real_connection_limits(
                 config["memory_limit"] == "64MiB" and config["threads"] == 1
                 for config, _ in observed
             )
+            assert all("temp_directory" not in config for config, _ in observed)
             assert all(actual[:2] == ("64.0 MiB", 1) for _, actual in observed)
             assert all(pool._conn_borrows == 0 for pool in pools)
             assert owner.execute("SELECT 1").fetchone() == (1,)
@@ -513,7 +532,7 @@ def test_borrowed_semantic_queries_account_storage_and_close_only_fresh_cursor(
     settings = Settings(tmp_path)
     settings = replace(settings, capture=replace(settings.capture, max_temp_bytes=16 * 1024**2))
     settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
-    owner = duckdb.connect(str(settings.warehouse_path))
+    owner = spill_pinned_owner(settings)
     accounted, cursors = [], []
     actual_enforce = semantics.enforce_storage_limits
 
@@ -566,7 +585,7 @@ def test_borrowed_query_fails_closed_when_retained_allowance_is_crossed(tmp_path
 
     settings = Settings(tmp_path)
     settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
-    owner = duckdb.connect(str(settings.warehouse_path))
+    owner = spill_pinned_owner(settings)
     settings = replace(
         settings, capture=replace(settings.capture, max_retained_bytes=retained_bytes(settings) + 2)
     )
@@ -585,5 +604,164 @@ def test_borrowed_query_fails_closed_when_retained_allowance_is_crossed(tmp_path
             with pytest.raises(duckdb.ConnectionException, match="already closed"):
                 cursor.execute("SELECT 1")
         assert owner.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        owner.close()
+
+
+def test_actual_spill_allows_borrowed_queries_and_next_dlt_resources(tmp_path, monkeypatch):
+    from oddsfox_catalogue.limits import remaining_temp_bytes, retained_bytes
+    from oddsfox_catalogue.load.runner import LoadRuntime, _run_resource
+    from oddsfox_catalogue.semantics import bounded_connection
+
+    def offline(*args, **kwargs):
+        pytest.fail("spill regression must remain offline")
+
+    monkeypatch.setattr(socket.socket, "connect", offline)
+    monkeypatch.setattr(socket, "create_connection", offline)
+    settings = Settings(tmp_path)
+    settings = replace(
+        settings,
+        load=replace(settings.load, duckdb_memory_limit="64MiB", duckdb_threads=1),
+        capture=replace(
+            settings.capture, max_retained_bytes=64 * 1024**2, max_temp_bytes=48 * 1024**2
+        ),
+    )
+    settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    observed = []
+    original_borrow = DuckDbConnectionPool.borrow_conn
+
+    def borrow(self, *args, **kwargs):
+        connection = original_borrow(self, *args, **kwargs)
+        assert self._conn_owner is False
+        config = dict(self.credentials.global_config)
+        assert "temp_directory" not in config
+        assert config["memory_limit"] == "16MiB" and config["threads"] == 1
+        assert self._conn.execute(
+            "SELECT current_setting('memory_limit'),current_setting('threads')"
+        ).fetchone() == ("16.0 MiB", 1)
+        observed.append(config)
+        return connection
+
+    monkeypatch.setattr(DuckDbConnectionPool, "borrow_conn", borrow)
+    with bounded_connection(settings, read_only=False) as owner:
+        assert owner.execute("SELECT current_setting('temp_directory')").fetchone() == (
+            str(settings.temporary_dir),
+        )
+        owner.execute("SET memory_limit='16MiB'")
+        settings = replace(settings, load=replace(settings.load, duckdb_memory_limit="16MiB"))
+        with owner.cursor() as sort:
+            sort.execute(
+                "SELECT i,md5(i::VARCHAR) AS payload FROM range(500000) t(i) ORDER BY payload,i"
+            )
+            first = sort.fetchone()
+            assert first is not None
+            spilled_bytes, files = owner.execute(
+                "SELECT sum(size),count(*) FROM duckdb_temporary_files()"
+            ).fetchone()
+            assert spilled_bytes > 0 and files > 0, "the regression requires real temporary files"
+            assert retained_bytes(settings) <= settings.capture.max_retained_bytes
+            count = 1
+            previous = (first[1], first[0])
+            while rows := sort.fetchmany(8192):
+                assert len(rows) <= 8192
+                assert previous <= (rows[0][1], rows[0][0])
+                previous = (rows[-1][1], rows[-1][0])
+                count += len(rows)
+            assert count == 500000
+        with bounded_connection(settings, connection=owner) as borrowed:
+            assert borrowed.execute("SELECT 1").fetchone() == (1,)
+        with confined_runtime(settings.dlt_pipelines_dir):
+            runtime = LoadRuntime(settings, SimpleNamespace(), connection=owner)
+            _run_resource(runtime, event_resource([], materialize_only=True))
+            first_cap = observed[-1]["max_temp_directory_size"]
+            (settings.dlt_pipelines_dir / "additional-working-bytes").write_bytes(b"x" * 1024**2)
+            expected = f"{remaining_temp_bytes(settings)}B"
+            _run_resource(runtime, market_resource([], materialize_only=True))
+            assert observed[-1]["max_temp_directory_size"] == expected
+            assert int(expected[:-1]) < int(first_cap[:-1])
+            with bounded_connection(settings, connection=owner) as borrowed:
+                assert borrowed.execute(
+                    "SELECT count(*) FROM bronze.market_observations"
+                ).fetchone() == (0,)
+        assert owner.execute("SELECT 1").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("entrypoint", ["destination", "query"])
+def test_external_spill_directory_mismatch_rejects_before_mutation_or_consumption(
+    tmp_path, monkeypatch, entrypoint
+):
+    from oddsfox_catalogue.load.source import make_destination
+    from oddsfox_catalogue.semantics import bounded_connection
+
+    settings = Settings(tmp_path)
+    settings = replace(settings, load=replace(settings.load, duckdb_memory_limit="64MiB"))
+    owner = spill_pinned_owner(settings)
+    mismatch = replace(
+        settings,
+        paths=replace(settings.paths, state_dir="different-state"),
+        load=replace(settings.load, duckdb_memory_limit="16MiB", duckdb_threads=1),
+    )
+    query = "SELECT current_setting('temp_directory'),current_setting('memory_limit'),current_setting('threads'),current_setting('max_temp_directory_size')"
+    before = owner.execute(query).fetchone()
+    yielded = []
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an incompatible external connection must not reach the dlt factory")
+
+    monkeypatch.setattr("oddsfox_catalogue.load.source.dlt.destinations.duckdb", forbidden)
+    try:
+        with pytest.raises(ValueError, match="incompatible spill directory"):
+            if entrypoint == "destination":
+                make_destination(
+                    settings.warehouse_path,
+                    mismatch.load,
+                    temp_directory=mismatch.temporary_dir,
+                    max_temp_bytes=16 * 1024**2,
+                    connection=owner,
+                )
+            else:
+                with bounded_connection(mismatch, connection=owner):
+                    yielded.append(True)
+        assert not yielded
+        assert owner.execute(query).fetchone() == before
+        assert owner.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["destination", "query"])
+def test_external_spill_directory_accepts_lexically_equivalent_path(tmp_path, entrypoint):
+    from oddsfox_catalogue.load.source import make_destination
+    from oddsfox_catalogue.semantics import bounded_connection
+
+    settings = Settings(tmp_path)
+    settings = replace(settings, load=replace(settings.load, duckdb_memory_limit="64MiB"))
+    owner = spill_pinned_owner(settings)
+    equivalent = replace(settings, paths=replace(settings.paths, state_dir=".state/alias/.."))
+    try:
+        initial = make_destination(
+            settings.warehouse_path,
+            settings.load,
+            temp_directory=settings.temporary_dir,
+            max_temp_bytes=16 * 1024**2,
+        )
+        assert initial.config_params["credentials"]["global_config"]["temp_directory"] == str(
+            settings.temporary_dir
+        )
+        if entrypoint == "destination":
+            destination = make_destination(
+                settings.warehouse_path,
+                equivalent.load,
+                temp_directory=equivalent.temporary_dir,
+                max_temp_bytes=16 * 1024**2,
+                connection=owner,
+            )
+            assert "temp_directory" not in destination.config_params["credentials"].global_config
+        else:
+            with bounded_connection(equivalent, connection=owner) as borrowed:
+                assert borrowed.execute("SELECT 1").fetchone() == (1,)
+        assert owner.execute("SELECT current_setting('temp_directory')").fetchone() == (
+            str(settings.temporary_dir),
+        )
     finally:
         owner.close()

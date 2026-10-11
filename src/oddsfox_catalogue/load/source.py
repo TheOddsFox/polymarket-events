@@ -15,6 +15,7 @@ Every resource shares one contract:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -202,7 +203,16 @@ def make_destination(
     temporary_config = {}
     if temp_directory is not None:
         temp_directory.mkdir(parents=True, exist_ok=True)
-        temporary_config["temp_directory"] = str(temp_directory)
+        if connection is None:
+            temporary_config["temp_directory"] = str(temp_directory)
+        else:
+            current_temp_directory = connection.execute(
+                "SELECT current_setting('temp_directory')"
+            ).fetchone()[0]
+            if not current_temp_directory or os.path.abspath(
+                current_temp_directory
+            ) != os.path.abspath(temp_directory):
+                raise ValueError("borrowed DuckDB connection has an incompatible spill directory")
     if max_temp_bytes is not None:
         temporary_config["max_temp_directory_size"] = f"{max_temp_bytes}B"
     config = {

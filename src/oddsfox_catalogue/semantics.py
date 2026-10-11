@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -94,6 +95,14 @@ def bounded_connection(
     )
     try:
         if borrowed:
+            current_temp_directory = connection.execute(
+                "SELECT current_setting('temp_directory')"
+            ).fetchone()[0]
+            if not current_temp_directory or os.path.abspath(
+                current_temp_directory
+            ) != os.path.abspath(settings.temporary_dir):
+                raise ValueError("borrowed DuckDB connection has an incompatible spill directory")
+            del config["temp_directory"]
             for key, value in config.items():
                 connection.execute(f"SET {key} = ?", [value])
         connection.execute("SET TimeZone = 'UTC'")

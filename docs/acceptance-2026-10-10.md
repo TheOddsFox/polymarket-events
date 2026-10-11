@@ -859,3 +859,34 @@ inside the root lock on every exit, then runtime connection and pipeline
 references clear. The existing checkpoint threshold and commit flushing remain
 unchanged. Recovery regressions and final installed/native/hosted gates are
 required before adoption; the active installed runtime stays fixed meanwhile.
+
+The connection regression checks passed 71 tests, including partial commits,
+SQL rollback, shrinking spill allowances and retained-WAL crash recovery.
+The first complete native run passed 1,111 tests and failed 43 cases using an
+older mocked runtime without the new connection field. Updating that test
+fixture preserved its conflict, schema, precision and bounded-read assertions;
+all 136 tests in the affected scale module then passed. Production files did
+not change during this correction. Full hosted verification remains required.
+
+The independently installed wheel passed both offline workflows, distribution
+audits and all 38 read-only dbt resource checks in 93.243 seconds. Report SHA-256:
+`31a334a4375b4a9f3b8c69bc368274becf45db3119e47e463ff09da8c726cc2e`.
+Its public-market catalogue smoke passed all 24 steps in 111.604 seconds,
+using three attempts (including one retry), 15,436 downloaded bytes and
+56,332,907 retained bytes. Two observations, complete replay, raw rebuild,
+verified backup restoration and preservation of the previous pointer after
+an injected failure passed, with zero quarantine. Real report SHA-256:
+`ae78f0102492c8ca80cde29dd020c8c9b2842d40da80c8bf23831d98abb58ae9`.
+These bounded checks do not complete catalogue-wide acceptance.
+
+Independent verification then exposed a scale failure omitted by the small
+smoke: after a real spill, DuckDB rejects resetting `temp_directory`, even to
+the same path. The candidate was not adopted. Reused connections now validate
+the existing directory and refresh only memory, threads and the remaining spill
+allowance. New owned connections still set the directory initially. Five new
+regression cases force real spill, exercise both subsequent dlt loads and
+borrowed queries, and reject mismatched directories without changing the owner.
+All 212 tests across the four affected modules passed in 43.03 seconds.
+Independent actual-spill, architecture and security verification passed.
+Fresh installed-package, public smoke and final full hosted gates remain
+required for the corrected production bytes before adoption.

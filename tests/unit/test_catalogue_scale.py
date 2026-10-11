@@ -162,19 +162,20 @@ class ObservationConnection:
 def observation_guard(monkeypatch, tmp_path, tables, **cursor_options):
     path = tmp_path / "warehouse.duckdb"
     path.touch()
-    runtime = SimpleNamespace(settings=SimpleNamespace(warehouse_path=path))
-    connection = ObservationConnection(tables, **cursor_options)
+    runtime = SimpleNamespace(settings=SimpleNamespace(warehouse_path=path), connection=None)
+    observed = ObservationConnection(tables, **cursor_options)
 
     @contextmanager
-    def connect(settings):
+    def connect(settings, *, connection):
         assert settings is runtime.settings
+        assert connection is runtime.connection is None
         try:
-            yield connection
+            yield observed
         finally:
-            connection.closed = True
+            observed.closed = True
 
     monkeypatch.setattr("oddsfox_catalogue.load.runner.bounded_connection", connect)
-    return runtime, connection
+    return runtime, observed
 
 
 def observation_rowset(incoming, *, market):
@@ -286,10 +287,12 @@ def test_existing_observation_rejects_untrustworthy_persisted_json(
 
 
 def test_missing_warehouse_does_not_open_a_connection(monkeypatch, tmp_path):
-    runtime = SimpleNamespace(settings=SimpleNamespace(warehouse_path=tmp_path / "missing.duckdb"))
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(warehouse_path=tmp_path / "missing.duckdb"), connection=None
+    )
     monkeypatch.setattr(
         "oddsfox_catalogue.load.runner.bounded_connection",
-        lambda *_: pytest.fail("a missing warehouse must not be opened"),
+        lambda *_, **__: pytest.fail("a missing warehouse must not be opened"),
     )
     _check_existing_observations(runtime, RowSet(events=[observation_row(1)]))
 
@@ -360,7 +363,7 @@ def test_empty_existing_relation_still_rejects_missing_required_columns(tmp_path
     with duckdb.connect(str(path)) as connection:
         connection.execute("CREATE SCHEMA bronze")
         connection.execute(f"CREATE TABLE bronze.{table} ({declaration})")
-    runtime = SimpleNamespace(settings=settings)
+    runtime = SimpleNamespace(settings=settings, connection=None)
     with pytest.raises(duckdb.BinderException, match=missing):
         _check_existing_observations(
             runtime, observation_rowset([observation_row(1, market=market)], market=market)
