@@ -68,21 +68,34 @@ def json_descriptor(value):
 
 
 @contextmanager
-def bounded_connection(settings: Settings, path: Path | None = None, *, read_only=True):
+def bounded_connection(
+    settings: Settings,
+    path: Path | None = None,
+    *,
+    read_only=True,
+    connection: duckdb.DuckDBPyConnection | None = None,
+):
     """Use the operator's memory, spill and retained limits for every semantic query."""
     enforce_storage_limits(settings)
     settings.temporary_dir.mkdir(parents=True, exist_ok=True)
-    connection = duckdb.connect(
-        str(path or settings.warehouse_path),
-        read_only=read_only,
-        config={
-            "memory_limit": settings.load.duckdb_memory_limit,
-            "threads": settings.load.duckdb_threads,
-            "temp_directory": str(settings.temporary_dir),
-            "max_temp_directory_size": f"{remaining_temp_bytes(settings)}B",
-        },
+    config = {
+        "memory_limit": settings.load.duckdb_memory_limit,
+        "threads": settings.load.duckdb_threads,
+        "temp_directory": str(settings.temporary_dir),
+        "max_temp_directory_size": f"{remaining_temp_bytes(settings)}B",
+    }
+    borrowed = connection is not None
+    connection = (
+        connection.cursor()
+        if borrowed
+        else duckdb.connect(
+            str(path or settings.warehouse_path), read_only=read_only, config=config
+        )
     )
     try:
+        if borrowed:
+            for key, value in config.items():
+                connection.execute(f"SET {key} = ?", [value])
         connection.execute("SET TimeZone = 'UTC'")
         yield connection
     finally:

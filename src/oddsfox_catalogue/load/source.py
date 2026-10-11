@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Any
 
 import dlt
+from dlt.destinations.impl.duckdb.configuration import DuckDbCredentials
 from dlt.extract import materialize_schema_item
 from dlt.sources import DltResource
+from duckdb import DuckDBPyConnection
 
 from oddsfox_catalogue.config import LoadSettings
 from oddsfox_catalogue.load.runtime import confined_runtime
@@ -167,6 +169,7 @@ def make_pipeline(
     *,
     temp_directory: Path | None = None,
     max_temp_bytes: int | None = None,
+    connection: DuckDBPyConnection | None = None,
 ) -> dlt.Pipeline:
     """The one dlt pipeline that owns bronze. State lives under ``pipelines_dir``."""
     warehouse.parent.mkdir(parents=True, exist_ok=True)
@@ -175,7 +178,11 @@ def make_pipeline(
         return dlt.pipeline(
             pipeline_name=PIPELINE_NAME,
             destination=make_destination(
-                warehouse, load, temp_directory=temp_directory, max_temp_bytes=max_temp_bytes
+                warehouse,
+                load,
+                temp_directory=temp_directory,
+                max_temp_bytes=max_temp_bytes,
+                connection=connection,
             ),
             dataset_name=load.dataset_name,
             pipelines_dir=str(pipelines_dir),
@@ -189,6 +196,7 @@ def make_destination(
     *,
     temp_directory: Path | None = None,
     max_temp_bytes: int | None = None,
+    connection: DuckDBPyConnection | None = None,
 ):
     """Fresh connection settings for the current remaining operator allowance."""
     temporary_config = {}
@@ -197,16 +205,17 @@ def make_destination(
         temporary_config["temp_directory"] = str(temp_directory)
     if max_temp_bytes is not None:
         temporary_config["max_temp_directory_size"] = f"{max_temp_bytes}B"
-    return dlt.destinations.duckdb(
-        credentials={
-            "database": str(warehouse),
-            "global_config": {
-                **temporary_config,
-                "memory_limit": load.duckdb_memory_limit,
-                "threads": load.duckdb_threads,
-            },
-        }
+    config = {
+        **temporary_config,
+        "memory_limit": load.duckdb_memory_limit,
+        "threads": load.duckdb_threads,
+    }
+    credentials = (
+        {"database": str(warehouse), "global_config": config}
+        if connection is None
+        else DuckDbCredentials(connection, global_config=config)
     )
+    return dlt.destinations.duckdb(credentials=credentials)
 
 
 def interrupted(rows: list[dict[str, Any]], fault: Any) -> Iterator[dict[str, Any]]:

@@ -25,6 +25,7 @@ from typing import Any
 
 import dlt
 from dlt.sources import DltResource
+from duckdb import DuckDBPyConnection
 
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.reader import (
@@ -84,6 +85,7 @@ class LoadRuntime:
     pipeline: dlt.Pipeline | None = None
     batch_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     storage_snapshot: tuple[int, int] | None = None
+    connection: DuckDBPyConnection | None = None
 
 
 @dataclass
@@ -104,6 +106,7 @@ def _pipeline(rt: LoadRuntime) -> dlt.Pipeline:
             rt.settings.load,
             temp_directory=rt.settings.temporary_dir,
             max_temp_bytes=remaining_temp_bytes(rt.settings),
+            connection=rt.connection,
         )
     return rt.pipeline
 
@@ -116,6 +119,7 @@ def _run_resource(rt: LoadRuntime, resource: DltResource):
         rt.settings.load,
         temp_directory=rt.settings.temporary_dir,
         max_temp_bytes=remaining_temp_bytes(rt.settings),
+        connection=rt.connection,
     )
     return pipeline.run(resource, destination=destination, loader_file_format="parquet")
 
@@ -256,7 +260,7 @@ def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
         "payload_hash",
         "normalized",
     )
-    with bounded_connection(rt.settings) as connection:
+    with bounded_connection(rt.settings, connection=rt.connection) as connection:
         tables = {
             row[0]
             for row in connection.execute(
@@ -433,36 +437,42 @@ def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
     Raises ``LoadBlocked`` after registering every batch that passes the quarantine gate, if
     any batch fails it.
     """
-    eligible_batches = rt.ledger.list_batches()
-    for candidate in eligible_batches:
-        if (batch_id is None or batch_id == candidate["batch_id"]) and rt.ledger.pending_controls(
-            candidate["batch_id"]
-        ):
-            raise LoadBlocked(
-                "capture has an interrupted control commit; explicitly resume its batch first"
-            )
-    _reset_load_budget(rt)
-    _preflight_load_bytes(rt, 0)
-    from oddsfox_catalogue.certification import mark_dirty
+    try:
+        eligible_batches = rt.ledger.list_batches()
+        for candidate in eligible_batches:
+            if (
+                batch_id is None or batch_id == candidate["batch_id"]
+            ) and rt.ledger.pending_controls(candidate["batch_id"]):
+                raise LoadBlocked(
+                    "capture has an interrupted control commit; explicitly resume its batch first"
+                )
+        _reset_load_budget(rt)
+        _preflight_load_bytes(rt, 0)
+        from oddsfox_catalogue.certification import mark_dirty
 
-    ensure_warehouse_contract(rt.settings, create=True)
-    mark_dirty(rt.settings, "warehouse load")
-    enforce_storage_limits(rt.settings)
-    summary = LoadSummary()
-    pending = rt.ledger.pending_load_pages(batch_id)
-    for chunk in _chunks(pending, rt.settings.load.max_pages_per_run):
-        work = [chunk]
-        while work:
-            part = work.pop()
-            try:
-                _load_chunk(rt, part, summary)
-            except LoadReservationExceeded:
-                if len(part) == 1:
-                    raise
-            else:
-                continue
-            # Leave the handler to release failed rows before loading either half.
-            midpoint = len(part) // 2
-            work.extend((part[midpoint:], part[:midpoint]))
-    _register_complete_batches(rt, summary, batch_id)
-    return summary
+        ensure_warehouse_contract(rt.settings, create=True)
+        mark_dirty(rt.settings, "warehouse load")
+        enforce_storage_limits(rt.settings)
+        summary = LoadSummary()
+        pending = rt.ledger.pending_load_pages(batch_id)
+        with bounded_connection(rt.settings, read_only=False) as connection:
+            rt.connection = connection
+            for chunk in _chunks(pending, rt.settings.load.max_pages_per_run):
+                work = [chunk]
+                while work:
+                    part = work.pop()
+                    try:
+                        _load_chunk(rt, part, summary)
+                    except LoadReservationExceeded:
+                        if len(part) == 1:
+                            raise
+                    else:
+                        continue
+                    # Leave the handler to release failed rows before loading either half.
+                    midpoint = len(part) // 2
+                    work.extend((part[midpoint:], part[:midpoint]))
+            _register_complete_batches(rt, summary, batch_id)
+        return summary
+    finally:
+        rt.connection = None
+        rt.pipeline = None

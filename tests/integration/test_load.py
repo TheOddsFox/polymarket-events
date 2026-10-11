@@ -231,7 +231,7 @@ def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monk
     original_chunk = runner._load_chunk
     original_write = runner._run_resource
     original_preflight = runner._preflight_load_bytes
-    attempts, current_part = [], ()
+    attempts, owners, current_part = [], [], ()
     reject_market, rejected = False, False
 
     def load_chunk(rt, chunk, summary):
@@ -242,6 +242,8 @@ def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monk
 
     def write(rt, resource):
         nonlocal reject_market
+        assert rt.connection is not None
+        owners.append(rt.connection)
         info = original_write(rt, resource)
         if resource.name == "event_observations" and current_part == page_ids and not rejected:
             formats = {
@@ -251,9 +253,24 @@ def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monk
                 if job.job_file_info.table_name == "event_observations"
             }
             assert "parquet" in formats and "insert_values" not in formats
-            assert _table_count(adaptive, "event_observations") > 0
+            with rt.connection.cursor() as connection:
+                assert (
+                    connection.execute("SELECT count(*) FROM bronze.event_observations").fetchone()[
+                        0
+                    ]
+                    > 0
+                )
+                registry_exists = connection.execute(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema='bronze' AND table_name='batch_registry'"
+                ).fetchone()[0]
+                if registry_exists:
+                    assert (
+                        connection.execute("SELECT count(*) FROM bronze.batch_registry").fetchone()[
+                            0
+                        ]
+                        == 0
+                    )
             assert len(rt.ledger.pending_load_pages(batch_id)) == len(pages)
-            assert _registry_rows(adaptive) == []
             reject_market = True
         return info
 
@@ -274,6 +291,9 @@ def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monk
     monkeypatch.setattr(runner, "_preflight_load_bytes", preflight)
     recovered = _load(adaptive)
     assert rejected
+    assert len({id(owner) for owner in owners}) == 1
+    with pytest.raises(duckdb.ConnectionException, match="already closed"):
+        owners[0].execute("SELECT 1")
     assert attempts == [page_ids, page_ids[: len(pages) // 2], page_ids[len(pages) // 2 :]]
     for field in ("pages_loaded", "event_rows", "market_rows", "quarantined", "batches_registered"):
         assert getattr(recovered, field) == getattr(expected, field)
@@ -300,6 +320,77 @@ def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monk
     assert page_counts(adaptive) == page_counts(reference)
 
 
+def test_market_merge_sql_failure_rolls_back_and_retries_with_same_owner(tmp_path, monkeypatch):
+    from shutil import copytree
+
+    from dlt.destinations.impl.duckdb.sql_client import DuckDbSqlClient
+
+    from oddsfox_catalogue.load import runner
+
+    batch_id = _capture(tmp_path / "capture")
+    for name in ("reference", "retry"):
+        copytree(tmp_path / "capture", tmp_path / name)
+    reference = make_settings(tmp_path / "reference")
+    retry = make_settings(tmp_path / "retry")
+    expected = _load(reference)
+    expected_semantics = _bronze_semantics(reference)
+    original_many = DuckDbSqlClient.execute_many
+    original_sql = DuckDbSqlClient.execute_sql
+    failed, rollback_observed = False, False
+    owners = []
+    original_resource = runner._run_resource
+
+    def resource(rt, item):
+        owners.append(rt.connection)
+        return original_resource(rt, item)
+
+    def execute_many(self, statements, *args, **kwargs):
+        nonlocal failed, rollback_observed
+        rendered = " ".join(statements)
+        target_merge = '"bronze"."market_observations"' in rendered and "MERGE INTO" in rendered
+        if target_merge and not failed:
+            # DuckDB's one-statement merge normally autocommits. The fault injector opens
+            # a real transaction on dlt's borrowed cursor to exercise SQL rollback/retry.
+            with self.begin_transaction():
+                result = original_many(self, statements, *args, **kwargs)
+                assert (
+                    self.native_connection.execute(
+                        "SELECT count(*) FROM bronze.market_observations"
+                    ).fetchone()[0]
+                    > 0
+                )
+                assert (
+                    self.native_connection.execute(
+                        "SELECT count(*) FROM bronze.event_observations"
+                    ).fetchone()[0]
+                    > 0
+                )
+                failed = True
+                original_sql(self, "SELEC synthetic_transaction_failure")
+            return result
+        if target_merge and failed and not rollback_observed:
+            assert self.native_connection.execute(
+                "SELECT count(*) FROM bronze.market_observations"
+            ).fetchone() == (0,)
+            rollback_observed = True
+        return original_many(self, statements, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_run_resource", resource)
+    monkeypatch.setattr(DuckDbSqlClient, "execute_many", execute_many)
+    recovered = _load(retry)
+    assert failed and rollback_observed
+    assert len({id(owner) for owner in owners}) == 1
+    assert recovered.batches_registered == [batch_id]
+    assert (
+        recovered.pages_loaded,
+        recovered.event_rows,
+        recovered.market_rows,
+        recovered.quarantined,
+    ) == (expected.pages_loaded, expected.event_rows, expected.market_rows, expected.quarantined)
+    assert _bronze_semantics(retry) == expected_semantics
+    assert _load(retry).pages_loaded == 0
+
+
 def test_crash_mid_dlt_load_recovers_without_duplicates(tmp_path: Path) -> None:
     _capture(tmp_path)
     settings = make_settings(tmp_path)
@@ -321,6 +412,87 @@ def test_crash_mid_dlt_load_recovers_without_duplicates(tmp_path: Path) -> None:
         settings, "event_observations"
     )
     assert _table_count(settings, "event_observations") > 0
+
+
+@pytest.mark.parametrize("changed_record", [False, True])
+def test_committed_owner_wal_survives_process_crash_and_resume_checks_conflicts(
+    tmp_path, changed_record
+):
+    from hashlib import sha256
+    from shutil import copytree
+
+    batch_id = _capture(tmp_path / "capture")
+    for name in ("reference", "crashed"):
+        copytree(tmp_path / "capture", tmp_path / name)
+    reference = make_settings(tmp_path / "reference")
+    expected = _load(reference)
+    expected_semantics = _bronze_semantics(reference)
+    settings = make_settings(tmp_path / "crashed")
+    raw_hashes = {
+        path: sha256(path.read_bytes()).hexdigest()
+        for path in settings.raw_dir.rglob("*")
+        if path.is_file()
+    }
+    code = r"""
+import os, socket, sys
+from pathlib import Path
+def offline(*args, **kwargs):
+    raise AssertionError('crash fixture is offline')
+socket.socket.connect = socket.create_connection = offline
+from fakes.harness import FIXED_NOW, make_settings
+from oddsfox_catalogue.capture.ledger import Ledger
+from oddsfox_catalogue.faults import CRASH_EXIT_CODE
+from oddsfox_catalogue.load import runner
+settings = make_settings(Path(sys.argv[1]))
+original = runner._run_resource
+def committed_parent(rt, resource):
+    result = original(rt, resource)
+    if resource.name == 'event_observations':
+        assert rt.connection.execute('SELECT count(*) FROM bronze.event_observations').fetchone()[0] > 0
+        wal = Path(str(settings.warehouse_path)+'.wal')
+        assert wal.is_file() and wal.stat().st_size > 0, 'owner must retain committed WAL before crash'
+        assert rt.ledger.pending_load_pages(), 'page checkpoint must still be pending'
+        os._exit(CRASH_EXIT_CODE)
+    return result
+runner._run_resource = committed_parent
+with Ledger(settings.ledger_path) as ledger:
+    runner.load_pending(runner.LoadRuntime(settings, ledger, now=lambda: FIXED_NOW))
+raise AssertionError('crash hook not reached')
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", code, str(settings.root)],
+        env={**os.environ, "PYTHONPATH": str(TESTS_DIR), "RUNTIME__DLTHUB_TELEMETRY": "false"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert crashed.returncode == CRASH_EXIT_CODE, crashed.stderr
+    wal = Path(str(settings.warehouse_path) + ".wal")
+    assert wal.stat().st_size > 0
+    assert len(sha256(wal.read_bytes()).hexdigest()) == 64
+    with Ledger(settings.ledger_path) as ledger:
+        assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+    if changed_record:
+        # A writable reopen recovers the retained WAL before simulating changed persisted evidence.
+        with duckdb.connect(str(settings.warehouse_path)) as connection:
+            connection.execute(
+                "UPDATE bronze.event_observations SET normalized='{}' WHERE entity_id='101'"
+            )
+        with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
+            _load(settings)
+        assert _registry_rows(settings) == []
+        assert _batch_status(settings, batch_id) == "captured"
+        with Ledger(settings.ledger_path) as ledger:
+            assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+    else:
+        recovered = _load(settings)
+        assert recovered.batches_registered == [batch_id]
+        assert recovered.pages_loaded == expected.pages_loaded
+        assert _bronze_semantics(settings) == expected_semantics
+        assert not wal.exists(), "normal final close checkpoints the retained WAL"
+        assert _load(settings).pages_loaded == 0
+    assert {path: sha256(path.read_bytes()).hexdigest() for path in raw_hashes} == raw_hashes
 
 
 def test_crash_before_registry_recovers_and_registers_once(tmp_path: Path) -> None:

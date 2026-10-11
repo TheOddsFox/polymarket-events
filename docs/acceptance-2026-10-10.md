@@ -825,5 +825,37 @@ downloaded bytes and 53,968,753 retained bytes. Complete semantic replay, raw
 rebuild, verified backup restoration and injected-failure pointer preservation
 passed. Real report SHA-256:
 `00bda882736bca5b07b4e17ae949b91708e1d05f135bfd88c9c3bf5fd28b6b29`.
-The combined full native gate, exact-revision hosted CI and full-root resume
-remain required. Scheduling stays inactive.
+The combined native gate passed 1,142 tests in 446.32 seconds. Exact commit
+`9dd7076a` passed hosted CI run `38159453075`, including the installed workflows;
+independent final verification passed. Its full-root load resumed from the
+12,600-page prefix and reached 19,800 committed pages at 18:25 UTC. Full
+catalogue acceptance remains incomplete. Scheduling stays inactive.
+
+### Reuse the bounded connection for a finite load (2026-10-11)
+
+A 30-second native sample of the running load captured 537 of 1,426 main-thread
+stacks in writable shutdown checkpointing, including 536 in `fsync`. This is a
+sampled interval, not whole-run attribution. A private-filesystem comparison of
+caller-owned connection reuse saved only 1.34%; a relevant comparison on the
+operator's Mac SSD volume was needed before implementation.
+
+The same-volume comparison used 200 identical captured pages in eight ordered
+25-page chunks. All four bronze schemas and complete semantic row digests
+matched: 19,944 event and 49,260 market observations, with no quarantine.
+Load including close fell from 103.109 to 86.189 seconds (16.41%). The candidate's
+34.391-second final close is included. Peak RSS rose from 1.514 to 2.030 GB;
+final output rose from 425 to 570 MB. Its 563 MB WAL disappeared after close.
+Both cases remained within 120 seconds, and combined final output was
+994,686,876 bytes. Report SHA-256:
+`4bedf6e57f5af062e236cef6f6617a6eacb9fd158e69416472a6f54f201df219`.
+One baseline-first pair, warmed inputs and shared-disk activity limit attribution;
+this does not establish a sustained catalogue-wide rate or final storage fit.
+
+The loader uses dlt's supported caller-owned connection credentials for one
+finite load. Resource transactions, raw verification, conflict comparisons,
+adaptive reservations, accounting and registration remain unchanged. Each
+resource and conflict-query cursor gets current finite limits. The owner closes
+inside the root lock on every exit, then runtime connection and pipeline
+references clear. The existing checkpoint threshold and commit flushing remain
+unchanged. Recovery regressions and final installed/native/hosted gates are
+required before adoption; the active installed runtime stays fixed meanwhile.

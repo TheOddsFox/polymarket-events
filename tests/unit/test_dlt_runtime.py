@@ -7,20 +7,24 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from types import SimpleNamespace
 
+import duckdb
 import pytest
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.configuration.specs.runtime_configuration import RuntimeConfiguration
 from dlt.common.configuration.utils import ResolvedValueTrace, TraceLogContext
 from dlt.common.runtime import anon_tracker, telemetry
+from dlt.destinations.impl.duckdb.configuration import DuckDbConnectionPool
 from dlt.extract.concurrency import FuturesPool
 from dlt.load import Load
 from dlt.normalize import Normalize
 
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.load.runtime import CatalogueRunContext, confined_runtime
-from oddsfox_catalogue.load.source import event_resource, make_pipeline
+from oddsfox_catalogue.load.source import event_resource, make_pipeline, market_resource
 
 
 @pytest.fixture
@@ -234,9 +238,12 @@ else:
     from oddsfox_catalogue.gamma.http import GammaClient
     from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
     from dlt.pipeline.pipeline import Pipeline
+    import duckdb
 
     original_run = Pipeline.run
     resource_runs = []
+    resource_pipelines = []
+    resource_owners = []
     def checked_run(self, *args, **kwargs):
         traces = Container()[TraceLogContext]
         assert traces is not caller
@@ -246,6 +253,8 @@ else:
         assert Container()[TraceLogContext] is traces
         assert traces.resolved_traces == traces.all_traces == []
         resource_runs.append(traces)
+        resource_pipelines.append(self)
+        resource_owners.append(kwargs['destination'].config_params['credentials']._external_conn)
         return result
     Pipeline.run = checked_run
     body = {
@@ -267,6 +276,9 @@ else:
                 assert result.pages_loaded == result.market_rows == 1
                 assert len(result.batches_registered) == 1
                 batches.extend(result.batches_registered)
+                assert load_runtime.pipeline is load_runtime.connection is None
+                with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+                    assert connection.execute('SELECT count(*) FROM bronze.batch_registry').fetchone()[0] == len(batches)
                 assert Container()[TraceLogContext] is caller
                 assert caller.logging_enabled is True
                 assert (tuple(caller.resolved_traces), tuple(caller.all_traces)) == caller_history
@@ -276,7 +288,16 @@ else:
             assert len(resource_runs) == 12
             assert Container()[TraceLogContext] is caller
             assert (tuple(caller.resolved_traces), tuple(caller.all_traces)) == caller_history
-            pipeline = load_runtime.pipeline
+            pipeline = resource_pipelines[-1]
+            assert len({id(owner) for owner in resource_owners}) == 3
+            assert all(len({id(owner) for owner in resource_owners[start:start+4]}) == 1 for start in (0,4,8))
+            for owner in resource_owners:
+                try:
+                    owner.execute('SELECT 1')
+                except duckdb.ConnectionException:
+                    pass
+                else:
+                    raise AssertionError('owner survived finite invocation')
         finally:
             client.close()
 assert pipeline.config.enable_runtime_trace is False
@@ -418,3 +439,151 @@ def test_exercised_dlt_worker_and_queue_config_is_single_worker(tmp_path, monkey
     assert effective["extract"] and set(effective["extract"]) == {(1, 1)}
     assert effective["normalize"] and set(effective["normalize"]) == {(1, "none")}
     assert effective["load"] and set(effective["load"]) == {(1, "none")}
+
+
+def test_external_dlt_pools_preserve_owner_and_refresh_real_connection_limits(
+    tmp_path, monkeypatch
+):
+    from oddsfox_catalogue.limits import remaining_temp_bytes
+    from oddsfox_catalogue.load.runner import LoadRuntime, _run_resource
+
+    settings = Settings(tmp_path)
+    settings = replace(
+        settings,
+        load=replace(settings.load, duckdb_memory_limit="64MiB", duckdb_threads=1),
+        capture=replace(settings.capture, max_temp_bytes=16 * 1024**2),
+    )
+    settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    owner = duckdb.connect(str(settings.warehouse_path))
+    pools, observed = [], []
+    original_borrow = DuckDbConnectionPool.borrow_conn
+
+    def borrow(self, *args, **kwargs):
+        connection = original_borrow(self, *args, **kwargs)
+        assert self._conn is owner and self._conn_owner is False
+        pools.append(self)
+        observed.append(
+            (
+                dict(self.credentials.global_config),
+                owner.execute(
+                    "SELECT current_setting('memory_limit'),current_setting('threads'),"
+                    "current_setting('max_temp_directory_size')"
+                ).fetchone(),
+            )
+        )
+        return connection
+
+    monkeypatch.setattr(DuckDbConnectionPool, "borrow_conn", borrow)
+    try:
+        with confined_runtime(settings.dlt_pipelines_dir):
+            runtime = LoadRuntime(settings, SimpleNamespace(), connection=owner)
+            _run_resource(runtime, event_resource([], materialize_only=True))
+            pipeline = runtime.pipeline
+            first = observed[-1]
+            (settings.dlt_pipelines_dir / "retained-working-bytes").write_bytes(b"x" * 1024**2)
+            expected = f"{remaining_temp_bytes(settings)}B"
+            _run_resource(runtime, market_resource([], materialize_only=True))
+            assert runtime.pipeline is pipeline
+            second = observed[-1]
+            assert second[0]["max_temp_directory_size"] == expected
+            assert int(expected[:-1]) < int(first[0]["max_temp_directory_size"][:-1])
+            assert second[1][2] != first[1][2]
+            assert all(
+                config["memory_limit"] == "64MiB" and config["threads"] == 1
+                for config, _ in observed
+            )
+            assert all(actual[:2] == ("64.0 MiB", 1) for _, actual in observed)
+            assert all(pool._conn_borrows == 0 for pool in pools)
+            assert owner.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        owner.close()
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM bronze.market_observations").fetchone() == (
+            0,
+        )
+
+
+@pytest.mark.parametrize("failure", [None, KeyboardInterrupt])
+def test_borrowed_semantic_queries_account_storage_and_close_only_fresh_cursor(
+    tmp_path, monkeypatch, failure
+):
+    from oddsfox_catalogue import semantics
+    from oddsfox_catalogue.limits import remaining_temp_bytes
+
+    settings = Settings(tmp_path)
+    settings = replace(settings, capture=replace(settings.capture, max_temp_bytes=16 * 1024**2))
+    settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    owner = duckdb.connect(str(settings.warehouse_path))
+    accounted, cursors = [], []
+    actual_enforce = semantics.enforce_storage_limits
+
+    def enforce(selected):
+        assert selected is settings
+        accounted.append(True)
+        actual_enforce(selected)
+
+    monkeypatch.setattr(semantics, "enforce_storage_limits", enforce)
+    try:
+        with semantics.bounded_connection(settings, connection=owner) as first:
+            assert first is not owner
+            first_setting = first.execute(
+                "SELECT current_setting('max_temp_directory_size')"
+            ).fetchone()[0]
+        (settings.temporary_dir / "additional-spill").write_bytes(b"x" * 1024**2)
+        expected = remaining_temp_bytes(settings)
+
+        def query():
+            with semantics.bounded_connection(settings, connection=owner) as second:
+                assert second is not owner and second is not first
+                cursors.append(second)
+                value, timezone = second.execute(
+                    "SELECT current_setting('max_temp_directory_size'),current_setting('TimeZone')"
+                ).fetchone()
+                assert value != first_setting and timezone == "UTC"
+                assert expected < settings.capture.max_temp_bytes
+                if failure is not None:
+                    raise failure("synthetic query interruption")
+
+        if failure is None:
+            query()
+        else:
+            with pytest.raises(failure, match="synthetic query interruption"):
+                query()
+        assert accounted == [True] * 4
+        for cursor in [first, *cursors]:
+            with pytest.raises(duckdb.ConnectionException, match="already closed"):
+                cursor.execute("SELECT 1")
+        assert owner.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+def test_borrowed_query_fails_closed_when_retained_allowance_is_crossed(tmp_path, phase):
+    from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
+    from oddsfox_catalogue.limits import retained_bytes
+    from oddsfox_catalogue.semantics import bounded_connection
+
+    settings = Settings(tmp_path)
+    settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
+    owner = duckdb.connect(str(settings.warehouse_path))
+    settings = replace(
+        settings, capture=replace(settings.capture, max_retained_bytes=retained_bytes(settings) + 2)
+    )
+    yielded = []
+    try:
+        if phase == "before":
+            (tmp_path / "extra-retained").write_bytes(b"xxx")
+        with (
+            pytest.raises(RequestBudgetExceeded, match="retained"),
+            bounded_connection(settings, connection=owner) as cursor,
+        ):
+            yielded.append(cursor)
+            (tmp_path / "extra-retained").write_bytes(b"xxx")
+        assert bool(yielded) is (phase == "after")
+        for cursor in yielded:
+            with pytest.raises(duckdb.ConnectionException, match="already closed"):
+                cursor.execute("SELECT 1")
+        assert owner.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        owner.close()
