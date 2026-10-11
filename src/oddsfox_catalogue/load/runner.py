@@ -261,20 +261,19 @@ def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
             ("event_observations", rows.events),
             ("market_observations", rows.markets),
         ):
-            if table not in tables:
+            if table not in tables or not incoming:
                 continue
             columns = fields + (
                 ("source_kind", "json_pointer") if table == "market_observations" else ()
             )
             by_id = {row["observation_id"]: row for row in incoming}
-            for offset in range(0, len(incoming), 512):
-                ids = [row["observation_id"] for row in incoming[offset : offset + 512]]
-                existing = connection.execute(
-                    f"SELECT {', '.join(columns)} FROM bronze.{table} "
-                    "WHERE observation_id IN (SELECT unnest(?))",
-                    [ids],
-                ).fetchall()
-                for values in existing:
+            existing = connection.execute(
+                f"SELECT {', '.join(columns)} FROM bronze.{table} "
+                "WHERE observation_id IN (SELECT unnest(?))",
+                [list(by_id)],
+            )
+            while values_batch := existing.fetchmany(512):
+                for values in values_batch:
                     row = by_id[values[0]]
                     prior = dict(zip(columns, values, strict=True))
                     for field in columns:

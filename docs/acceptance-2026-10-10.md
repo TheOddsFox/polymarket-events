@@ -291,6 +291,103 @@ temporary root. Invocation 13's completion summary has SHA-256
 The two earlier failed full runs remain retained. Catalogue-wide load and all
 subsequent acceptance gates remain pending.
 
+The refinement was committed and pushed on the existing feature branch as
+`e8953f4ef9095fddda24654b312a53b5d662c66a`; `main` remains unchanged.
+[Hosted CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38114947814)
+passed: 873 tests in 593.12 seconds and the installed-package workflow.
+The finalized immutable runtime manifest binds that commit to the existing
+proof-8 wheel, CLI and 77 code/dbt files; SHA-256
+`e3c7def5d19c8f7a8426b4e3156326f5c8051e864704f62c3f796dd980e0b26b`.
+Verification of this binding accessed no operator-root data.
+
+A separately supervised same-batch offline load was authorized with unchanged
+configuration, working directory, normalization, schema and load50 boundaries.
+Its helper began complete-capture verification at 05:37:29 UTC; no load child or
+terminal outcome had yet been reported at 05:44 UTC. The reviewed launcher pins
+the original terminal evidence and 4,150 committed checkpoints, verifies raw
+inventory before and after, and starts only `load --batch-id` for the named
+bootstrap. It does not acquire source data or continue to build/publication.
+The launcher passed 107 self-checks; independent security review passed focused
+rejection and valid-state checks. Catalogue-wide fit and recovery remain unverified.
+
+The proof-8 load child started at 05:45:06.574447 UTC. Its first observer at
+05:48:54–58 UTC still found the original 4,150 committed pages. A narrow sample
+of that registered child at 05:50:30 UTC found it active, with 96.1% CPU and
+2,791,488 KiB RSS. These are point measurements, not evidence of a completed
+chunk, peak usage or full-catalogue fit. No further acquisition, build or
+publication was started.
+
+The first new 50-page chunk committed at 05:50:29.929 UTC. At 05:56:36–47 UTC,
+the named offline load reached 4,400 committed pages / 428,577 source records,
+with 65,554 pages pending. No subsequent stage ran.
+
+A separate source refinement reduces persisted-observation validation to one
+parameterized query per populated relation and consumes every match in batches
+of 512. All projections and exact comparisons remain unchanged, including
+conflicting persisted duplicates. Architecture, data and actual-patch security
+review passed. The old function failed five query/stream regressions; the
+refinement passed all 37 focused cases and independent verification, plus
+lint/format/diff checks. A SQL-only synthetic benchmark returned identical rows
+with 32 queries reduced to one; its measured speed gain was modest. It neither
+diagnoses the live timing nor proves internal DuckDB memory use or full fit.
+This refinement is uncommitted and uninstalled; the active loader remains on
+the verified proof-8 package. Full-suite and distribution gates remain pending.
+
+At the 06:31:14–06:35:10 UTC resource checkpoint, the named offline load had
+committed 5,050 pages / 492,704 source records. Sequential installed resource
+walks measured 19,836,798,446 whole-root bytes and 846,285,057 temporary bytes,
+within the unchanged 64 GiB and 8 GiB limits. These are active points, not peaks
+or proof of final fit. The observer's typed settings matched the pinned effective
+configuration and the reviewed installed settings loader. A failed private
+observer's incomplete measurement and correction are retained separately.
+
+The supervised operator sent one SIGINT to the registered CLI child at
+06:38:41.695704 UTC after checking its exact identity. The child exited 1 at
+06:41:06.184582 UTC, with the named load stage failed at 06:41:05.860 UTC and
+`RuntimeError: Query interrupted` in the read-only conflict check. The actual
+checkpoint was 5,100 loaded pages / 64,854 pending, beyond the pause-point
+measurement. The supervisor terminated with exit 1 and preserved its original
+`failed_retained_for_explicit_recovery` classification. Its capture/schema/runtime
+postflight passed. The narrow final audit confirmed both owned processes absent
+and the existing lock available without changing its contents, size or mtime.
+The 5,100 committed pages contain 497,674 source records. The batch remains
+captured, certification dirty and the publication pointer absent.
+
+The supervisor's quiescent 06:48:42–43 UTC resource point measured
+19,848,848,330 retained bytes and 860,353,773 temporary bytes. All caps remain
+unchanged. Operational dlt inventory has 306 loaded directories / 860,340,299
+bytes, with no new or normalized directories; those counts do not verify package
+semantics. No captures, checkpoints or packages were pruned. No replacement
+writer or later catalogue-wide stage has started.
+
+The conflict-query refinement then passed isolated `scripts/verify`: all 910
+tests in 399.69 seconds, with unchanged test deadlines, plus dependency,
+lint/format, dbt parse and diff checks. Log SHA-256:
+`d4ba047aeaf86c7ffaa6d2c11ddee28c3e4150af226341bb03471b6c808c4aff`.
+Installed proof 9 passed in 54.426 seconds outside the checkout, including
+read-only dbt resources, package-content auditing and both offline workflows.
+Its catalogue workflow measured ten HTTP attempts / 20,530 bytes and compared
+29 semantic relations, 30 warehouse schemas and seven published relations,
+including replay, raw rebuild, verified restoration and failure preservation.
+Its metadata workflow measured one attempt / 1,220 bytes and remained compatible.
+
+Proof-9 wheel SHA-256:
+`14f4790c51c4920cf23213b6e069f0471f9805b94c0b5c8620e840ba239f60a4`
+(154,493 bytes / 82 members); sdist:
+`448ca1ee32874bed3eac5eaee83a9460b1c2aa726ac9962c4ebb92cb0b47a289`
+(204,219 bytes / 86 members). Installed report SHA-256:
+`9acaad2a779b194cff346102d01fd3c9a5ea852d5cab37417d1944664ba3b857`.
+The proof-9 real-data smoke passed in 39.403776 seconds at 07:02:32–07:03:11 UTC
+with two requests, 15,418 downloaded bytes and 54,190,700 whole-output retained
+bytes. Market `5234660` provided two observations, one published market and two
+CTF outcomes, with no quarantine. All semantic/recovery/failure-preservation checks
+passed within the unchanged smoke limits. Report SHA-256:
+`303e8de142b4b88e59bcd9e6a5f8b955bb549d463f8e07bc0169ade5378724f0`.
+Committed-source binding and full-load resume remain pending. The private restart
+check has separate actual terminal and 5,100-prefix
+bindings. Its reviewed projection correction permits only the omitted null dbt
+field in the compact audit; the complete stage and every other field remain exact.
+
 Remaining gates: complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
