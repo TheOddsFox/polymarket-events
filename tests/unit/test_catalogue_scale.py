@@ -9,6 +9,7 @@ from datetime import timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
+import duckdb
 import pytest
 
 from fakes.fake_gamma import FakeGamma
@@ -17,7 +18,7 @@ from fakes.world import World, event_stub, make_event, make_market
 from oddsfox_catalogue.capture.reader import DurabilityError, scan_dir_for
 from oddsfox_catalogue.capture.runner import _adopt_durable_pages, run_capture
 from oddsfox_catalogue.capture.writer import manifest_path
-from oddsfox_catalogue.config import CaptureSettings, GammaSettings
+from oddsfox_catalogue.config import CaptureSettings, GammaSettings, Settings
 from oddsfox_catalogue.gamma.paginators import _window_params
 from oddsfox_catalogue.gamma.scans import ID_STEP, sealed_plan
 from oddsfox_catalogue.ids import canonical_json, make_page_id, make_scan_id, parse_batch_id
@@ -34,6 +35,7 @@ from oddsfox_catalogue.load.runner import (
     _check_existing_observations,
     _rows_for_chunk,
 )
+from oddsfox_catalogue.load.source import event_columns, market_columns
 from oddsfox_catalogue.publish import _validate_coverage
 
 BATCH = "20261010T142904Z-bootstrap"
@@ -84,6 +86,13 @@ class ObservationCursor:
         self.offset = len(self.rows)
         return rows
 
+    def fetchone(self):
+        if self.offset == len(self.rows):
+            return None
+        row = self.rows[self.offset]
+        self.offset += 1
+        return row
+
     def fetchmany(self, size):
         assert 0 < size <= 512, "observation result batches must stay bounded"
         if self.fail_after is not None and self.offset >= self.fail_after:
@@ -100,6 +109,9 @@ class ObservationConnection:
         self.prohibit_fetchall = prohibit_fetchall
         self.fail_after = fail_after
         self.queries = []
+        self.schema_binds = []
+        self.wide_queries = []
+        self.query_order = []
         self.cursors = []
         self.closed = False
 
@@ -107,14 +119,26 @@ class ObservationConnection:
         if "information_schema.tables" in query:
             assert params is None
             return ObservationCursor([(table,) for table in self.tables])
+        table = query.split("FROM bronze.", 1)[1].split()[0]
+        columns = query.removeprefix("SELECT ").split(" FROM ", 1)[0].split(", ")
+        if query.endswith("WHERE FALSE"):
+            assert params is None
+            self.schema_binds.append((table, columns))
+            self.query_order.append((table, "schema"))
+            return ObservationCursor([])
         assert "WHERE observation_id IN (SELECT unnest(?))" in query
         assert len(params) == 1 and isinstance(params[0], list)
-        table = query.split("FROM bronze.", 1)[1].split()[0]
         ids = params[0]
         assert all(value not in query for value in ids), "IDs must remain bound parameters"
-        self.queries.append((table, ids))
-        columns = query.removeprefix("SELECT ").split(" FROM ", 1)[0].split(", ")
         selected = set(ids)
+        if columns == ["1"]:
+            assert query.endswith("LIMIT 1")
+            self.queries.append((table, ids))
+            self.query_order.append((table, "probe"))
+            matching = any(row["observation_id"] in selected for row in self.tables[table])
+            return ObservationCursor([(1,)] if matching else [])
+        self.wide_queries.append((table, ids))
+        self.query_order.append((table, "wide"))
         cursor = ObservationCursor(
             [
                 tuple(row[column] for column in columns)
@@ -166,6 +190,7 @@ def test_existing_observations_query_each_relation_once_and_read_bounded_results
     )
     _check_existing_observations(runtime, observation_rowset(incoming, market=market))
     assert connection.queries == [(table, [row["observation_id"] for row in incoming])]
+    assert connection.wide_queries == connection.queries
     assert connection.cursors[0].offset == len(stored)
     assert connection.cursors[0].fetch_sizes
     assert connection.closed
@@ -292,6 +317,74 @@ def test_existing_observation_result_failure_after_first_batch_is_not_silently_a
     )
     with pytest.raises(RuntimeError, match="observation cursor interrupted"):
         _check_existing_observations(runtime, RowSet(events=incoming))
+    assert connection.closed
+
+
+@pytest.mark.parametrize("market", [False, True])
+def test_new_observation_ids_bind_full_schema_before_probe_without_reading_wide_rows(
+    monkeypatch, tmp_path, market
+):
+    incoming = observation_row(1, market=market)
+    incoming["observation_id"] = "new-observation') OR TRUE --"
+    stored = stored_observation(observation_row(2, market=market))
+    stored["payload"] = "unread malformed payload"
+    stored["normalized"] = "unread malformed normalization"
+    table = "market_observations" if market else "event_observations"
+    runtime, connection = observation_guard(monkeypatch, tmp_path, {table: [stored]})
+    _check_existing_observations(runtime, observation_rowset([incoming], market=market))
+    assert connection.schema_binds == [(table, list(incoming))]
+    assert connection.queries == [(table, [incoming["observation_id"]])]
+    assert connection.query_order == [(table, "schema"), (table, "probe")]
+    assert connection.wide_queries == [] and connection.cursors == []
+    assert connection.closed
+
+
+@pytest.mark.parametrize(
+    "market,missing",
+    [(False, "payload"), (False, "normalized"), (True, "source_kind"), (True, "json_pointer")],
+)
+def test_empty_existing_relation_still_rejects_missing_required_columns(tmp_path, market, missing):
+    settings = Settings(tmp_path)
+    path = settings.warehouse_path
+    path.parent.mkdir(parents=True)
+    table = "market_observations" if market else "event_observations"
+    columns = market_columns() if market else event_columns()
+    types = {"text": "VARCHAR", "json": "JSON", "timestamp": "TIMESTAMPTZ"}
+    declaration = ", ".join(
+        f"{name} {types[hint['data_type']]}" for name, hint in columns.items() if name != missing
+    )
+    with duckdb.connect(str(path)) as connection:
+        connection.execute("CREATE SCHEMA bronze")
+        connection.execute(f"CREATE TABLE bronze.{table} ({declaration})")
+    runtime = SimpleNamespace(settings=settings)
+    with pytest.raises(duckdb.BinderException, match=missing):
+        _check_existing_observations(
+            runtime, observation_rowset([observation_row(1, market=market)], market=market)
+        )
+
+
+@pytest.mark.parametrize("market", [False, True])
+def test_mixed_new_and_existing_ids_still_detect_late_conflicting_persisted_duplicate(
+    monkeypatch, tmp_path, market
+):
+    existing = [observation_row(index, market=market) for index in range(1, 513)]
+    incoming = [*existing, observation_row(1000, market=market)]
+    stored = [stored_observation(row) for row in existing]
+    unrelated = stored_observation(observation_row(2000, market=market))
+    unrelated["payload"] = "unread unrelated invalid JSON"
+    conflicting = copy.deepcopy(stored[0])
+    conflicting["payload_hash"] = "late conflicting duplicate"
+    table = "market_observations" if market else "event_observations"
+    runtime, connection = observation_guard(
+        monkeypatch, tmp_path, {table: [*stored, unrelated, conflicting]}, prohibit_fetchall=True
+    )
+    with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
+        _check_existing_observations(runtime, observation_rowset(incoming, market=market))
+    expected = [(table, [row["observation_id"] for row in incoming])]
+    assert connection.queries == expected and connection.wide_queries == expected
+    assert connection.query_order == [(table, "schema"), (table, "probe"), (table, "wide")]
+    assert connection.cursors[0].offset == 513
+    assert connection.cursors[0].fetch_sizes == [512, 512]
     assert connection.closed
 
 

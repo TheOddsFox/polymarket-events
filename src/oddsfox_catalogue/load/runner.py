@@ -267,10 +267,18 @@ def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
                 ("source_kind", "json_pointer") if table == "market_observations" else ()
             )
             by_id = {row["observation_id"]: row for row in incoming}
+            ids = [list(by_id)]
+            projection = f"SELECT {', '.join(columns)} FROM bronze.{table} "
+            # Bind the schema before avoiding large JSON reads for entirely new observations.
+            connection.execute(projection + "WHERE FALSE")
+            hit = connection.execute(
+                f"SELECT 1 FROM bronze.{table} WHERE observation_id IN (SELECT unnest(?)) LIMIT 1",
+                ids,
+            ).fetchone()
+            if hit is None:
+                continue
             existing = connection.execute(
-                f"SELECT {', '.join(columns)} FROM bronze.{table} "
-                "WHERE observation_id IN (SELECT unnest(?))",
-                [list(by_id)],
+                projection + "WHERE observation_id IN (SELECT unnest(?))", ids
             )
             while values_batch := existing.fetchmany(512):
                 for values in values_batch:

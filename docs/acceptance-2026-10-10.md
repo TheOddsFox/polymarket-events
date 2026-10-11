@@ -388,6 +388,90 @@ check has separate actual terminal and 5,100-prefix
 bindings. Its reviewed projection correction permits only the omitted null dbt
 field in the compact audit; the complete stage and every other field remain exact.
 
+The conflict-query refinement was committed as
+`d05a954a05385c67e4ae368db87526d757ea501a` and its
+[hosted CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38120301632)
+passed 910 tests and the installed workflow. The separately attested proof-9
+runtime then resumed only the named bootstrap load. It added 400 pages / 39,700
+source records in 4,584.031578 seconds. At the operator's performance request,
+one identity-checked child-only SIGINT was sent at 08:51:47.298982 UTC. The child
+exited 1 at 08:54:57.916966 UTC; the original failed stage and supervisor
+classification remain retained separately from the intentional intervention.
+
+Its full postflight passed. The quiescent checkpoint is 5,500 loaded pages /
+537,374 source records / 64,454 pending, with unchanged capture, no unresolved
+controls, dirty certification and no pointer. Both registered processes are
+absent and the existing lock is available. The 09:04:07–09 UTC resource point
+measured 21,549,369,593 retained bytes and 983,816,732 temporary bytes; these are
+points, not peaks or proof of final fit. All caps, raw evidence and 330 operational
+loaded dlt package directories remain retained. Completion summary SHA-256:
+`5c7430e324db8b3d291cdaf3aaefef4340f507041c7f155d5c30a5111628358f`;
+full actual checkpoint binding:
+`04413ba9f3f3b71dad3331105b16b056aa28bc1aa970ef11c21161cfb2284a89`.
+
+A supervised read-only diagnostic then selected the next 50 pages in production
+order: 43,578,442 declared body bytes, 4,990 event observations, 8,835 market
+observations and no quarantine. It used the attested proof-9 code, immutable
+query-only SQLite, read-only DuckDB, 2 GB memory / two threads, zero spill and
+300-second query / 420-second process deadlines. The original conflict check
+was interrupted at its query deadline. Its 304.605691-second phase is a lower
+bound, not a completed-query timing. The source checkpoint and file metadata
+remained unchanged. Supervisor SHA-256:
+`063a9169afbb4073f66cf71c0c342ed6d035aa0e2f2c9acd1455e5603ecca35e`;
+child report:
+`3ead50e72989b7869b9480d8e888c1e0a8cb459d50c931fbfaff7241f90854a0`.
+
+The same frozen input was measured once with a no-hit prototype: bind all 11/13
+required columns with a zero-row query, then probe only the parameterized
+observation IDs. Both populated relations had no matches. Schema binding plus
+the probe and connection accounting finished in 6.434563 seconds. Normalization
+took 36.623727 seconds in the baseline and 34.762518 seconds in the prototype;
+budget resets took 3.387112 and 1.734281 seconds respectively. This one sequential
+pair suggests over 47-fold improvement in the measured no-hit conflict phase;
+cache effects and profiling overhead remain, and overall loader speed is not
+yet measured. The prototype completed in 51.449577 seconds and left the
+checkpoint and file metadata unchanged. Supervisor SHA-256:
+`492f7f0342497344893dfee7af7f509d223754e7f580ac8f4ce0161bae0abe5b`;
+child report:
+`0455895e74c057bf0c8e0817d0cc3d93f171640b1bab00eb4b0be2362e99a92c`.
+
+The corresponding production refinement binds the schema before a narrow ID
+probe. New IDs avoid the wide JSON scan; any matching ID still triggers the
+unchanged exhaustive, bounded conflict comparison. Architecture, data and
+production security review approved this design. The test engineer's 85-case
+focused module passed in 7.15 seconds; independent verification passed those
+85 cases and two conflicting-replay integration cases, plus lint/format/diff
+checks. The new cases exercise zero-hit wide-read avoidance, real DuckDB
+missing-column binding and mixed IDs with late conflicting persisted duplicates.
+It changes neither normalization, schemas, dlt persistence, checkpoints nor
+allowances.
+
+Installed proof 10 passed in 63.6 seconds outside the checkout, including
+package-content auditing, frozen dbt resources and both offline workflows.
+Catalogue acquisition measured ten attempts / 20,530 bytes; metadata measured
+one attempt / 1,220 bytes. Wheel SHA-256:
+`921e7551d859ec00d9c788b80767228d55e4c31751a33877044b9eb8e511ce2f`
+(154,611 bytes); sdist:
+`76da7877923a25f5cdbbbdc233c3839743bb751ddd22bda5ca04adca3fca046e`
+(206,240 bytes). Installed report SHA-256:
+`079a821db5ab150fa625855f8798d0e74b4dc9f80a60c24be730f1ca6fcd73a6`.
+
+The proof-10 real-data smoke passed at 09:39:45–09:40:32 UTC in 46.912871
+seconds: two attempts, 15,372 downloaded bytes and 54,192,011 whole-output
+retained bytes. It compared all 29 semantic relations, 30 schemas and seven
+publications, with two observations, one published market, two CTF outcomes
+and no quarantine. Replay, raw rebuild, fresh verified restoration and the
+injected-failure pointer check passed within the unchanged smoke bounds.
+Report SHA-256:
+`461ab8358e93bd8a15155ec8f9dc806b5671e04907ea96f8636f6e098504a9cb`.
+Isolated `scripts/verify` passed all 918 tests in 511.43 seconds, with unchanged
+test deadlines, plus dependency, lint/format, dbt parse and diff checks. Log
+SHA-256:
+`c96bcd6e5e430454144920cbf16b928e1e33caa7b648bc6e6b53725deb763ab1`.
+Committed-source/runtime attestation and exact-commit hosted CI remain pending
+for this refinement. Catalogue-wide throughput remains unmeasured until the
+verified named load resumes.
+
 Remaining gates: complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
