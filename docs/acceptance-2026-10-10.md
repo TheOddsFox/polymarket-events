@@ -153,12 +153,145 @@ fixture server; that failed evidence remains retained. The permitted loopback-on
 rerun passed. The repeat real smoke above used this new wheel and passed all recovery
 and semantic comparisons with complete request accounting.
 
-Commit and exact-head hosted CI remain pending for this correction. Every prior
-installation remains retained. Live acquisition will switch only at an explicit
-continuation boundary. Read-only SQLite inspections may update its shared-memory
-readmarks; they do not alter registered evidence or the main ledger's semantic state.
+The correction was committed as `89c409049d67ab9e74acb56d96122a56ae0c5e07`;
+[exact-head hosted CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38073588587)
+passed all 859 tests and the installed workflows. Every prior installation remains
+retained. Read-only SQLite inspections may update its shared-memory readmarks;
+they do not alter registered evidence or the main ledger's semantic state.
 
-Remaining gates: complete bootstrap, daily refresh and reconcile; immutable release
+## Completed bootstrap capture and active full load
+
+The same sealed batch was explicitly resumed without increasing allowances.
+Invocations 7 onward use proof 7b; invocations 8 onward set the existing positive
+`load.max_pages_per_run` control to 50. Admission against a frozen 200-page chunk
+failed its conservative 8 GiB staging estimate; the same pages passed as four
+50-page chunks. This changes chunk size, not capture scope or resource caps.
+
+| Invocation | Attempts | Received bytes | Capture duration (seconds) | Added pages | Added records | Capture result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 7 | 15,633 | 4,294,981,439 | 8,675.502 | 15,619 | 580,098 | Download allowance |
+| 8 | 7,999 | 4,294,975,305 | 4,497.552 | 7,998 | 629,504 | Download allowance |
+| 9 | 6,399 | 4,294,970,026 | 3,520.228 | 6,398 | 619,608 | Download allowance |
+| 10 | 6,377 | 4,294,979,267 | 3,537.390 | 6,376 | 602,291 | Download allowance |
+| 11 | 6,805 | 4,294,970,558 | 3,782.375 | 6,804 | 589,439 | Download allowance |
+| 12 | 6,255 | 4,294,972,395 | 3,532.816 | 6,254 | 596,550 | Download allowance |
+| 13 | 6,255 | 2,959,428,549 | 4,246.752 | 6,255 | 398,801 | Complete |
+
+Bootstrap capture finished at **2026-10-11 02:59:23.888 UTC** with 69,954 committed
+pages / 5,415,266 top-level source records. Cumulative accounting is 70,000 actual
+attempts / 50,278,242,921 received bytes, including retries and partial responses.
+All 136 core scans reached their original high-water marks. The existing follow-up
+mechanism recovered 408 referenced parent events through five successful empty bulk
+responses followed by five finite individual-ID scans. Committed scope and plans
+agree with the ledger; only observed parent-ID provenance was added. This does not
+expand numeric high-water marks or implement exhaustive inactive-ID discovery.
+
+The automatic load began at 02:59:23.896 UTC under the same invocation. At
+03:31:09–11 UTC, 3,050 pages / 296,850 source records were committed loaded.
+The actual whole root measured 11,163,929,921 bytes and temporary storage
+259,956,436 bytes, below the unchanged 64/8 GiB limits. These sequential active-run
+measurements are points, not peaks. Warehouse build, certification and publication
+have not yet passed.
+
+A frozen recent closed-market audit found 1,485 actual v1 markets / 2,970 outcomes,
+including 530 records with both native-ID arrays populated. Checksums, source
+bounds, exact decimals, nullable fields, memberships and metadata.v1 parity passed;
+zero malformed identities or ownership conflicts occurred in this sample.
+The sample contained no v2/position-only records; synthetic coverage supplies
+those cases. This read-only audit made no source requests and does not certify
+the full warehouse.
+
+Static load investigation found dlt configuration resolver traces accumulate
+independently of disabled pipeline tracing. A scoped fix disables that collector
+before runtime initialization and restores any caller's context and history on
+exit. Architecture and security review approved its boundary. Eighteen focused
+tests passed, including caller-history restoration, initialization failure,
+interruption, nesting, named-worker propagation and repeated synthetic loads.
+Substituting the pre-fix function in an isolated test process failed 12 new cases.
+Independent verification passed the same 18 tests and lint/format/diff checks.
+The first full regression run passed 871 tests and failed one adversarial smoke
+test before its deliberately stalled operation was reached. The test's five-second
+budget included parent setup and isolated-child imports. A focused rerun reproduced
+deadline exhaustion before child launch; the exact cause of the original timeout
+is unavailable. The harness now separates a finite 30-second startup allowance
+from the unchanged 0.15-second operation deadline, armed only after authenticated
+helper entry. A deterministic 5.1-second startup delay passes; PID/group identity,
+termination, stopped heartbeat and failed-report assertions remain required.
+Independent verification passed 58 connected tests. Production deadlines are
+unchanged. The full-suite rerun passed 870 tests and failed three existing dbt
+integration cases at pytest's 120-second timeout (Dagster validation, warning-band
+quality accounting and empty-catalogue publication), in 1,100.67 seconds. Both new
+smoke-startup cases and the tracing tests passed. This remains a failed full gate;
+retain both logs and rerun unchanged checks at a quiescent live-run boundary.
+No resource or test timeout is increased. The active installed load is unchanged.
+No source-row retention leak or causal explanation of its measured RSS is proven.
+
+Installed proof 8 passed in 133.438 seconds; all 77 code/dbt resources match the
+checkout, wheel, sdist and installation, and all 38 dbt resources remain read-only.
+Wheel SHA-256: `ec6ce32b0ae1648e2eea184884aba31b94b892d823bbab4206229945cdda1609`;
+sdist SHA-256: `7bed15916275dd5de9c37739d350ff808d5fd115e3bc76f54490d39fa9ed0564`.
+Both offline workflows passed, including the full semantic and recovery comparisons.
+
+The repeat real proof-8 smoke ran from 03:50:06.145883 to 03:51:51.570805 UTC,
+passing in 105.424598 seconds with two actual requests, 15,384 downloaded bytes
+and 54,190,588 whole-output retained bytes. It checked 29 semantic warehouse
+relations, 30 schemas and seven publications, replay, raw rebuild, verified
+restoration and previous-pointer preservation after injected failure. Its complete
+accounting remains within all smoke bounds. This still does not prove full readiness.
+
+At 03:44:12–03:45:57 UTC the unchanged bootstrap load had committed 3,250 pages.
+Sequential active-run walks measured 16,214,103,048 whole-root bytes and
+1,727,783,300 temporary bytes. Later attribution points in that walk included
+9,904,599,040 warehouse bytes, 132,793,367 WAL bytes, 342,090,116 dlt bytes and
+1,385,693,184 operator temporary bytes. These are neither an atomic sum nor peaks.
+The owned process RSS fell to 2,096,560 KiB at 03:46:07 UTC before this run received
+any code change; the earlier larger sample therefore does not prove a leak.
+
+At the 04:20:24–04:22:33 UTC observation, 3,750 pages / 364,299 source records
+were loaded. The 04:50:23–04:51:36 UTC resource checkpoint found 4,000 loaded
+pages / 388,777 records, stable during the 1.782793-second accounting walks.
+Whole-root retention was 16,226,162,323 bytes and temporary storage 543,565,862
+bytes. Exact owned-PID RSS was 2,913,664 KiB / CPU 99.9% at 04:51:23 UTC.
+These active points are within the unchanged limits; full fit remains unverified.
+No warehouse build or publication had completed. Source commits are
+held while this invocation runs: the legacy audit `git_sha` samples enclosing
+checkout HEAD separately at each stage and does not identify the installed binary.
+Future prepared commands require separate committed-source, installed-content and
+wheel provenance. Their pending source SHA fails closed before operator-root access;
+independent security review passed their 16-operation / 68-comparison preservation.
+Those commands remain unexecuted.
+
+At 05:16:58.273768 UTC, a supervised operator intervention sent one SIGINT to
+the registered CLI child after checking its PID, start time, parent and UID.
+Independent architecture and security review passed the interruption/restart
+procedure. The CLI and helper both terminated with exit 1; the helper's original
+`unexpected_failure` classification is retained. The interrupt occurred during
+the read-only persisted-observation conflict check, not during dlt extraction.
+The unscoped load stage ended at 05:17:03.442 UTC with
+`RuntimeError: Query interrupted`. This was an intentional interruption to obtain
+a quiescent verification boundary; it is not a successful load.
+
+The quiescent audit found both owned processes absent and the existing writer
+lock available without changing its contents, size or modification time.
+All 146 declared scans remain complete and the batch remains captured:
+4,150 pages / 403,755 source records are loaded, with 65,804 pages pending.
+Build certification is dirty. Whole-root retention is 16,252,199,773 bytes and
+temporary storage 573,797,504 bytes. There are 249 retained loaded dlt package
+directories and no new or normalized package directories; directory counts do
+not establish semantic package verification. All evidence is retained, and the
+unchanged limits still apply. No replacement writer or later stage has started.
+
+The unchanged three timeout regressions then passed in 43.75 seconds, with the
+same 120-second pytest limit and offline fixtures. Dagster validation, warning-band
+build/certification and empty-catalogue publication completed their assertions.
+The full unchanged `scripts/verify` then passed all 873 tests in 391.96 seconds,
+along with lock/install, lint/format, dbt parse and diff checks, in an isolated
+temporary root. Invocation 13's completion summary has SHA-256
+`7c9bc5f63bccd0dc7d76d68211f4462a8dacc405849c385fbf377ecc37dd566b`.
+The two earlier failed full runs remain retained. Catalogue-wide load and all
+subsequent acceptance gates remain pending.
+
+Remaining gates: complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
 Scheduling remains inactive. Provider availability, full-load spill demand, cumulative

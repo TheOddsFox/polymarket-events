@@ -434,10 +434,13 @@ def test_expected_crash_code_cannot_hide_a_replaced_current_pointer(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="The package's supported workflow uses POSIX groups")
+@pytest.mark.parametrize("startup_delay", [0.0, 5.1])
 def test_semantic_helper_is_a_bounded_child_and_a_stall_leaves_failed_evidence(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, startup_delay
 ):
-    report = catalogue_report(duration=5.0)
+    startup_allowance = 30.0
+    operation_allowance = 0.15
+    report = catalogue_report(duration=startup_allowance)
     report["output"] = str(tmp_path)
     env = smoke.catalogue_environment(tmp_path)
     marker = tmp_path / "catalogue/helper-entered"
@@ -456,8 +459,11 @@ def stalled_certification(settings):
         time.sleep(0.02)
 certification.assert_build_valid = stalled_certification
 """
+    # Slow imports must not consume the deadline intended to stop a running semantic query.
+    prelude = f"import time; time.sleep({startup_delay!r})\n" + prelude
     real_popen = subprocess.Popen
     children = []
+    entered_at = []
 
     def launch_instrumented_helper(argv, **kwargs):
         assert argv[1:3] == ["-I", "-c"], "Semantic checks must use an isolated child"
@@ -468,30 +474,39 @@ certification.assert_build_valid = stalled_certification
             if child.poll() is not None:
                 break
             time.sleep(0.01)
-        if marker.exists():
-            identity = json.loads(marker.read_bytes())
-            assert identity == {"pid": child.pid, "pgid": child.pid, "uid": os.getuid()}
-            assert os.getpgid(child.pid) == child.pid
-        # Expire during the real helper operation, allowing variable import startup time.
-        report["deadline_monotonic"] = min(report["deadline_monotonic"], time.monotonic() + 0.15)
+        assert marker.exists(), (
+            "The installed helper did not enter within the finite startup allowance; "
+            f"exit={child.poll()}, stderr={os.pread(kwargs['stderr'].fileno(), 4096, 0)!r}"
+        )
+        identity = json.loads(marker.read_bytes())
+        assert identity == {"pid": child.pid, "pgid": child.pid, "uid": os.getuid()}
+        assert os.getpgid(child.pid) == child.pid
+        entered_at.append(time.monotonic())
+        report["deadline_monotonic"] = min(
+            report["deadline_monotonic"], entered_at[0] + operation_allowance
+        )
         return child
 
     monkeypatch.setattr(smoke.subprocess, "Popen", launch_instrumented_helper)
     started = time.monotonic()
     try:
-        with pytest.raises(subprocess.TimeoutExpired):
+        with pytest.raises(subprocess.TimeoutExpired) as timed_out:
             smoke._catalogue_state(tmp_path, report, env)
-        assert time.monotonic() - started < 7.0
+        assert len(entered_at) == 1
+        assert time.monotonic() - entered_at[0] < 2.0
+        assert time.monotonic() - started < startup_allowance + 2.0
         assert marker.exists(), "The installed helper must reach the stalled semantic query"
         assert len(children) == 1 and children[0].poll() is not None
         before = heartbeat.read_bytes()
         time.sleep(0.1)
         assert heartbeat.read_bytes() == before
-        smoke.finish(tmp_path, report, subprocess.TimeoutExpired("semantic helper", 5))
+        smoke.finish(tmp_path, report, timed_out.value)
         saved = json.loads((tmp_path / "report.json").read_bytes())
         assert saved["status"] == "failed"
         assert saved["accounting_complete"] is False
+        assert saved["http_attempts"] == saved["downloaded_bytes"] == 0
         assert saved["steps"][-1]["name"] == "semantic_snapshot"
+        assert saved["steps"][-1]["successful"] is False
     finally:
         for child in children:
             with suppress(ProcessLookupError):

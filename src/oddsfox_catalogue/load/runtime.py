@@ -11,6 +11,7 @@ from dlt.common.configuration.container import Container
 from dlt.common.configuration.providers import DictionaryProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.configuration.specs.runtime_configuration import RuntimeConfiguration
+from dlt.common.configuration.utils import TraceLogContext
 from dlt.common.runtime.run_context import RunContext
 from dlt.common.runtime.telemetry import stop_telemetry
 
@@ -80,16 +81,21 @@ def confined_runtime(pipelines_dir: Path) -> Iterator[None]:
     """Serialize root changes across complete loads and retain a safe context afterward."""
     with _RUNTIME_LOCK:
         container = Container()
-        # Container.get creates missing defaults, which would initialize ambient telemetry.
-        active = container[PluggableRunContext] if PluggableRunContext in container else None  # noqa: SIM401
-        root = Path(pipelines_dir).absolute()
-        if not (
-            active is not None
-            and isinstance(active.context, CatalogueRunContext)
-            and active.context.pipelines_dir == root
-        ):
-            active = PluggableRunContext(CatalogueRunContext(root))
-            # Set explicitly without creating a default context or restoring ambient settings.
-            container[PluggableRunContext] = active
-        with container.injectable_context(active, lock_context_on_yield=True):
-            yield
+        # Resolver histories otherwise grow even when pipeline runtime tracing is disabled.
+        # Use a fresh context so the caller's history is restored without being cleared.
+        traces = TraceLogContext()
+        traces.logging_enabled = False
+        with container.injectable_context(traces, lock_context_on_yield=True):
+            # Container.get creates missing defaults, which would initialize ambient telemetry.
+            active = container[PluggableRunContext] if PluggableRunContext in container else None  # noqa: SIM401
+            root = Path(pipelines_dir).absolute()
+            if not (
+                active is not None
+                and isinstance(active.context, CatalogueRunContext)
+                and active.context.pipelines_dir == root
+            ):
+                active = PluggableRunContext(CatalogueRunContext(root))
+                # Keep the safe root-bound runtime after exit instead of ambient settings.
+                container[PluggableRunContext] = active
+            with container.injectable_context(active, lock_context_on_yield=True):
+                yield

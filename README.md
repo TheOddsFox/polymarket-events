@@ -81,6 +81,9 @@ Completion covers manually invoked catalogue commands. Scheduler definitions and
 optional operator tools; none is activated by installation or verification. CLI and Dagster
 resolve the same packaged dbt resources, warehouse and resource limits. Generated targets,
 logs and dlt state stay under the operator root.
+dlt telemetry, pipeline tracing and configuration resolver tracing are disabled during
+loading. Resolver histories cannot accumulate across chunks; an existing caller's
+trace context is restored when loading exits.
 Optional launchd templates require separate `__PROJECT_ROOT__` and `__OPERATOR_ROOT__`
 paths; editing these templates does not activate scheduling.
 
