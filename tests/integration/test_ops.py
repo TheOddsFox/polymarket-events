@@ -23,6 +23,8 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import rebuild_from_raw, run_capture
 from oddsfox_catalogue.certification import assert_build_valid
 from oddsfox_catalogue.config import load_settings
+from oddsfox_catalogue.metadata import RELATIONS as METADATA_RELATIONS
+from oddsfox_catalogue.metadata import export_metadata
 from oddsfox_catalogue.pipeline import capture_stage, dbt_stage, load_stage
 from oddsfox_catalogue.publish import current_release, publish_release
 from oddsfox_catalogue.rebuild import (
@@ -32,6 +34,7 @@ from oddsfox_catalogue.rebuild import (
     warehouse_fingerprints,
 )
 from oddsfox_catalogue.warehouse import read_open_event_ids
+from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT, ensure_warehouse_contract
 
 REPO = Path(__file__).resolve().parents[2]
 THRESHOLD = '{"max_open_events_drop_pct": 0.9}'
@@ -47,10 +50,35 @@ def built_root(tmp_path_factory) -> Path:
 
 def test_rebuild_from_raw_reproduces_the_live_warehouse(built_root, tmp_path: Path) -> None:
     settings = copy_built(built_root, tmp_path)
-    report = rebuild_and_verify(settings)
+    before_output = tmp_path / "metadata-before-rebuild"
+    before_manifest = export_metadata(settings, ["5001", "5002", "6001"], before_output)
+    rebuild_root = tmp_path / "same-layout-rebuild"
+    report = rebuild_and_verify(settings, scratch=rebuild_root)
     assert report.matched, report.mismatches
     for table in VERIFIED_TABLES:
         assert report.tables[table]["live"] is not None, f"{table} missing from live warehouse"
+    rebuilt = scratch_settings(settings, rebuild_root)
+    assert report.rebuilt_to == rebuilt.warehouse_path
+    ensure_warehouse_contract(rebuilt)
+    after_output = tmp_path / "metadata-after-rebuild"
+    after_manifest = export_metadata(rebuilt, ["5001", "5002", "6001"], after_output)
+    assert (
+        before_manifest["contract"]
+        == after_manifest["contract"]
+        == "oddsfox.polymarket.metadata.v1"
+    )
+    assert before_manifest["files"] == after_manifest["files"]
+    for name in METADATA_RELATIONS:
+        assert (before_output / f"{name}.json").read_bytes() == (
+            after_output / f"{name}.json"
+        ).read_bytes()
+    with duckdb.connect(str(rebuilt.warehouse_path), read_only=True) as connection:
+        assert connection.execute("SELECT contract FROM catalogue_meta.contract").fetchone() == (
+            WAREHOUSE_CONTRACT,
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema='bronze' AND table_name IN ('event_observations','market_observations') AND column_name='payload'"
+        ).fetchone() == (0,)
 
 
 def test_rebuild_detects_a_tampered_live_warehouse(built_root, tmp_path: Path) -> None:
@@ -135,6 +163,15 @@ def test_backup_restores_a_verified_publication_into_a_fresh_root(built_root, tm
         restored.warehouse_path, VERIFIED_TABLES
     ) == warehouse_fingerprints(settings.warehouse_path, VERIFIED_TABLES)
     assert restored.quality == settings.quality
+    ensure_warehouse_contract(restored)
+    source_output, restored_output = tmp_path / "source-metadata", tmp_path / "restored-metadata"
+    source_manifest = export_metadata(settings, ["5001", "5002", "6001"], source_output)
+    restored_manifest = export_metadata(restored, ["5001", "5002", "6001"], restored_output)
+    assert source_manifest["files"] == restored_manifest["files"]
+    for name in METADATA_RELATIONS:
+        assert (source_output / f"{name}.json").read_bytes() == (
+            restored_output / f"{name}.json"
+        ).read_bytes()
 
 
 def test_rebuild_rejects_existing_scratch_without_deleting_evidence(built_root, tmp_path: Path):

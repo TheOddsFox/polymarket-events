@@ -3,7 +3,9 @@
 import duckdb
 
 from oddsfox_catalogue.config import Settings
-from oddsfox_catalogue.contract import CONTRACT, NORMALIZATION_REVISION
+from oddsfox_catalogue.contract import NORMALIZATION_REVISION
+
+WAREHOUSE_CONTRACT = "oddsfox.polymarket.warehouse.v3"
 
 
 class WarehouseVersionError(ValueError):
@@ -45,7 +47,7 @@ def ensure_warehouse_contract(settings: Settings, *, create: bool = False) -> No
             rows = connection.execute(
                 "SELECT contract, normalization_revision FROM catalogue_meta.contract"
             ).fetchall()
-            if rows == [(CONTRACT, NORMALIZATION_REVISION)]:
+            if rows == [(WAREHOUSE_CONTRACT, NORMALIZATION_REVISION)]:
                 return
         elif (
             create
@@ -67,7 +69,7 @@ def ensure_warehouse_contract(settings: Settings, *, create: bool = False) -> No
                 )
                 connection.execute(
                     "INSERT INTO catalogue_meta.contract VALUES (?, ?)",
-                    [CONTRACT, NORMALIZATION_REVISION],
+                    [WAREHOUSE_CONTRACT, NORMALIZATION_REVISION],
                 )
                 connection.execute("COMMIT")
             except BaseException:

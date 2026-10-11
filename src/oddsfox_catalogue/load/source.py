@@ -5,10 +5,10 @@ Every resource shares one contract:
 * ``merge`` with ``insert-only``: a row whose key already exists is never
   rewritten, so replaying a chunk is a no-op and history is never overwritten.
 * ``schema_contract`` freezes columns and data types. Unknown fields belong
-  inside the ``payload`` JSON column, so only a deliberate code change can add
-  a column. A changed envelope therefore fails the load instead of drifting.
-* ``payload`` is declared as ``json``, which stops dlt from exploding nested
-  Gamma objects into child tables.
+  in immutable raw pages; bronze keeps their canonical hash and normalized
+  fields. A changed envelope fails the load instead of drifting.
+* ``normalized`` and quarantine ``payload`` use ``json``, which stops dlt from
+  exploding nested objects into child tables.
 * Resources must be created immediately before their ``pipeline.run``. Building
   several resources first and running them later corrupts dlt's shared schema.
 """
@@ -50,7 +50,6 @@ ENVELOPE_COLUMNS: dict[str, dict[str, Any]] = {
     "source_updated_at": _TIMESTAMP_OPTIONAL,
     "endpoint": _TEXT_REQUIRED,
     "payload_hash": _TEXT_REQUIRED,
-    "payload": _JSON_REQUIRED,
     "normalized": _JSON_REQUIRED,
 }
 

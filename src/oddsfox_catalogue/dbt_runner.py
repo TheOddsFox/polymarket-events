@@ -20,6 +20,7 @@ import duckdb
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.limits import remaining_temp_bytes
 from oddsfox_catalogue.resources import dbt_project_dir
+from oddsfox_catalogue.warehouse_version import ensure_warehouse_contract
 
 DBT_DIR = dbt_project_dir()
 
@@ -158,6 +159,7 @@ def dbt_vars(args: Sequence[str]) -> tuple[dict, list[str]]:
 
 def run_dbt(settings: Settings, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run dbt for the project's own settings: warehouse, project, and state directory."""
+    ensure_warehouse_contract(settings)
     work_dir = settings.state_dir / "dbt" / "invocations" / uuid.uuid4().hex
     if args and args[0] == "build":
         from oddsfox_catalogue.certification import prepare_dbt_execution

@@ -251,7 +251,6 @@ def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
         "source_updated_at",
         "endpoint",
         "payload_hash",
-        "payload",
         "normalized",
     )
     with bounded_connection(rt.settings) as connection:
@@ -291,7 +290,7 @@ def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
                     for field in columns:
                         current = row[field]
                         previous = prior[field]
-                        if field in {"payload", "normalized"}:
+                        if field == "normalized":
                             previous = canonical_json(
                                 json.loads(
                                     previous, parse_float=Decimal, parse_constant=_invalid_number
@@ -452,8 +451,8 @@ def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
     _preflight_load_bytes(rt, 0)
     from oddsfox_catalogue.certification import mark_dirty
 
-    mark_dirty(rt.settings, "warehouse load")
     ensure_warehouse_contract(rt.settings, create=True)
+    mark_dirty(rt.settings, "warehouse load")
     enforce_storage_limits(rt.settings)
     summary = LoadSummary()
     pending = rt.ledger.pending_load_pages(batch_id)

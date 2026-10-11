@@ -99,7 +99,6 @@ def _envelope(
         "source_updated_at": parse_timestamp(record.get("updatedAt")),
         "endpoint": ctx.endpoint,
         "payload_hash": payload_hash(record),
-        "payload": exact_json(record),
     }
 
 

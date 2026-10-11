@@ -15,6 +15,7 @@ from oddsfox_catalogue.certification import BuildInvalid, assert_build_valid, re
 from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
 from oddsfox_catalogue.pipeline import dbt_stage
 from oddsfox_catalogue.semantics import SEMANTIC_RELATIONS
+from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT
 
 
 @pytest.fixture(scope="module")
@@ -27,6 +28,8 @@ def certified_root(tmp_path_factory):
 def test_complete_build_certifies_all_declared_semantics(certified_root, tmp_path):
     settings = copy_built(certified_root, tmp_path)
     receipt = assert_build_valid(settings)
+    assert receipt["binding"]["warehouse_contract"] == WAREHOUSE_CONTRACT
+    assert receipt["binding"]["contract"] == "oddsfox.polymarket.catalogue.v2"
     assert set(receipt["binding"]["warehouse"]["relations"]) == set(SEMANTIC_RELATIONS)
     assert set(receipt["binding"]["published"]) == {
         "events",
@@ -46,7 +49,7 @@ def test_complete_build_certifies_all_declared_semantics(certified_root, tmp_pat
         "UPDATE history.market_metrics SET volume='99999'",
         "UPDATE history.market_history SET question='externally changed'",
         "DELETE FROM core.market_event_bridge",
-        "UPDATE bronze.event_observations SET payload=json_merge_patch(payload, '{\"external\": true}')",
+        "UPDATE bronze.event_observations SET payload_hash='externally changed full source hash'",
         "ALTER TABLE core.events_current ADD COLUMN externally_added INTEGER",
     ],
 )

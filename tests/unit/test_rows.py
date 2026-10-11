@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime
 
 import pytest
 
 from fakes.world import event_stub, make_event, make_market
-from oddsfox_catalogue.ids import observation_id
+from oddsfox_catalogue.ids import observation_id, payload_hash
 from oddsfox_catalogue.load.rows import (
     DuplicateObservation,
     PageContext,
@@ -15,6 +16,7 @@ from oddsfox_catalogue.load.rows import (
     parse_timestamp,
     rows_for_page,
 )
+from oddsfox_catalogue.load.source import event_columns, market_columns
 
 OBSERVED = datetime(2026, 10, 8, 6, 0, 0, tzinfo=UTC)
 
@@ -62,6 +64,23 @@ def test_direct_market_pages_use_market_pointer() -> None:
     assert rows.markets[0]["json_pointer"] == "/markets/0"
 
 
+@pytest.mark.parametrize("key", ["events", "markets"])
+def test_compact_envelope_keeps_full_source_hash_and_frozen_normalized_fields(key):
+    record = (
+        make_event("101", "Compact event")
+        if key == "events"
+        else make_market("8001", "Compact market")
+    )
+    record["unmodeled_source_field"] = {"nullable": None, "nested": [1, 2, 3]}
+    original = deepcopy(record)
+    row = getattr(rows_for_page(_ctx(key), [record]), key)[0]
+    columns = event_columns() if key == "events" else market_columns()
+    assert set(row) == set(columns)
+    assert "payload" not in row
+    assert row["payload_hash"] == payload_hash(original)
+    assert row["normalized"] and record == original
+
+
 def test_record_without_id_is_quarantined_and_rest_of_page_loads() -> None:
     good = make_event("101", "Alpha")
     bad = {"title": "no id"}
@@ -71,6 +90,7 @@ def test_record_without_id_is_quarantined_and_rest_of_page_loads() -> None:
     assert len(rows.quarantine) == 1
     assert rows.quarantine[0]["entity"] == "event"
     assert rows.quarantine[0]["json_pointer"] == "/events/0"
+    assert rows.quarantine[0]["payload"] == bad
 
 
 def test_non_object_record_is_quarantined() -> None:
@@ -78,6 +98,7 @@ def test_non_object_record_is_quarantined() -> None:
 
     assert rows.events == []
     assert len(rows.quarantine) == 1
+    assert rows.quarantine[0]["payload"] == {"value": "not-an-object"}
 
 
 def test_non_list_nested_markets_is_quarantined_not_fatal() -> None:

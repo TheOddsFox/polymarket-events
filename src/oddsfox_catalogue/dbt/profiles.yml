@@ -10,7 +10,8 @@ oddsfox_catalogue:
       path: "{{ env_var('CATALOGUE_WAREHOUSE') }}"
       schema: main
       threads: "{{ env_var('CATALOGUE_DUCKDB_THREADS', '1') | int }}"
-      settings:
+      config_options:
+        threads: "{{ env_var('CATALOGUE_DUCKDB_THREADS', '1') | int }}"
         memory_limit: "{{ env_var('CATALOGUE_DUCKDB_MEMORY_LIMIT', '2GB') }}"
         temp_directory: "{{ env_var('CATALOGUE_DUCKDB_TEMP_DIRECTORY') }}"
         max_temp_directory_size: "{{ env_var('CATALOGUE_DUCKDB_MAX_TEMP_BYTES', '8589934592') }}B"

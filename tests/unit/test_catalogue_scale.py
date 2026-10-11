@@ -52,13 +52,13 @@ def observation_row(index, *, market=False):
         "source_updated_at": None,
         "endpoint": "/markets/keyset" if market else "/events/keyset",
         "payload_hash": f"payload-{index}",
-        "payload": {
-            "id": str(index),
+        "normalized": {
             "amount": Decimal("0.12345678901234567890123456789"),
             "nullable": None,
             "labels": ["Yes", "No"],
+            "minimum": Decimal("0.0100"),
+            "active": None,
         },
-        "normalized": {"amount": Decimal("0.0100"), "active": None},
     }
     if market:
         row.update(source_kind="market_direct", json_pointer=f"/markets/{index}")
@@ -67,8 +67,7 @@ def observation_row(index, *, market=False):
 
 def stored_observation(row):
     stored = copy.deepcopy(row)
-    for field in ("payload", "normalized"):
-        stored[field] = canonical_json(row[field])
+    stored["normalized"] = canonical_json(row["normalized"])
     return stored
 
 
@@ -223,11 +222,10 @@ def test_existing_observation_comparison_preserves_exact_json_nulls_and_timestam
     stored = stored_observation(row)
     stored["observed_at"] = FIXED_NOW.astimezone(timezone(timedelta(hours=2)))
     stored["source_updated_at"] = FIXED_NOW.astimezone(timezone(timedelta(hours=-5)))
-    stored["payload"] = (
+    stored["normalized"] = (
         '{ "labels": ["Yes", "No"], "nullable": null, '
-        '"amount": 0.12345678901234567890123456789, "id": "1" }'
+        '"amount": 0.12345678901234567890123456789, "minimum": 0.01, "active": null }'
     )
-    stored["normalized"] = '{ "active": null, "amount": 0.0100 }'
     table = "market_observations" if market else "event_observations"
     runtime, connection = observation_guard(monkeypatch, tmp_path, {table: [stored]})
     _check_existing_observations(runtime, observation_rowset([row], market=market))
@@ -246,7 +244,7 @@ def test_existing_observation_comparison_preserves_exact_json_nulls_and_timestam
         ("source_updated_at", FIXED_NOW),
         ("endpoint", "/events/keyset"),
         ("payload_hash", "different-payload-hash"),
-        ("payload", '{"amount":0.12345678901234567890123456788}'),
+        ("normalized", '{"amount":0.12345678901234567890123456788}'),
         ("normalized", '{"amount":0.01,"active":false}'),
         ("source_kind", "event_embedded"),
         ("json_pointer", "/events/0/markets/0"),
@@ -266,14 +264,13 @@ def test_existing_observation_rejects_changes_to_projected_evidence(
     assert connection.closed
 
 
-@pytest.mark.parametrize("field", ["payload", "normalized"])
 @pytest.mark.parametrize("invalid_json", ['{"amount":NaN}', '{"amount":Infinity}', "{"])
 def test_existing_observation_rejects_untrustworthy_persisted_json(
-    monkeypatch, tmp_path, field, invalid_json
+    monkeypatch, tmp_path, invalid_json
 ):
     row = observation_row(1)
     stored = stored_observation(row)
-    stored[field] = invalid_json
+    stored["normalized"] = invalid_json
     runtime, connection = observation_guard(monkeypatch, tmp_path, {"event_observations": [stored]})
     with pytest.raises((LoadBlocked, ValueError)):
         _check_existing_observations(runtime, RowSet(events=[row]))
@@ -327,7 +324,6 @@ def test_new_observation_ids_bind_full_schema_before_probe_without_reading_wide_
     incoming = observation_row(1, market=market)
     incoming["observation_id"] = "new-observation') OR TRUE --"
     stored = stored_observation(observation_row(2, market=market))
-    stored["payload"] = "unread malformed payload"
     stored["normalized"] = "unread malformed normalization"
     table = "market_observations" if market else "event_observations"
     runtime, connection = observation_guard(monkeypatch, tmp_path, {table: [stored]})
@@ -341,7 +337,7 @@ def test_new_observation_ids_bind_full_schema_before_probe_without_reading_wide_
 
 @pytest.mark.parametrize(
     "market,missing",
-    [(False, "payload"), (False, "normalized"), (True, "source_kind"), (True, "json_pointer")],
+    [(False, "payload_hash"), (False, "normalized"), (True, "source_kind"), (True, "json_pointer")],
 )
 def test_empty_existing_relation_still_rejects_missing_required_columns(tmp_path, market, missing):
     settings = Settings(tmp_path)
@@ -371,7 +367,7 @@ def test_mixed_new_and_existing_ids_still_detect_late_conflicting_persisted_dupl
     incoming = [*existing, observation_row(1000, market=market)]
     stored = [stored_observation(row) for row in existing]
     unrelated = stored_observation(observation_row(2000, market=market))
-    unrelated["payload"] = "unread unrelated invalid JSON"
+    unrelated["normalized"] = "unread unrelated invalid JSON"
     conflicting = copy.deepcopy(stored[0])
     conflicting["payload_hash"] = "late conflicting duplicate"
     table = "market_observations" if market else "event_observations"
@@ -385,6 +381,33 @@ def test_mixed_new_and_existing_ids_still_detect_late_conflicting_persisted_dupl
     assert connection.query_order == [(table, "schema"), (table, "probe"), (table, "wide")]
     assert connection.cursors[0].offset == 513
     assert connection.cursors[0].fetch_sizes == [512, 512]
+    assert connection.closed
+
+
+@pytest.mark.parametrize("market", [False, True])
+def test_unmodeled_source_change_still_conflicts_with_compact_observation(
+    monkeypatch, tmp_path, market
+):
+    key = "markets" if market else "events"
+    record = make_market("1", "Compact evidence") if market else make_event("1", "Compact evidence")
+    ctx = PageContext("same-page", BATCH, f"/{key}/keyset", FIXED_NOW, key, "a" * 64)
+    first = rows_for_page(ctx, [record])
+    record["unmodeled_source_field"] = {
+        "exact": Decimal("0.12345678901234567890123456789"),
+        "nullable": None,
+    }
+    changed = rows_for_page(ctx, [record])
+    before, after = getattr(first, key)[0], getattr(changed, key)[0]
+    assert "payload" not in before and "payload" not in after
+    assert before["normalized"] == after["normalized"]
+    assert before["observation_id"] == after["observation_id"]
+    assert before["payload_hash"] != after["payload_hash"]
+    table = "market_observations" if market else "event_observations"
+    runtime, connection = observation_guard(
+        monkeypatch, tmp_path, {table: [stored_observation(before)]}
+    )
+    with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
+        _check_existing_observations(runtime, changed)
     assert connection.closed
 
 

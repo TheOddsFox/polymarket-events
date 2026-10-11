@@ -24,7 +24,7 @@ from oddsfox_catalogue.semantics import (
     published_snapshot,
     warehouse_snapshot,
 )
-from oddsfox_catalogue.warehouse_version import ensure_warehouse_contract
+from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT, ensure_warehouse_contract
 
 RECEIPT_REVISION = 1
 ARTIFACT_LIMIT = 64 * 1024**2
@@ -60,6 +60,7 @@ def mark_dirty(settings: Settings, reason: str):
 
 def prepare_dbt_execution(settings: Settings, target: Path, *, args=()):
     """Derive required nodes from a fresh parse before starting the mutating build."""
+    ensure_warehouse_contract(settings)
     if target.exists() or target.is_symlink():
         raise BuildInvalid("dbt invocation requires a fresh artifact directory")
     try:
@@ -280,6 +281,7 @@ def _binding(settings: Settings, effective_vars):
     ensure_warehouse_contract(settings)
     return {
         "contract": CONTRACT,
+        "warehouse_contract": WAREHOUSE_CONTRACT,
         "normalization_revision": NORMALIZATION_REVISION,
         "model_revision": _model_revision(settings),
         "quality": asdict(settings.quality),

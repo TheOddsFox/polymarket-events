@@ -5,6 +5,16 @@ Use a fresh operator root. Retain old evidence and state separately; neither mig
 compatibility views are provided. The independent `oddsfox.polymarket.metadata.v1` JSON bundle
 shape remains supported, using the same normalization rules.
 
+The internal warehouse layout is `oddsfox.polymarket.warehouse.v3`. Bronze event and
+market observations retain the full canonical source hash, normalized fields and
+provenance; the complete source JSON remains in checksummed raw captures. Quarantine
+still retains its decoded payload. This avoids serializing and storing a second full
+source copy for every valid observation. Load and dbt reject the previous warehouse
+stamp before changing its warehouse or build certification. Use a fresh root and
+retain the previous root and its matching installation; no state migration is provided.
+The public catalogue.v2 and metadata.v1 schemas remain unchanged, and immutable release
+verification remains independent of the warehouse layout.
+
 The six original filenames contain explicit replacement projections: `events.parquet`,
 `markets.parquet`, `outcomes.parquet`, `event_tags.parquet`, `event_series.parquet` and
 `market_event_bridge.parquet`. `quarantine.parquet` accounts for malformed records and unusable
@@ -49,6 +59,16 @@ dirty; a complete validated build certifies its captured inputs, coverage, model
 revisions, quality configuration, schemas and semantic digests. Publication recomputes that binding
 under the root lock. Immutable verification checks only the release and does not require the
 warehouse or ledger. The current pointer includes the release-manifest digest.
+
+The packaged dbt profile passes configured engine threads, memory and temporary-storage
+limits to DuckDB when the connection opens. Its scheduler uses the same thread value.
+Spill-directory settings are not reapplied for every adapter cursor after temporary
+storage has been used. These settings preserve the operator's configured resource limits.
+Market staging is a full table rebuilt by dbt, so current and history models reuse the
+same parsed observation projection. It extracts scalar and JSON paths in two grouped
+calls behind a materialized query boundary, preserving the original casts, missing values
+and explicit JSON nulls. Loading makes its previous contents stale and dirties
+certification; publication requires a complete successful rebuild of all models and tests.
 
 Offline rebuild uses exactly the complete capture inventory and compares every declared semantic
 warehouse relation and public projection, including observation history, metrics and quarantine.

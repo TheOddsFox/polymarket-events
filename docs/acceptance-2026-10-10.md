@@ -516,11 +516,86 @@ one published market, two CTF outcomes and no quarantine. Its replay, raw
 rebuild, verified fresh restoration and injected-failure pointer checks passed.
 Report SHA-256:
 `a83e4594738a11517f73c64083a57f80239f1663e317096c0884f55045644114`.
-Full offline checks, committed-source/runtime attestation and exact-commit CI
-are pending for this refinement. Its actual large-load speed and final resource
-fit remain unmeasured; the catalogue root is quiescent.
+Full offline checks passed all 955 tests in 569.13 seconds, with dependency,
+lint/format, dbt parse and diff checks. Committed-source/runtime attestation and
+the exact `b537c9b` [hosted CI run](https://github.com/TheOddsFox/polymarket-events/actions/runs/38134354344)
+passed. The named load resumed with that source held unchanged. A dated query-only
+snapshot at 12:06:39–12:07:27 UTC recorded 7,250 loaded pages / 711,659 source
+records / 62,704 pending; its last committed chunk was at 12:05:21 UTC. This is
+partial progress, without a full-load runtime or final storage-fit claim.
 
-Remaining gates: complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
+A separate managed worktree evaluates compact bronze observations without altering
+the running `b537c9b` source or its operator root. Full canonical source hashes and
+raw evidence remain; valid observations no longer repeat their complete source JSON
+in bronze. Quarantine payloads remain. The incompatible internal layout is explicitly
+versioned as warehouse.v3; public catalogue.v2 and metadata.v1 stay unchanged.
+
+A checksummed copy of 50 committed pages contains 4,987 events and 13,193 embedded
+market observations, with no quarantine. It retains original receipt times, scope,
+predecessor and scan provenance. No new provider requests are made. Initial bounded
+builds reproduced memory exhaustion with the declared 2 GB limit. Connection-time
+DuckDB settings fixed a separate spill-directory reset error. Materializing market
+staging then isolated the remaining exhaustion to its repeated JSON extraction.
+Two grouped calls to the existing scalar/JSON extraction functions preserve all
+47 projected fields, including missing values and explicit JSON nulls; a direct
+STRUCT conversion was rejected because it changes those semantics.
+
+The fresh V4 pair passed all 89 dbt nodes in both layouts and matched all 29 semantic
+relations and seven public projections under 2 GB, two threads, 8 GiB temporary
+and 64 GiB retained limits. Loading plus registry took 28.992051 seconds in the old
+layout and 13.521964 seconds in the compact layout (2.14 times faster). Encoded rows
+fell from 185,540,663 to 78,541,274 bytes; final retained accounting fell from
+510,798,693 to 251,250,007 bytes. Temporary accounting was 16,541,498 versus
+7,863,221 bytes. Both roots and failed earlier runs remain retained.
+
+Total V4 time was 39.050225 versus 42.955436 seconds, so this run does not establish
+an overall speedup. The old installed environment and candidate checkout environment
+were on different disks, and the original load continued concurrently. dbt node
+execution measured 2.232745 versus 3.856743 seconds, within external build times
+of 5.468591 versus 16.512494 seconds. These measurements do not establish
+whole-catalogue throughput or storage fit.
+V4 report SHA-256:
+`b6be05b13acb6d332fb6f29e3d662c2835c7a8eaab9655d0a5a43bbd6eee61a3`.
+
+The V5 comparison uses both independently installed packages on the same disk,
+with identical 132 locked dependency records and the same bounded dbt project.
+Both runs again passed all 89 nodes and all 29/seven semantic comparisons.
+Load plus registry measured 22.450585 versus 13.573927 seconds (1.65 times
+faster); build measured 5.600353 versus 5.153031 seconds. Total measured time
+fell from 37.891299 to 23.156755 seconds (1.64 times faster). Encoded bytes stayed
+at 185,540,663 versus 78,541,274; retained accounting was 508,439,419 versus
+250,463,577 bytes, and temporary accounting 16,541,510 versus 7,863,339 bytes.
+The original child was still draining after one deliberate SIGINT, so this is
+an ordered bounded comparison with explicit host contention, rather than sustained
+whole-root performance. Failed and previous runs remain immutable.
+V5 report SHA-256:
+`5d6200891bfdb6f843531a2e75707e9c4acb687642b1ab59b8ff3a2d6addc2c9`.
+
+The installed compact package also passed both offline workflows in 64.141 seconds,
+including read-only dbt resources, raw rebuild, replay, restoration and pointer
+failure checks. The audit found 82 wheel and 86 sdist members. Synthetic catalogue
+capture measured ten attempts / 20,530 bytes; metadata measured one / 1,220 bytes.
+Report SHA-256:
+`dd46b428c5a5ea16f83d6950df9e2f270dafbd82a171c8a1ed4c8bf553345a02`;
+wheel SHA-256:
+`28cc23d3107289e7623d562d51cf9c3031901631c5eb7ab9175e1efe0cac275a`.
+Architecture/data/security reviews and the independent verifier found no blocking
+candidate issue. Focused checks cover the resource profile, old/new warehouse
+rejection, complete raw hashes, precise projections and stale-stage publication.
+The final native `scripts/verify` gate passed all 1,049 tests in 613.55 seconds,
+with locked dependencies, Ruff, formatting and dbt parsing passing. A real
+installed-package catalogue smoke for public market 5234660 then passed all
+24 steps in 55.429 seconds: two observations, publication, offline replay,
+semantic raw rebuild, verified backup restoration and preservation of the
+previous pointer after an injected failure. It used two requests / 15,412 bytes,
+retained 53,883,388 bytes, and recorded complete accounting with zero quarantine.
+Its report SHA-256 is
+`983fb3c6f850fa59a387f918a95e926871eb7fa647be64fc4d75f847d8f471f6`.
+The installed wheel matches the final source/dbt resources exactly; the final
+distribution audit excludes operator data and generated state.
+Exact-revision hosted CI and fresh-root adoption remain pending.
+
+Remaining gates: final compact hosted CI and adoption, complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
 Scheduling remains inactive. Provider availability, full-load spill demand, cumulative

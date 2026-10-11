@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,14 @@ from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.faults import CRASH_EXIT_CODE
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded, RetriesExhausted
 from oddsfox_catalogue.load.runner import LoadBlocked, LoadRuntime, load_pending
-from oddsfox_catalogue.load.source import event_resource, make_pipeline
+from oddsfox_catalogue.load.source import (
+    QUARANTINE_COLUMNS,
+    event_columns,
+    event_resource,
+    make_pipeline,
+    market_columns,
+    market_resource,
+)
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
 LOAD_CHILD = TESTS_DIR / "fakes" / "load_child.py"
@@ -212,7 +221,6 @@ def test_schema_drift_in_envelope_is_rejected(tmp_path: Path) -> None:
             "source_updated_at": None,
             "endpoint": "/events/keyset",
             "payload_hash": "h",
-            "payload": {},
             "normalized": {},
             "unexpected_new_column": "boom",
         }
@@ -346,7 +354,13 @@ def test_batch_over_quarantine_cap_is_blocked_and_not_registered(tmp_path: Path)
     assert _registry_rows(settings) == [], "a blocked batch is never registered"
 
 
-def test_insert_only_merge_keys_on_observation_id_not_payload(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "table,resource",
+    [("event_observations", event_resource), ("market_observations", market_resource)],
+)
+def test_insert_only_merge_keys_on_observation_id_not_payload(
+    tmp_path: Path, table, resource
+) -> None:
     """Regression: two observations with identical payloads must both be kept.
 
     Shared column-hint dicts once made dlt merge on payload_hash, which dropped the second
@@ -359,7 +373,7 @@ def test_insert_only_merge_keys_on_observation_id_not_payload(tmp_path: Path) ->
     observed = datetime(2026, 10, 8, 6, 0, tzinfo=datetime.now().astimezone().tzinfo)
 
     def row(observation_id: str) -> dict:
-        return {
+        result = {
             "observation_id": observation_id,
             "venue": "polymarket",
             "entity_id": "1",
@@ -369,14 +383,17 @@ def test_insert_only_merge_keys_on_observation_id_not_payload(tmp_path: Path) ->
             "source_updated_at": None,
             "endpoint": "/events/keyset",
             "payload_hash": "same-hash",
-            "payload": {"id": "1"},
             "normalized": {},
         }
+        if table == "market_observations":
+            result.update(source_kind="market_direct", json_pointer="/markets/0")
+        return result
 
     for observation_id in ["obs-a", "obs-b"]:
-        pipeline.run(event_resource([row(observation_id)]))
+        pipeline.run(resource([row(observation_id)]))
 
-    assert _query(settings, "SELECT COUNT(*) FROM bronze.event_observations") == 2
+    assert _query(settings, f"SELECT COUNT(*) FROM bronze.{table}") == 2
+    assert _query(settings, f"SELECT COUNT(DISTINCT payload_hash) FROM bronze.{table}") == 1
 
 
 def test_replay_blocks_conflicting_persisted_normalization(tmp_path: Path) -> None:
@@ -434,11 +451,45 @@ def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(tmp_p
         pipeline.run(factory([], materialize_only=True))
     for table in ("event_observations", "market_observations", "quarantined_records"):
         assert _table_count(settings, table) == 0
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+        for table, expected in (
+            ("event_observations", event_columns()),
+            ("market_observations", market_columns()),
+            ("quarantined_records", QUARANTINE_COLUMNS),
+        ):
+            actual = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema='bronze' AND table_name=?",
+                    [table],
+                ).fetchall()
+            }
+            assert actual - {name for name in actual if name.startswith("_dlt_")} == set(expected)
+            assert ("payload" in actual) == (table == "quarantined_records")
     context = PageContext("page", "batch", "/events", FIXED_NOW, "events")
-    rows = rows_for_page(context, [make_event("1", "First")])
+    rows = rows_for_page(
+        context,
+        [
+            make_event("1", "First"),
+            {
+                "title": "Missing ID",
+                "unmodeled_source_field": {
+                    "exact": Decimal("0.12345678901234567890123456789"),
+                    "nullable": None,
+                },
+            },
+        ],
+    )
     for _ in range(2):
         pipeline.run(event_resource(rows.events))
+        pipeline.run(quarantine_resource(rows.quarantine))
     assert _table_count(settings, "event_observations") == 1
+    assert _table_count(settings, "quarantined_records") == 1
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT json_extract_string(payload, '$.unmodeled_source_field.exact'), "
+            "json_type(payload, '$.unmodeled_source_field.nullable') FROM bronze.quarantined_records"
+        ).fetchone() == ("0.12345678901234567890123456789", "NULL")
 
 
 def test_load_preflight_blocks_before_dlt_when_working_allowance_is_too_small(
@@ -520,7 +571,15 @@ def test_byte_heavy_selected_load_stays_inside_documented_reservation(tmp_path: 
         before = retained_bytes(runtime.settings)
         loaded = load_pending(load_runtime)
         after = retained_bytes(runtime.settings)
-        assert encoded > 1024**2
+        raw_bytes = sum(
+            json.loads(path.read_bytes())["body_bytes"]
+            for path in runtime.settings.raw_dir.glob("**/p*.manifest.json")
+        )
+        assert raw_bytes > 1024**2, "the retained full source must remain byte-heavy"
+        assert encoded < raw_bytes // 10, (
+            "unmodeled raw fields must not be duplicated into dlt rows"
+        )
+        assert all("payload" not in row for row in (*rows.events, *rows.markets))
         assert loaded.batches_registered == [captured.batch_id]
         assert 0 < after - before <= LOAD_FIXED_RESERVE + LOAD_EXPANSION_FACTOR * encoded
         assert after < runtime.settings.capture.max_retained_bytes
