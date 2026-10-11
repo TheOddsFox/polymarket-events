@@ -59,6 +59,7 @@ class CatalogueRunContext(RunContext):
         for section in ("extract", "normalize", "load"):
             provider.set_value("workers", 1, None, section)
         provider.set_value("max_parallel_items", 1, None, "extract")
+        provider.set_value("compression", "zstd", None, "data_writer")
         return [provider]
 
     def initialize_runtime(self, runtime_config: RuntimeConfiguration | None = None) -> None:

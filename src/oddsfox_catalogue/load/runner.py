@@ -72,6 +72,10 @@ class LoadBlocked(RuntimeError):
     """Loading refused: a page is not durable or a batch is inconsistent."""
 
 
+class LoadReservationExceeded(RequestBudgetExceeded):
+    """Estimated load growth does not fit; fewer pages may fit unchanged limits."""
+
+
 @dataclass
 class LoadRuntime:
     settings: Settings
@@ -160,9 +164,9 @@ def _preflight_load_bytes(rt: LoadRuntime, size: int) -> None:
     retained, temporary = rt.storage_snapshot
     allowance = LOAD_FIXED_RESERVE + size * LOAD_EXPANSION_FACTOR
     if temporary + allowance > rt.settings.capture.max_temp_bytes:
-        raise RequestBudgetExceeded("load staging estimate exceeds temporary storage allowance")
+        raise LoadReservationExceeded("load staging estimate exceeds temporary storage allowance")
     if retained + allowance > rt.settings.capture.max_retained_bytes:
-        raise RequestBudgetExceeded("load estimate exceeds retained storage allowance")
+        raise LoadReservationExceeded("load estimate exceeds retained storage allowance")
 
 
 def _rows_for_chunk(
@@ -447,6 +451,18 @@ def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
     summary = LoadSummary()
     pending = rt.ledger.pending_load_pages(batch_id)
     for chunk in _chunks(pending, rt.settings.load.max_pages_per_run):
-        _load_chunk(rt, chunk, summary)
+        work = [chunk]
+        while work:
+            part = work.pop()
+            try:
+                _load_chunk(rt, part, summary)
+            except LoadReservationExceeded:
+                if len(part) == 1:
+                    raise
+            else:
+                continue
+            # Leave the handler to release failed rows before loading either half.
+            midpoint = len(part) // 2
+            work.extend((part[midpoint:], part[:midpoint]))
     _register_complete_batches(rt, summary, batch_id)
     return summary

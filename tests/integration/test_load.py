@@ -120,6 +120,40 @@ def _batch_status(settings: Settings, batch_id: str) -> str:
         ledger.close()
 
 
+def _bronze_semantics(settings):
+    from oddsfox_catalogue.fingerprints import semantic_fingerprint
+    from oddsfox_catalogue.semantics import semantic_query
+
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+        return {
+            table: semantic_fingerprint(connection, semantic_query(connection, f"bronze.{table}"))
+            for table in (
+                "event_observations",
+                "market_observations",
+                "quarantined_records",
+                "batch_registry",
+            )
+        }
+
+
+def _parquet_codecs(info, table):
+    import pyarrow.parquet as pq
+
+    jobs = {}
+    for package in info.load_packages:
+        for job in package.jobs["completed_jobs"]:
+            if job.job_file_info.table_name == table and job.job_file_info.file_format == "parquet":
+                path = Path(job.file_path)
+                metadata = pq.read_metadata(path)
+                jobs[path] = {
+                    metadata.row_group(group).column(column).compression
+                    for group in range(metadata.num_row_groups)
+                    for column in range(metadata.num_columns)
+                }
+    assert jobs, "the exercised table must retain a Parquet job"
+    return jobs
+
+
 def test_bootstrap_loads_rows_and_registers_batch(tmp_path: Path) -> None:
     batch_id = _capture(tmp_path)
     settings = make_settings(tmp_path)
@@ -158,6 +192,112 @@ def test_rerun_is_a_noop_and_rows_never_duplicate(tmp_path: Path) -> None:
     assert _table_count(settings, "market_observations") == markets_before
     assert _distinct_observations(settings, "event_observations") == events_before
     assert _registry_rows(settings) == [(batch_id, "loaded")], "registry is insert-only"
+
+
+def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from shutil import copytree
+
+    from fakes.world import World
+    from oddsfox_catalogue.load import runner
+
+    world = World()
+    for index in (1, 2):
+        event = make_event(str(index), f"Event {index}")
+        event["markets"] = [
+            make_market(str(index + 3), f"Market {index}", event_stub=event_stub(event))
+        ]
+        world.add_event(event)
+    fake = FakeGamma(world)
+    fake.nested_overrides["5"] = "not-an-object"
+    capture, _ = build_runtime(tmp_path / "capture", fake)
+    try:
+        batch_id = run_capture(capture, "bootstrap").batch_id
+        pages = capture.ledger.pending_load_pages(batch_id)
+        page_ids = tuple(page["page_id"] for page in pages)
+        assert 3 <= len(pages) <= 200
+    finally:
+        capture.client.close()
+        capture.ledger.close()
+    for name in ("reference", "adaptive"):
+        copytree(tmp_path / "capture", tmp_path / name)
+    options = {"CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO": "1.0"}
+    reference = make_settings(tmp_path / "reference", options)
+    reference = replace(reference, load=replace(reference.load, max_pages_per_run=1))
+    adaptive = make_settings(tmp_path / "adaptive", options)
+    expected = _load(reference)
+    assert expected.quarantined > 0
+
+    original_chunk = runner._load_chunk
+    original_write = runner._run_resource
+    original_preflight = runner._preflight_load_bytes
+    attempts, current_part = [], ()
+    reject_market, rejected = False, False
+
+    def load_chunk(rt, chunk, summary):
+        nonlocal current_part
+        current_part = tuple(page["page_id"] for page in chunk)
+        attempts.append(current_part)
+        return original_chunk(rt, chunk, summary)
+
+    def write(rt, resource):
+        nonlocal reject_market
+        info = original_write(rt, resource)
+        if resource.name == "event_observations" and current_part == page_ids and not rejected:
+            formats = {
+                job.job_file_info.file_format
+                for package in info.load_packages
+                for job in package.jobs["completed_jobs"]
+                if job.job_file_info.table_name == "event_observations"
+            }
+            assert "parquet" in formats and "insert_values" not in formats
+            assert _table_count(adaptive, "event_observations") > 0
+            assert len(rt.ledger.pending_load_pages(batch_id)) == len(pages)
+            assert _registry_rows(adaptive) == []
+            reject_market = True
+        return info
+
+    def preflight(rt, size):
+        nonlocal reject_market, rejected
+        if reject_market:
+            reject_market, rejected = False, True
+            # Simulate growth between committed resources; use the actual estimate guard.
+            assert rt.storage_snapshot is not None
+            rt.storage_snapshot = (rt.storage_snapshot[0], rt.settings.capture.max_temp_bytes)
+            with pytest.raises(runner.LoadReservationExceeded) as failure:
+                original_preflight(rt, size)
+            raise failure.value
+        return original_preflight(rt, size)
+
+    monkeypatch.setattr(runner, "_load_chunk", load_chunk)
+    monkeypatch.setattr(runner, "_run_resource", write)
+    monkeypatch.setattr(runner, "_preflight_load_bytes", preflight)
+    recovered = _load(adaptive)
+    assert rejected
+    assert attempts == [page_ids, page_ids[: len(pages) // 2], page_ids[len(pages) // 2 :]]
+    for field in ("pages_loaded", "event_rows", "market_rows", "quarantined", "batches_registered"):
+        assert getattr(recovered, field) == getattr(expected, field)
+
+    def page_counts(settings):
+        with Ledger(settings.ledger_path) as ledger:
+            assert not ledger.pending_load_pages(batch_id)
+            assert ledger.get_batch(batch_id)["status"] == "loaded"
+            return sorted(
+                (page["page_id"], page["event_rows"], page["market_rows"], page["quarantine_rows"])
+                for page in ledger.pages_for_batch(batch_id)
+            )
+
+    baseline = _bronze_semantics(reference)
+    assert _bronze_semantics(adaptive) == baseline
+    assert page_counts(adaptive) == page_counts(reference)
+    assert _registry_rows(adaptive) == [(batch_id, "loaded")]
+    assert _load(adaptive).pages_loaded == 0
+    with Ledger(adaptive.ledger_path) as ledger, ledger.transaction() as connection:
+        connection.execute("UPDATE pages SET loaded_at = NULL, dlt_load_id = NULL")
+    replay = _load(adaptive)
+    assert replay.pages_loaded == expected.pages_loaded
+    assert _bronze_semantics(adaptive) == baseline
+    assert page_counts(adaptive) == page_counts(reference)
 
 
 def test_crash_mid_dlt_load_recovers_without_duplicates(tmp_path: Path) -> None:
@@ -206,32 +346,80 @@ def test_crash_before_registry_recovers_and_registers_once(tmp_path: Path) -> No
     assert _batch_status(settings, batch_id) == "loaded"
 
 
-def test_parquet_recovers_unacknowledged_old_format_commit(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("old_format", ["insert_values", "parquet_snappy"])
+def test_parquet_recovers_unacknowledged_old_format_commit(
+    tmp_path: Path, monkeypatch, old_format
+) -> None:
+    from hashlib import sha256
+    from shutil import copytree
+
+    from dlt.common.configuration.container import Container
+    from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
     from dlt.pipeline.pipeline import Pipeline
 
-    batch_id = _capture(tmp_path)
-    settings = make_settings(tmp_path)
+    from oddsfox_catalogue.load.runtime import CatalogueRunContext
+
+    batch_id = _capture(tmp_path / "capture")
+    settings = make_settings(tmp_path / "capture")
+    copytree(settings.root, tmp_path / "reference")
+    reference = make_settings(tmp_path / "reference")
+    _load(reference)
+    expected = _bronze_semantics(reference)
     original_run = Pipeline.run
+    original_providers = CatalogueRunContext.initial_providers
+    old_jobs = {}
+
+    def snappy_providers(self):
+        providers = original_providers(self)
+        providers[0].set_value("compression", "snappy", None, "data_writer")
+        return providers
 
     def old_format_then_stop(self, *args, **kwargs):
-        kwargs["loader_file_format"] = "insert_values"
-        original_run(self, *args, **kwargs)
+        kwargs["loader_file_format"] = "parquet" if old_format == "parquet_snappy" else old_format
+        info = original_run(self, *args, **kwargs)
+        if old_format == "parquet_snappy":
+            jobs = _parquet_codecs(info, "event_observations")
+            assert all(codecs == {"SNAPPY"} for codecs in jobs.values())
+            old_jobs.update({path: sha256(path.read_bytes()).hexdigest() for path in jobs})
         raise RuntimeError("stop after old-format resource commit")
 
     with monkeypatch.context() as changed:
         changed.setattr(Pipeline, "run", old_format_then_stop)
+        if old_format == "parquet_snappy":
+            changed.setattr(CatalogueRunContext, "initial_providers", snappy_providers)
         with pytest.raises(RuntimeError, match="old-format resource commit"):
             _load(settings)
+    # Replace process configuration as a restarted operator would, retaining all jobs.
+    Container()[PluggableRunContext] = PluggableRunContext(
+        CatalogueRunContext(settings.dlt_pipelines_dir)
+    )
     committed = _table_count(settings, "event_observations")
     assert committed > 0
     assert _registry_rows(settings) == []
     with Ledger(settings.ledger_path) as ledger:
         assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+    new_codecs = []
+
+    def current_format_run(self, resource, *args, **kwargs):
+        info = original_run(self, resource, *args, **kwargs)
+        if resource.name in ("event_observations", "market_observations"):
+            new_codecs.extend(_parquet_codecs(info, resource.name).values())
+        return info
+
+    monkeypatch.setattr(Pipeline, "run", current_format_run)
     recovered = _load(settings)
     assert recovered.batches_registered == [batch_id]
     assert _table_count(settings, "event_observations") == committed
     assert _distinct_observations(settings, "event_observations") == committed
     assert _registry_rows(settings) == [(batch_id, "loaded")]
+    assert _bronze_semantics(settings) == expected
+    with Ledger(settings.ledger_path) as ledger, ledger.transaction() as connection:
+        connection.execute("UPDATE pages SET loaded_at = NULL, dlt_load_id = NULL")
+    replay = _load(settings)
+    assert replay.pages_loaded == recovered.pages_loaded
+    assert _bronze_semantics(settings) == expected
+    assert new_codecs and all(codecs == {"ZSTD"} for codecs in new_codecs)
+    assert {path: sha256(path.read_bytes()).hexdigest() for path in old_jobs} == old_jobs
 
 
 @pytest.mark.parametrize("file_format", ["insert_values", "parquet"])
@@ -716,6 +904,7 @@ def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
         }
         assert "parquet" in formats
         assert "insert_values" not in formats
+        assert all(codecs == {"ZSTD"} for codecs in _parquet_codecs(first, table).values())
         _run_resource(runtime, factory([row]))
         _run_resource(
             runtime,

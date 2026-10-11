@@ -184,15 +184,20 @@ def test_loader_uses_confined_runtime_without_initializing_any_tracker(tmp_path,
     ambient = tmp_path / "ambient"
     ambient.mkdir()
     (ambient / ".dlt").mkdir()
-    (ambient / ".dlt" / "config.toml").write_text("[runtime]\ndlthub_telemetry = true\n")
+    (ambient / ".dlt" / "config.toml").write_text(
+        '[runtime]\ndlthub_telemetry = true\n[data_writer]\ncompression = "gzip"\n'
+    )
     code = r"""
+import pickle
 import sys
 from pathlib import Path
+from io import BytesIO
 import requests
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.providers import DictionaryProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.configuration.utils import ResolvedValueTrace, TraceLogContext
+from dlt.common.data_writers.writers import ParquetDataWriter
 from dlt.common.runtime import anon_tracker, telemetry
 
 calls = []
@@ -279,6 +284,13 @@ run_context = Container()[PluggableRunContext]
 context = run_context.context
 assert len(run_context.providers.providers) == 1
 assert isinstance(run_context.providers.providers[0], DictionaryProvider)
+assert run_context.providers.providers[0].get_value("compression", str, None, "data_writer")[0] == "zstd"
+assert ParquetDataWriter(BytesIO()).parquet_format.compression == "zstd"
+restored = PluggableRunContext(pickle.loads(pickle.dumps(context)))
+with Container().injectable_context(restored, lock_context_on_yield=True):
+    assert ParquetDataWriter(BytesIO()).parquet_format.compression == "zstd"
+    assert Container()[PluggableRunContext].context.pipelines_dir == settings.dlt_pipelines_dir
+assert Container()[PluggableRunContext] is run_context
 for name in ("enable_airflow_secrets", "enable_google_secrets", "enable_aws_secrets"):
     assert run_context.providers.providers[0].get_value(name, bool, None, "providers")[0] is False
 assert context.runtime_config.dlthub_telemetry is False
@@ -304,6 +316,8 @@ print("confined-runtime-ok")
             "PROVIDERS__ENABLE_AIRFLOW_SECRETS": "true",
             "PROVIDERS__ENABLE_GOOGLE_SECRETS": "true",
             "PROVIDERS__ENABLE_AWS_SECRETS": "true",
+            "DATA_WRITER__COMPRESSION": "snappy",
+            "NORMALIZE__DATA_WRITER__COMPRESSION": "gzip",
         }
     )
     result = subprocess.run(

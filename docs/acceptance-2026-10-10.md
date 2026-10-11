@@ -717,9 +717,9 @@ seconds, plus locked dependencies, Ruff, formatting, dbt parse and diff checks.
 The subsequently added format-transition regression passed separately; hosted CI
 must include all 1,116 tests. Exact-revision hosted CI for `a8fbfa99` passed all
 1,116 tests and the installed workflows in run `38153793718`. Its verified
-installed runtime is now performing the named full load.
+installed runtime performed the named full load described below.
 
-Remaining gates: the byte-total candidate's final native/hosted checks and verified adoption;
+Remaining gates: verified adoption of subsequent loader changes;
 complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
@@ -779,7 +779,51 @@ Complete semantic replay, raw rebuild, verified backup restoration and the injec
 failure's previous-pointer preservation passed. Report SHA-256:
 `3be1094f96cbbb79d2acff44323ed0e0e8885ac00bf0b41aa99ac65ff9a5d41e`.
 
-The final native gate and exact candidate hosted CI remain required. The actual
-catalogue continues under the previously verified `a8fbfa99` runtime; no active
-runtime was modified. Full bootstrap publication, daily refresh, reconcile and
-catalogue-wide replay/rebuild/restoration remain incomplete.
+The final native gate passed 1,131 tests in 475.89 seconds, and exact commit
+`eb68438e` passed hosted CI run `38157303230`, including installed workflows.
+The independent final review passed. Full bootstrap publication, daily refresh,
+reconcile and catalogue-wide replay/rebuild/restoration remain incomplete.
+
+### Split oversized reservations within existing limits (2026-10-11)
+
+The actual `a8fbfa99` load stopped explicitly after 12,600 of 69,954 pages at
+16:47:56 UTC. Its next 200-page chunk exceeded the conservative staging
+reservation. The observed temporary storage was 2,732,781,224 bytes, below the
+8 GiB allowance; retained storage was 28,658,826,629 bytes, below 64 GiB. These
+are point measurements, not peak or final-fit guarantees. No stop signal,
+cleanup or cap increase occurred. Both owned processes exited, and the existing
+writer lock was independently verified free without changing its contents.
+
+The loader now distinguishes estimated reservation failures from actual storage
+exhaustion. Only estimated failures split a chunk into ordered halves. Every
+child repeats normal verification and accounting; a single-page failure stops
+explicitly. The iterative queue runs left first and retains no parent exception
+or row set while loading children. No resource, quality, scope or reserve changes.
+
+An earlier resource can have committed before its next reservation fails.
+Pages remain unacknowledged until all resources succeed; existing observation
+conflict checks and insert-only merge protect those child retries. Registration
+still requires every page. Full-root resume and its remaining acceptance gates
+are pending; an estimated-size recovery is not evidence of complete storage fit.
+
+The existing dlt runtime now writes future Parquet jobs with lossless ZSTD.
+Successful job files are retained and count toward temporary storage; this
+reduces future growth without deleting or rewriting earlier jobs. A bounded
+off-root comparison of four files and 69,205 rows preserved every decoded
+schema, value and row order, plus the original file hashes. SNAPPY used
+59,847,704 bytes; ZSTD used 25,761,001 bytes (56.96% smaller). Warm-cache write
+time increased from 0.144 to 0.187 seconds and read time from 0.063 to 0.087
+seconds; this measures storage reduction, not a throughput gain. Report SHA-256:
+`72b0e29a27da1477c897269fb07e9bce7d33d9cb4b0e14828f4a6bf4b2d07f85`.
+Old SNAPPY jobs remain retained, and full-root fit remains unverified.
+
+The independently installed adaptive/ZSTD candidate passed both offline
+workflows and distribution audits in 54.782 seconds. Installed report SHA-256:
+`159b3705ec8944f3f384a5bb23f09b7e7b8ae141607e47fd292b0f4bb6f20e7d`.
+Its real public-market smoke passed all 24 steps with two attempts, 15,386
+downloaded bytes and 53,968,753 retained bytes. Complete semantic replay, raw
+rebuild, verified backup restoration and injected-failure pointer preservation
+passed. Real report SHA-256:
+`00bda882736bca5b07b4e17ae949b91708e1d05f135bfd88c9c3bf5fd28b6b29`.
+The combined full native gate, exact-revision hosted CI and full-root resume
+remain required. Scheduling stays inactive.
