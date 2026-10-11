@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -593,7 +594,7 @@ def test_byte_heavy_selected_load_stays_inside_documented_reservation(tmp_path: 
         load_runtime = LoadRuntime(
             settings=runtime.settings, ledger=runtime.ledger, now=lambda: FIXED_NOW
         )
-        rows, _ = _rows_for_chunk(
+        rows, _, sizes = _rows_for_chunk(
             load_runtime, runtime.ledger.pending_load_pages(captured.batch_id)
         )
         encoded = sum(
@@ -601,6 +602,7 @@ def test_byte_heavy_selected_load_stays_inside_documented_reservation(tmp_path: 
             for relation in (rows.events, rows.markets, rows.quarantine)
             for row in relation
         )
+        assert sum(sizes) == encoded
         before = retained_bytes(runtime.settings)
         loaded = load_pending(load_runtime)
         after = retained_bytes(runtime.settings)
@@ -702,6 +704,7 @@ def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
     }
     if table == "market_observations":
         row.update(source_kind="market_direct", json_pointer="/markets/0")
+    original = deepcopy(row)
     with Ledger(settings.ledger_path) as ledger, confined_runtime(settings.dlt_pipelines_dir):
         runtime = LoadRuntime(settings, ledger)
         _run_resource(runtime, factory([], materialize_only=True))
@@ -718,6 +721,7 @@ def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
             runtime,
             factory([{**row, "observation_id": "second", "source_updated_at": received}]),
         )
+    assert row == original and payload == original["normalized"]
     with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
         schema = {
             name: (kind, nullable)

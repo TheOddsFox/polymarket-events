@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from oddsfox_catalogue.capture.reader import DurabilityError, scan_dir_for
 from oddsfox_catalogue.capture.runner import _adopt_durable_pages, run_capture
 from oddsfox_catalogue.capture.writer import manifest_path
 from oddsfox_catalogue.config import CaptureSettings, GammaSettings, Settings
+from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
 from oddsfox_catalogue.gamma.paginators import _window_params
 from oddsfox_catalogue.gamma.scans import ID_STEP, sealed_plan
 from oddsfox_catalogue.ids import canonical_json, make_page_id, make_scan_id, parse_batch_id
@@ -30,9 +32,15 @@ from oddsfox_catalogue.inventory import (
 )
 from oddsfox_catalogue.load.rows import PageContext, RowSet, rows_for_page
 from oddsfox_catalogue.load.runner import (
+    LOAD_EXPANSION_FACTOR,
+    LOAD_FIXED_RESERVE,
     LoadBlocked,
     LoadRuntime,
+    LoadSummary,
     _check_existing_observations,
+    _encoded_row_bytes,
+    _load_chunk,
+    _preflight_load_bytes,
     _rows_for_chunk,
 )
 from oddsfox_catalogue.load.source import event_columns, market_columns
@@ -501,7 +509,7 @@ def test_exact_page_lookup_uses_unique_index_and_does_not_cross_scans(
 def test_loader_reads_predecessor_without_enumerating_entire_scan(captured_keyset, monkeypatch):
     runtime, _, _, pages = captured_keyset
     monkeypatch.setattr(runtime.ledger, "pages_for_scan", no_full_scan)
-    rows, counts = _rows_for_chunk(
+    rows, counts, _ = _rows_for_chunk(
         LoadRuntime(runtime.settings, runtime.ledger, now=lambda: FIXED_NOW),
         runtime.ledger.pages_for_batch(pages[0]["batch_id"])[1:3],
     )
@@ -597,7 +605,7 @@ def scope_chunk(monkeypatch, tmp_path, batch_order):
         get_scan=lambda key: {"scan_id": key},
         page_for_scan=lambda key, seq: None,
     )
-    runtime = LoadRuntime(Settings(tmp_path), ledger)
+    runtime = LoadRuntime(Settings(tmp_path), ledger, now=lambda: FIXED_NOW)
 
     def read_manifest(settings, directory, page):
         if page is None:
@@ -632,6 +640,7 @@ def scope_chunk(monkeypatch, tmp_path, batch_order):
         pages=pages,
         batches=batches,
         manifests=manifests,
+        records=records,
         checks=checks,
         decodes=decodes,
     )
@@ -650,13 +659,13 @@ def test_scope_cache_preserves_complete_rows_counts_and_every_page_preflight(
         fixture.batches["B"]["scope_json"] = "invalid JSON skipped only for 404"
     expected_rows, expected_counts = RowSet(), {}
     for page in fixture.pages:
-        rows, counts = _rows_for_chunk(fixture.runtime, [page])
+        rows, counts, _ = _rows_for_chunk(fixture.runtime, [page])
         expected_rows.extend(rows)
         expected_counts.update(counts)
     fixture.decodes.clear()
     fixture.checks.clear()
     original_batches = copy.deepcopy(fixture.batches)
-    rows, counts = _rows_for_chunk(fixture.runtime, fixture.pages)
+    rows, counts, _ = _rows_for_chunk(fixture.runtime, fixture.pages)
     assert rows == expected_rows and counts == expected_counts
     assert rows.events and rows.markets and rows.quarantine
     assert len(fixture.decodes) == expected_decodes
@@ -690,6 +699,206 @@ def test_decoded_scope_is_not_reused_between_chunks(monkeypatch, tmp_path):
     changed = _rows_for_chunk(fixture.runtime, fixture.pages)
     assert len(fixture.decodes) == 3
     assert changed != first and not changed[0].events
+
+
+def streamed_relation_totals(rows):
+    encoder = json.JSONEncoder(
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        default=lambda value: (
+            value.isoformat() if hasattr(value, "isoformat") else json.loads(canonical_json(value))
+        ),
+    )
+    return tuple(
+        sum(sum(len(part.encode()) for part in encoder.iterencode(row)) + 1 for row in relation)
+        for relation in (rows.events, rows.markets, rows.quarantine)
+    )
+
+
+@pytest.mark.parametrize("case", ["mixed", "mixed404", "empty", "404"])
+def test_local_relation_totals_are_exact_and_fresh_for_mixed_empty_and_404_pages(
+    monkeypatch, tmp_path, case
+):
+    fixture = scope_chunk(monkeypatch, tmp_path, "AA")
+    for index, page in enumerate(fixture.pages):
+        event = fixture.records[page["page_id"]][0]
+        event["title"] = "£雪🦊"
+        event["volume"] = Decimal("0.12345678901234567890123456789")
+        event["markets"][1]["nullable"] = None
+        if case == "empty":
+            fixture.records[page["page_id"]] = []
+        if case == "404" or (case == "mixed404" and index == 1):
+            fixture.manifests[page["page_id"]]["http_status"] = 404
+    original = copy.deepcopy((fixture.records, fixture.batches, fixture.manifests))
+    rows, counts, sizes = _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert sizes == streamed_relation_totals(rows)
+    assert type(sizes) is tuple and all(type(size) is int for size in sizes)
+    if case in {"empty", "404"}:
+        assert sizes == (0, 0, 0) and rows == RowSet()
+        assert set(counts.values()) == {(0, 0, 0)}
+    else:
+        assert all(size > 0 for size in sizes)
+    assert (fixture.records, fixture.batches, fixture.manifests) == original
+    assert _rows_for_chunk(fixture.runtime, fixture.pages) == (rows, counts, sizes)
+    assert ("bytes", 100) in fixture.checks and ("bytes", 200) in fixture.checks
+
+
+def chunk_admission(monkeypatch, fixture, *, exhaust=None):
+    """Use real byte admission and resources, replacing only storage measurements and writes."""
+    operations, writes, acknowledgments = [], [], []
+    storage = {"retained": 0, "temporary": 0}
+
+    def reset(rt):
+        operations.append("reset")
+        rt.storage_snapshot = (storage["retained"], storage["temporary"])
+
+    def preflight(rt, size):
+        operations.append(("preflight", size))
+        _preflight_load_bytes(rt, size)
+
+    def existing(rt, rows):
+        operations.append("existing")
+        if exhaust is not None and exhaust[0] == 0:
+            exhaust[1](storage)
+
+    def write(rt, resource):
+        operations.append(("write", resource.name))
+        writes.append((resource.name, list(resource)))
+        if exhaust is not None and len(writes) == exhaust[0]:
+            exhaust[1](storage)
+        return SimpleNamespace(loads_ids=[resource.name])
+
+    monkeypatch.setattr("oddsfox_catalogue.load.runner._reset_load_budget", reset)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner._preflight_load_bytes", preflight)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner._check_existing_observations", existing)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner._run_resource", write)
+    fixture.runtime.ledger.complete_load_chunk = lambda **kwargs: acknowledgments.append(kwargs)
+    return operations, writes, acknowledgments
+
+
+def test_load_chunk_encodes_each_row_once_and_keeps_all_admission_calls(monkeypatch, tmp_path):
+    fixture = scope_chunk(monkeypatch, tmp_path, "AA")
+    expected_rows, expected_counts, sizes = _rows_for_chunk(fixture.runtime, fixture.pages)
+    encoded = []
+
+    def encode(row):
+        encoded.append(id(row))
+        return _encoded_row_bytes(row)
+
+    original = copy.deepcopy(fixture.records)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner._encoded_row_bytes", encode)
+    operations, writes, acknowledgments = chunk_admission(monkeypatch, fixture)
+    summary = LoadSummary()
+    _load_chunk(fixture.runtime, fixture.pages, summary)
+    relations = (expected_rows.events, expected_rows.markets, expected_rows.quarantine)
+    assert [data for _, data in writes] == list(relations)
+    assert len(encoded) == len(set(encoded)) == sum(map(len, relations))
+    page_totals = [
+        sum(
+            streamed_relation_totals(
+                RowSet(
+                    **{
+                        name: [
+                            row
+                            for row in getattr(expected_rows, name)
+                            if row["page_id"] == page["page_id"]
+                        ]
+                        for name in ("events", "markets", "quarantine")
+                    }
+                )
+            )
+        )
+        for page in fixture.pages
+    ]
+    assert operations == [
+        "reset",
+        ("preflight", 100),
+        ("preflight", page_totals[0]),
+        ("preflight", 200),
+        ("preflight", sum(page_totals)),
+        "existing",
+        ("preflight", sum(sizes)),
+        "reset",
+        ("preflight", sizes[0]),
+        ("write", "event_observations"),
+        "reset",
+        "reset",
+        ("preflight", sizes[1]),
+        ("write", "market_observations"),
+        "reset",
+        "reset",
+        ("preflight", sizes[2]),
+        ("write", "quarantined_records"),
+        "reset",
+    ]
+    assert acknowledgments[0]["page_counts"] == expected_counts
+    assert acknowledgments[0]["quarantine"] == expected_rows.quarantine
+    assert (summary.pages_loaded, summary.event_rows, summary.market_rows, summary.quarantined) == (
+        2,
+        len(relations[0]),
+        len(relations[1]),
+        len(relations[2]),
+    )
+    assert fixture.records == original
+
+
+@pytest.mark.parametrize("allowance", ["retained", "temporary"])
+@pytest.mark.parametrize("remaining", [0, -1])
+def test_exact_total_admission_boundary_precedes_writes(
+    monkeypatch, tmp_path, allowance, remaining
+):
+    fixture = scope_chunk(monkeypatch, tmp_path, "AA")
+    _, _, sizes = _rows_for_chunk(fixture.runtime, fixture.pages)
+    limit = LOAD_FIXED_RESERVE + sum(sizes) * LOAD_EXPANSION_FACTOR + remaining
+    field = "max_retained_bytes" if allowance == "retained" else "max_temp_bytes"
+    fixture.runtime.settings = replace(
+        fixture.runtime.settings,
+        capture=replace(fixture.runtime.settings.capture, **{field: limit}),
+    )
+    _, writes, acknowledgments = chunk_admission(monkeypatch, fixture)
+    summary = LoadSummary()
+    if remaining == 0:
+        _load_chunk(fixture.runtime, fixture.pages, summary)
+        assert len(writes) == 3 and len(acknowledgments) == 1
+    else:
+        with pytest.raises(RequestBudgetExceeded, match="allowance"):
+            _load_chunk(fixture.runtime, fixture.pages, summary)
+        assert not writes and not acknowledgments and summary.pages_loaded == 0
+
+
+@pytest.mark.parametrize("allowance", ["retained", "temporary"])
+@pytest.mark.parametrize("resource_index", [0, 1, 2])
+def test_resource_exhaustion_refreshes_admission_and_leaves_chunk_unacknowledged(
+    monkeypatch, tmp_path, allowance, resource_index
+):
+    fixture = scope_chunk(monkeypatch, tmp_path, "AA")
+    _, _, sizes = _rows_for_chunk(fixture.runtime, fixture.pages)
+    field = "max_retained_bytes" if allowance == "retained" else "max_temp_bytes"
+
+    def exhaust(storage):
+        storage[allowance] = (
+            getattr(fixture.runtime.settings.capture, field)
+            - LOAD_FIXED_RESERVE
+            - sizes[resource_index] * LOAD_EXPANSION_FACTOR
+            + 1
+        )
+
+    operations, writes, acknowledgments = chunk_admission(
+        monkeypatch, fixture, exhaust=(resource_index, exhaust)
+    )
+    summary = LoadSummary()
+    with pytest.raises(RequestBudgetExceeded, match="allowance"):
+        _load_chunk(fixture.runtime, fixture.pages, summary)
+    assert len(writes) == resource_index and not acknowledgments
+    assert operations[-1] == ("preflight", sizes[resource_index])
+    assert (
+        summary.pages_loaded
+        == summary.event_rows
+        == summary.market_rows
+        == summary.quarantined
+        == 0
+    )
 
 
 @pytest.mark.parametrize("scope", [{"revision": 1, "sealed": True}, {"revision": 2}])

@@ -715,11 +715,71 @@ Independent actual-diff review found no blocking architecture, data or security
 issue. The shared native `scripts/verify` gate passed 1,115 tests in 475.32
 seconds, plus locked dependencies, Ruff, formatting, dbt parse and diff checks.
 The subsequently added format-transition regression passed separately; hosted CI
-must include all 1,116 tests. Exact-revision hosted CI remains pending.
+must include all 1,116 tests. Exact-revision hosted CI for `a8fbfa99` passed all
+1,116 tests and the installed workflows in run `38153793718`. Its verified
+installed runtime is now performing the named full load.
 
-Remaining gates: final Parquet/encoder hosted CI and verified runtime adoption;
+Remaining gates: the byte-total candidate's final native/hosted checks and verified adoption;
 complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
 Scheduling remains inactive. Provider availability, full-load spill demand, cumulative
 temporary job storage and total catalogue runtime remain unverified.
+
+### Reuse exact admission byte totals (2026-10-11)
+
+The next isolated loader change computes each normalized row's exact encoded size
+once during the existing page admission, returning three chunk-local integer totals.
+Full-chunk and resource admission reuse those totals. Every raw, page, chunk and
+resource check, actual storage recount, strict encoder, fixed reserve, resource order
+and post-write checkpoint remains in place. No encoded rows or cross-chunk totals
+are retained; empty relations retain zero sizes and their existing fixed reserve.
+
+A three-second sample of the active loader showed substantial repeated JSON encoding.
+One bounded whole-root accounting read took 0.677 seconds at 23.3 GB retained, so
+storage traversal changes and raw-byte caching were deferred. Recent live 200-page
+chunks contained 85,821–120,640 market observations, materially more than the copied
+benchmark's 49,260; neither benchmark predicts whole-catalogue duration.
+
+The first installed comparison reduced size-encoding CPU from 3.242 to 1.177 seconds,
+but total load was effectively unchanged (26.764 to 26.675 seconds), with other phases
+slower. A subsequent consecutive comparison of both installed versions used the same
+200-page input and unchanged 2 GB memory/two threads:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Size encoding | 3.825 s | 1.196 s |
+| Load and registry | 31.077 s | 25.108 s |
+| Complete comparison | 50.294 s | 41.627 s |
+| Retained bytes | 931,012,577 | 936,518,329 |
+| Temporary bytes | 59,940,165 | 59,940,109 |
+
+The consecutive load was 19.2% shorter, and encoding CPU was 68.7% lower. Other
+phases also varied; ordered runs, filesystem caches and the active catalogue/native
+test workload limit attribution. This is a measured sample, not a sustained-rate or
+peak-resource guarantee. All four bronze, 29 semantic and seven public relations
+matched, and all 89 dbt nodes passed. The comparison report SHA-256 is
+`7a3283774e090bee5936c93992fd99505d7cf866695d00c9cea6554a4f68d844`.
+
+Focused regression checks passed 20 unit cases and three actual Parquet/byte-heavy
+integration cases, including exact totals, one size calculation per row, every
+admission boundary, failed-resource checkpoint preservation and input immutability.
+Independent architecture and actual-diff security reviews passed. The standalone
+installed proof passed both offline workflows and distribution audits in 57.268
+seconds; its 77 installed source/dbt members match the candidate and 38 dbt resources
+remain read-only. Report SHA-256:
+`f1bdce24cb90d97f13b1f02da75c0e3db4aab8067aae7edaf9406e4bae14c7d4`.
+The initial sandboxed proof stopped with a local process-permission error; its
+separate failed evidence is retained. The successful fresh proof used the required
+local subprocess permissions and offline locked dependencies.
+
+The new installed real public smoke passed all 24 steps in 46.136 seconds: two
+requests, 15,366 downloaded bytes, 53,984,682 retained bytes and zero quarantine.
+Complete semantic replay, raw rebuild, verified backup restoration and the injected
+failure's previous-pointer preservation passed. Report SHA-256:
+`3be1094f96cbbb79d2acff44323ed0e0e8885ac00bf0b41aa99ac65ff9a5d41e`.
+
+The final native gate and exact candidate hosted CI remain required. The actual
+catalogue continues under the previously verified `a8fbfa99` runtime; no active
+runtime was modified. Full bootstrap publication, daily refresh, reconcile and
+catalogue-wide replay/rebuild/restoration remain incomplete.

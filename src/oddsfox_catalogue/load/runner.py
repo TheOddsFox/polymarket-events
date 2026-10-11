@@ -168,12 +168,12 @@ def _preflight_load_bytes(rt: LoadRuntime, size: int) -> None:
 def _rows_for_chunk(
     rt: LoadRuntime,
     pages: list[dict[str, Any]],
-) -> tuple[RowSet, dict[str, tuple[int, int, int]]]:
+) -> tuple[RowSet, dict[str, tuple[int, int, int]], tuple[int, int, int]]:
     """Read and verify each page, then build its rows. Raises on any non-durable page."""
     rows = RowSet()
     counts: dict[str, tuple[int, int, int]] = {}
     raw_bytes = 0
-    serialized_bytes = 0
+    serialized_bytes = [0, 0, 0]
     scope_batch_id: object = object()
     scope: dict[str, Any] = {}
     for page in pages:
@@ -223,18 +223,17 @@ def _rows_for_chunk(
             len(page_rows.markets),
             len(page_rows.quarantine),
         )
-        serialized_bytes += sum(
-            _encoded_row_bytes(row)
-            for relation in (page_rows.events, page_rows.markets, page_rows.quarantine)
-            for row in relation
-        )
-        _preflight_load_bytes(rt, serialized_bytes)
+        for index, relation in enumerate(
+            (page_rows.events, page_rows.markets, page_rows.quarantine)
+        ):
+            serialized_bytes[index] += sum(_encoded_row_bytes(row) for row in relation)
+        _preflight_load_bytes(rt, sum(serialized_bytes))
         rows.extend(page_rows)
 
     assert_unique(rows.events)
     assert_unique(rows.markets)
     assert_unique(rows.quarantine, "quarantine_id")
-    return rows, counts
+    return rows, counts, (serialized_bytes[0], serialized_bytes[1], serialized_bytes[2])
 
 
 def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
@@ -323,27 +322,18 @@ def _load_chunk(
     summary: LoadSummary,
 ) -> None:
     _reset_load_budget(rt)
-    rows, counts = _rows_for_chunk(rt, pages)
+    rows, counts, serialized_bytes = _rows_for_chunk(rt, pages)
     _check_existing_observations(rt, rows)
-    _preflight_load_bytes(
-        rt,
-        sum(
-            _encoded_row_bytes(row)
-            for relation in (rows.events, rows.markets, rows.quarantine)
-            for row in relation
-        ),
-    )
+    _preflight_load_bytes(rt, sum(serialized_bytes))
     load_id: str | None = None
 
     # One pipeline.run per table, each resource created just before its run. Creating
     # several resources before running them corrupts dlt's shared schema (json_pointer
     # hints leak into event_observations). Each run is idempotent under insert-only merge,
     # so a crash between runs is safe.
-    for resource, relation in zip(
-        _chunk_resources(rows), (rows.events, rows.markets, rows.quarantine), strict=True
-    ):
+    for resource, size in zip(_chunk_resources(rows), serialized_bytes, strict=True):
         _reset_load_budget(rt)
-        _preflight_load_bytes(rt, sum(_encoded_row_bytes(row) for row in relation))
+        _preflight_load_bytes(rt, size)
         info = _run_resource(rt, resource)
         _reset_load_budget(rt)
         if info.loads_ids:
