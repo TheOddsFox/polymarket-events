@@ -1,14 +1,14 @@
 # Catalogue acceptance evidence
 
-Status at 2026-10-11 14:12 UTC: **partial readiness**. Bootstrap capture is complete;
-the original load stopped at a verified checkpoint of 8,200 loaded pages and
-61,754 pending. Its evidence and warehouse remain retained. The compact warehouse
-implementation passed native, installed, real-smoke and exact-revision hosted CI
-checks. Further streaming and directory-relative accounting refinements passed
-the shared native, installed and real-smoke checks; exact-revision hosted CI is
-pending. A raw-only copy into a fresh root is in progress. Fresh-root adoption and
-catalogue-wide build, publication and recovery acceptance have not passed.
-This document does not certify full operational readiness.
+Status at 2026-10-11 19:45 UTC: **partial readiness, paused at the operator's request**.
+Bootstrap capture is complete. The fresh-root load stopped with 43,600 committed
+pages and 26,354 pending; its evidence and warehouse remain retained. The current
+implementation passed native, installed-package, bounded public-smoke and
+exact-revision hosted CI checks. No collection or load process remains running.
+Catalogue-wide build, publication and recovery acceptance have not passed.
+The [resume checkpoint](#paused-checkpoint-and-resumption) records what remains.
+This document does not certify full operational readiness. Earlier sections below
+preserve the evidence and provisional decisions at their recorded revisions.
 
 ## Reviewed implementation
 
@@ -890,3 +890,78 @@ All 212 tests across the four affected modules passed in 43.03 seconds.
 Independent actual-spill, architecture and security verification passed.
 Fresh installed-package, public smoke and final full hosted gates remain
 required for the corrected production bytes before adoption.
+
+### Final verification of the corrected loader
+
+Corrected product commit `ed6b3aec16dd4d02b54558dc7c15f5043445eccc`
+passed `scripts/verify`: 1,159 tests in 596.90 seconds, locked dependencies,
+Ruff, formatting, dbt parse and diff checks.
+[Exact-revision hosted CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38167320056)
+passed, including the audited installed workflow. Independent final verification
+approved the product change, including actual-spill and recovery behavior.
+
+A fresh installed distribution passed both offline workflows and distribution
+audits in 59.88 seconds. All 77 packaged product members matched source and
+installed bytes; all 38 dbt resources remained read-only. Installed report SHA-256:
+`669adc93ac9415cb37423df2cc981bbbff64cf417866ce35a49d1210ee0776a0`.
+
+The corrected public-market smoke passed all 24 steps and nine checks:
+two observations, publication, semantic replay, raw rebuild, verified backup
+restoration and preservation of the prior pointer after an injected failure.
+It used two attempts, 15,410 downloaded bytes, 56,320,705 retained bytes and
+52.181 seconds, with zero quarantine. Comparisons covered 29 semantic relations,
+30 schemas and seven public projections, plus coverage and capture inventory.
+Real report SHA-256:
+`ee6815187605f78a79bf6cebfa78f327a2b4be799ec508488aa1dde23c8264ef`.
+These checks establish bounded workflow readiness; they do not certify the
+unfinished catalogue-wide root.
+
+### Paused checkpoint and resumption
+
+The operator requested that work stop for now. One supported SIGHUP stopped
+the named load; its child exited 129 at 2026-10-11 19:45:35 UTC and the supervisor
+reaped it. The ledger records `Terminated: SIGHUP`, rather than a successful load.
+The retained checkpoint was compared with the actual ledger under the existing
+writer lock. Both registered processes were absent, the lock was free and its
+identity and contents were unchanged. No automatic following stage was started.
+
+| Checkpoint | Retained value |
+| --- | --- |
+| Root, relative to this checkout | `data/acceptance/catalogue-v3-20261011T140200Z` |
+| Named batch | `20261010T142904Z-bootstrap` |
+| Capture | Complete, sealed scope; 69,954 pages and 5,415,266 top-level records |
+| Committed / pending pages | 43,600 / 26,354 |
+| Warehouse certification | Dirty; no catalogue-wide `current.json` |
+| Last load source | `ed6b3aec16dd4d02b54558dc7c15f5043445eccc` |
+| Last offline invocation HTTP attempts | 0 |
+| Retained / temporary bytes after stop | 43,597,006,021 / 4,076,434,920 |
+
+The byte measurements are points after shutdown, not peaks or a prediction that
+the remaining build will fit. Old roots, failed-stage evidence and committed
+capture accounting remain untouched. Temporary supervisor artifacts are local
+diagnostic evidence; the committed captures and ledger are the durable resume
+inputs. Do not rerun an old supervisor with hard-coded checkpoint expectations.
+
+From this repository checkout, explicitly select the retained root and resume
+the existing batch when work is authorized again:
+
+```sh
+export CATALOGUE_ROOT="$PWD/data/acceptance/catalogue-v3-20261011T140200Z"
+uv run --locked catalogue status
+uv run --locked catalogue load --batch-id 20261010T142904Z-bootstrap
+```
+
+Supervise each load invocation with a four-hour deadline. If stopped, send one
+supported SIGHUP to the CLI child and wait for shutdown and lock release before
+resuming. Keep one worker, the 64 GiB root and 8 GiB temporary limits, 2GB DuckDB
+memory and two threads. Preserve the named batch and its ledger; do not restart
+capture, reset checkpoints or increase limits to force completion.
+
+Only after the complete load succeeds, run the full `catalogue dbt -- build`,
+then `catalogue publish` and `catalogue verify`. Remaining acceptance requires
+catalogue-wide daily refresh and reconcile, complete named-batch resumes,
+semantic replay, raw rebuild, verified backup restoration and restored rebuild,
+with measured coverage, quarantine and recovery evidence. The operator approved
+10 requests/second for those later collections; one worker and all other finite
+caps remain unchanged. Product defaults stay at two requests/second.
+Scheduling remains inactive. No catalogue-wide completion is claimed.
