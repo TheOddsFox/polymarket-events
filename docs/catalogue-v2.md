@@ -66,7 +66,7 @@ Spill-directory settings are not reapplied for every adapter cursor after tempor
 storage has been used. These settings preserve the operator's configured resource limits.
 Market staging is a full table rebuilt by dbt, so current and history models reuse the
 same parsed observation projection. It extracts scalar and JSON paths in two grouped
-calls behind a materialized query boundary, preserving the original casts, missing values
+calls in a shared streaming projection, preserving the original casts, missing values
 and explicit JSON nulls. Loading makes its previous contents stale and dirties
 certification; publication requires a complete successful rebuild of all models and tests.
 
@@ -102,5 +102,9 @@ cannot interpret those pages. Retain the previous environment for its older evid
 
 Live storage measurements tolerate temporary files removed by active jobs. Missing immutable
 evidence still fails inventory verification; unreadable paths, symlinks and special files fail
-storage checks. The catalogue smoke runs semantic verification and report queries in bounded
+storage checks. Where supported, accounting uses directory-relative stats and complete
+directory listings, retaining the original path walker elsewhere. Skipped directory
+identities fail validation unless the path genuinely disappeared. Traversal descriptors
+close on success or failure; every existing storage checkpoint remains. Accounting is
+a point observation, not an atomic filesystem snapshot. The catalogue smoke runs semantic verification and report queries in bounded
 child processes so its shared deadline applies to those operations too.

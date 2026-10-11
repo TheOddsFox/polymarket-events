@@ -1,6 +1,6 @@
 {{ config(materialized='table') }}
 
-with extracted as materialized (
+with extracted as (
     select
         observation_id,
         venue,

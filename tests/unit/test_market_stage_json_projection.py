@@ -137,6 +137,40 @@ def test_all_columns_preserve_types_exact_values_and_observation_grain(connectio
         assert json.loads(row["raw_position_ids"]) == [["nested"], "202"]
 
 
+@pytest.mark.parametrize(
+    "disable_common_subexpressions", [False, True], ids=["default", "without-cse"]
+)
+def test_query_streams_shared_extraction_from_each_input_once(
+    connection, queries, disable_common_subexpressions
+):
+    if disable_common_subexpressions:
+        connection.execute("SET disabled_optimizers = 'common_subexpressions'")
+    record = _record()
+    _insert(connection, json.dumps(record))
+    plan = connection.execute("EXPLAIN (FORMAT JSON) " + queries[1]).fetchone()[1]
+    pending = json.loads(plan)
+    nodes = []
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        pending.extend(node["children"])
+    assert not any(node["name"] in {"CTE", "CTE_SCAN"} for node in nodes)
+    assert sorted(
+        node["extra_info"]["Table"].rsplit(".", 1)[-1]
+        for node in nodes
+        if "Table" in node["extra_info"]
+    ) == ["batches", "market_observations"]
+    shared_extractions = [
+        node
+        for node in nodes
+        if node["name"] == "PROJECTION"
+        and {"scalar_fields", "json_fields"}.issubset(node["extra_info"]["Projections"])
+        and any(child["name"] == "HASH_JOIN" for child in node["children"])
+    ]
+    assert len(shared_extractions) == 1
+    assert _equivalent(connection, queries)[0]["volume"] == record["volume"]
+
+
 @pytest.mark.parametrize("key", list(_record()))
 @pytest.mark.parametrize("absent", [True, False], ids=["missing-key", "json-null"])
 def test_missing_and_explicit_null_fields_retain_individual_path_semantics(

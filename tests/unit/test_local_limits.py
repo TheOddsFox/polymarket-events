@@ -16,6 +16,21 @@ from oddsfox_catalogue.limits import (
 )
 
 
+@pytest.fixture(params=["dirfd", "path"], autouse=True)
+def scanner(request, monkeypatch):
+    if request.param == "path":
+        monkeypatch.setattr(os, "supports_dir_fd", set())
+    elif os.stat not in os.supports_dir_fd or os.listdir not in os.supports_fd:
+        pytest.skip("descriptor-relative directory accounting is unavailable")
+    return request.param
+
+
+def _patch_descriptor_operation(monkeypatch, name, replacement):
+    monkeypatch.setattr(os, name, replacement)
+    support = "supports_dir_fd" if name == "stat" else "supports_fd"
+    monkeypatch.setattr(os, support, {*getattr(os, support), replacement})
+
+
 def test_retained_limit_counts_external_warehouse_and_pending_bytes(tmp_path: Path) -> None:
     settings = Settings(tmp_path / "operator")
     external = tmp_path / "external.duckdb"
@@ -96,7 +111,7 @@ def test_configured_parent_alias_is_rejected_before_lexical_containment(tmp_path
 
 @pytest.mark.parametrize("unsafe", ["symlink", "special", "unreadable"])
 def test_arbitrary_root_entries_cannot_bypass_fail_closed_storage_validation(
-    tmp_path, monkeypatch, unsafe
+    tmp_path, monkeypatch, unsafe, scanner
 ):
     settings = Settings(tmp_path / "operator")
     extra = settings.root / "extra"
@@ -107,7 +122,7 @@ def test_arbitrary_root_entries_cannot_bypass_fail_closed_storage_validation(
         (extra / "link").symlink_to(outside)
     elif unsafe == "special":
         os.mkfifo(extra / "fifo")
-    else:
+    elif scanner == "path":
         original = Path.iterdir
 
         def iterdir(path):
@@ -116,6 +131,16 @@ def test_arbitrary_root_entries_cannot_bypass_fail_closed_storage_validation(
             return original(path)
 
         monkeypatch.setattr(Path, "iterdir", iterdir)
+    else:
+        original = os.listdir
+        inode = extra.stat().st_ino
+
+        def listdir(path):
+            if isinstance(path, int) and os.fstat(path).st_ino == inode:
+                raise PermissionError("unreadable operator evidence")
+            return original(path)
+
+        _patch_descriptor_operation(monkeypatch, "listdir", listdir)
     error = PermissionError if unsafe == "unreadable" else RequestBudgetExceeded
     with pytest.raises(error):
         enforce_storage_limits(settings)
@@ -146,7 +171,7 @@ def test_storage_scan_rejects_symlinks_instead_of_following_them(tmp_path: Path)
 
 @pytest.mark.parametrize("removed", ["file", "directory"])
 def test_storage_scan_tolerates_jobs_removed_during_traversal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, removed: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, removed: str, scanner: str
 ) -> None:
     root = tmp_path / "data"
     root.mkdir()
@@ -154,40 +179,71 @@ def test_storage_scan_tolerates_jobs_removed_during_traversal(
     job = root / "job"
     if removed == "file":
         job.write_bytes(b"temporary")
-        original = Path.lstat
+        if scanner == "path":
+            original = Path.lstat
 
-        def lstat(path, *args, **kwargs):
-            if path == job:
-                job.unlink()
-            return original(path, *args, **kwargs)
+            def lstat(path, *args, **kwargs):
+                if path == job:
+                    job.unlink()
+                return original(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "lstat", lstat)
+            monkeypatch.setattr(Path, "lstat", lstat)
+        else:
+            original = os.stat
+
+            def relative_stat(path, *args, **kwargs):
+                if path == "job" and kwargs.get("dir_fd") is not None:
+                    job.unlink(missing_ok=True)
+                return original(path, *args, **kwargs)
+
+            _patch_descriptor_operation(monkeypatch, "stat", relative_stat)
     else:
         job.mkdir()
-        original = Path.iterdir
+        if scanner == "path":
+            original = Path.iterdir
 
-        def iterdir(path):
-            if path == job:
-                job.rmdir()
-            return original(path)
+            def iterdir(path):
+                if path == job:
+                    job.rmdir()
+                return original(path)
 
-        monkeypatch.setattr(Path, "iterdir", iterdir)
+            monkeypatch.setattr(Path, "iterdir", iterdir)
+        else:
+            original = os.fwalk
+
+            def fwalk(*args, **kwargs):
+                for point in original(*args, **kwargs):
+                    yield point
+                    if Path(point[0]) == root:
+                        job.rmdir()
+
+            monkeypatch.setattr(os, "fwalk", fwalk)
     assert directory_bytes(root) == 5
 
 
 def test_storage_scan_does_not_hide_permission_failures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner: str
 ) -> None:
     root = tmp_path / "data"
     root.mkdir()
-    original = Path.iterdir
+    if scanner == "path":
+        original = Path.iterdir
 
-    def iterdir(path):
-        if path == root:
-            raise PermissionError("unreadable storage")
-        return original(path)
+        def iterdir(path):
+            if path == root:
+                raise PermissionError("unreadable storage")
+            return original(path)
 
-    monkeypatch.setattr(Path, "iterdir", iterdir)
+        monkeypatch.setattr(Path, "iterdir", iterdir)
+    else:
+        original = os.listdir
+
+        def listdir(path):
+            if isinstance(path, int):
+                raise PermissionError("unreadable storage")
+            return original(path)
+
+        _patch_descriptor_operation(monkeypatch, "listdir", listdir)
     with pytest.raises(PermissionError, match="unreadable storage"):
         directory_bytes(root)
 

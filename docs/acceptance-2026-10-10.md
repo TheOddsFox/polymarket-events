@@ -1,10 +1,13 @@
 # Catalogue acceptance evidence
 
-Status at 2026-10-10 17:52 UTC: **partial readiness**. The committed implementation,
-installed package and bounded real workflow pass. Catalogue-wide bootstrap has
-resumed past the repaired adaptive-response failure and is paused at a verified
-checkpoint after a whole-root storage correction passed local, installed, real-smoke
-and independent review gates. Its commit and hosted CI remain pending.
+Status at 2026-10-11 14:12 UTC: **partial readiness**. Bootstrap capture is complete;
+the original load stopped at a verified checkpoint of 8,200 loaded pages and
+61,754 pending. Its evidence and warehouse remain retained. The compact warehouse
+implementation passed native, installed, real-smoke and exact-revision hosted CI
+checks. Further streaming and directory-relative accounting refinements passed
+the shared native, installed and real-smoke checks; exact-revision hosted CI is
+pending. A raw-only copy into a fresh root is in progress. Fresh-root adoption and
+catalogue-wide build, publication and recovery acceptance have not passed.
 This document does not certify full operational readiness.
 
 ## Reviewed implementation
@@ -593,9 +596,69 @@ Its report SHA-256 is
 `983fb3c6f850fa59a387f918a95e926871eb7fa647be64fc4d75f847d8f471f6`.
 The installed wheel matches the final source/dbt resources exactly; the final
 distribution audit excludes operator data and generated state.
-Exact-revision hosted CI and fresh-root adoption remain pending.
+Commit `59d6bc6e45ec12eb59531186a4fbff8023f5a7d5` passed
+[exact-revision hosted CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38141698754),
+including all 1,049 tests and the installed workflows. Fresh-root adoption remains
+pending. The original loader terminated cooperatively with exit 129; its final
+query-only checkpoint has 8,200 loaded pages / 805,933 source records / 61,754
+pending, a dirty build record and no publication pointer. Final retained and
+temporary point measurements were 33,566,385,249 and 1,810,691,460 bytes. The old
+root and matching installation remain available; no state was migrated or pruned.
 
-Remaining gates: final compact hosted CI and adoption, complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
+The streaming refinement removes only the extraction CTE's materialization hint;
+the final staging table and all 47 projected fields remain. Two structured physical
+plan checks establish one scan per input and one shared extraction projection, with
+and without common-subexpression optimization. All 81 focused query and staging
+checks passed; architecture, data and security reviews found no blocking issue.
+Installed proof 15 passed both offline workflows in 51.643 seconds with unchanged
+read-only resources. Its real selected workflow passed all 24 steps in 36.304
+seconds, with two requests / 15,416 bytes, 53,880,426 retained bytes, zero quarantine
+and all replay, rebuild, restoration and pointer-failure comparisons passing.
+Installed and real report SHA-256s are respectively
+`1ebf9383cf7d991ed9a93056a0f45ef1cfaa34e1e03cd85aa131be581b464fe8`
+and `42317ef64b985367d46cbef99894679ee3622bce8d1fdf3b5ab32e247e26d794`.
+
+A larger copied-input comparison used 200 original pages containing 19,944 events
+and 49,260 market observations, with zero quarantine. Both installed runs passed
+all 89 dbt nodes and matched four bronze fingerprints, 29 warehouse relations and
+seven public projections. The existing 50-page and 200-page chunk settings used
+identical installed code, dependencies and unchanged 2 GB / two-thread / 8 GiB
+temporary limits, with no HTTP requests. Four 50-page chunks took 64.532 seconds
+overall and 47.508 seconds to load; one 200-page chunk took 75.129 and 48.544
+seconds. Both fit the resource limits, but this sample shows no larger-batch speed
+win. It does not establish full-catalogue throughput or fit. Report SHA-256:
+`3d5d3cafbf2a63a5d25a354d348ac5ba050b6bf426bb28c9cb4415b24327cad3`.
+
+One metadata-only accounting pair on the quiescent original root measured
+6.175681 seconds for the installed path walker and 1.906709 seconds for a private
+directory-relative prototype. Retained/temp byte totals, the complete loaded-page
+checkpoint and the existing lock state matched; no HTTP request, payload read,
+warehouse read or product command occurred. This was a baseline-first point
+comparison subject to operating-system cache and ordering effects. The production
+refinement adds complete directory listings to reject entries that `fwalk` can
+otherwise silently omit after classification errors, so the prototype timing is
+not an exact production benchmark or whole-load speed claim. Pair report SHA-256:
+`07f59beed86a234bb6d3287d18f6be986c62e97d90388477526b9e215fbf0a56`.
+
+The production accounting refinement passed 134 focused checks, including both
+backends, omitted entries, directory replacements, disappearing temporary paths,
+permission/I/O errors, descriptor cleanup and unsupported-platform fallback.
+Independent architecture, data, security and verifier reviews found no blocking
+issue. The shared final `scripts/verify` gate passed all 1,089 tests in 419.07
+seconds, plus locked dependencies, Ruff, formatting, dbt parse and diff checks.
+Installed proof 16 passed both offline workflows in 53.77 seconds with all 77
+package files and 38 read-only dbt resources matching the source. The distribution
+audit found 82 wheel and 86 sdist members. Wheel SHA-256:
+`957c316014554a933d5c96b1f8cb2215876c60e28a32c45e44a65bb8d03c603b`.
+The real installed smoke passed all 24 steps in 37.841 seconds with two requests /
+15,418 downloaded bytes, 53,890,054 retained bytes, zero quarantine, complete
+accounting and every replay/rebuild/restore/pointer-failure comparison passing.
+Installed and real report SHA-256s are respectively
+`4ae676db4cc9ee700b9c35949d949362a6282236c956c9fe99eb4f8ac1a9bbba`
+and `a6570712367209b9650703948ced39d74b02b54ced42ad39ad9ea31de6fb5275`.
+
+Remaining gates: final streaming/accounting hosted CI, complete verified raw copy and fresh-root adoption,
+complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.
 Scheduling remains inactive. Provider availability, full-load spill demand, cumulative
