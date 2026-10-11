@@ -174,6 +174,8 @@ def _rows_for_chunk(
     counts: dict[str, tuple[int, int, int]] = {}
     raw_bytes = 0
     serialized_bytes = 0
+    scope_batch_id: object = object()
+    scope: dict[str, Any] = {}
     for page in pages:
         batch = _batch(rt, page["batch_id"])
         directory = scan_dir_for(
@@ -210,9 +212,11 @@ def _rows_for_chunk(
             record_key=page["record_key"],
             body_sha256=manifest["body_sha256"],
         )
-        scope = json.loads(batch.get("scope_json") or "{}")
-        if scope.get("revision") != 2 or not scope.get("sealed"):
-            raise LoadBlocked("loading requires a supported sealed capture scope")
+        if scope_batch_id != page["batch_id"]:
+            scope = json.loads(batch.get("scope_json") or "{}")
+            if scope.get("revision") != 2 or not scope.get("sealed"):
+                raise LoadBlocked("loading requires a supported sealed capture scope")
+            scope_batch_id = page["batch_id"]
         page_rows = rows_for_page(ctx, records, fetch_failed, scope=scope)
         counts[page["page_id"]] = (
             len(page_rows.events),

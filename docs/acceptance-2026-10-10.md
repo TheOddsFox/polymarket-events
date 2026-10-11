@@ -468,9 +468,57 @@ Isolated `scripts/verify` passed all 918 tests in 511.43 seconds, with unchanged
 test deadlines, plus dependency, lint/format, dbt parse and diff checks. Log
 SHA-256:
 `c96bcd6e5e430454144920cbf16b928e1e33caa7b648bc6e6b53725deb763ab1`.
-Committed-source/runtime attestation and exact-commit hosted CI remain pending
-for this refinement. Catalogue-wide throughput remains unmeasured until the
-verified named load resumes.
+Committed-source/runtime attestation passed for `6ff82e1`, and its
+[hosted CI run](https://github.com/TheOddsFox/polymarket-events/actions/runs/38129728830)
+passed. The named load then added 750 pages / 74,678 source records in
+1,548.250021 seconds. Fifteen completed 50-page chunks averaged 100.139 seconds
+including startup, with a maximum of 378.229 seconds. This is a measured partial
+run, not a full-catalogue completion estimate.
+
+One explicit operator interruption paused that load for further performance
+work. Its original `PipelineStepFailed` classification is preserved separately
+from the intervention. The final quiescent checkpoint is 6,250 loaded pages /
+612,052 source records / 63,704 pending. The helper postflight passed; registered
+processes are absent and the existing root lock is free and unchanged. The
+10:50:48–50 UTC resource point measured 23,619,079,350 retained bytes and
+1,224,809,945 temporary bytes, within the unchanged 64/8 GiB caps. No pruning,
+allowance increase or new acquisition occurred. Completion summary SHA-256:
+`e54f14a3c3189554ea82676053152fbbfa2eced70cc77810c747947b1089eb48`;
+full actual checkpoint binding:
+`cd87123bf0ede9fac844c58460d2b82581ec63f4e17554d723427c666cb13eb1`.
+An earlier point-in-time checkpoint was misinterpreted as a stalled unit;
+that inference was withdrawn. The observer used query-only `mode=ro`, without
+immutable SQLite semantics.
+
+The next minimal refinement reuses one decoded sealed scope within consecutive
+pages of a same-batch chunk and admits eligible below-high-water entity IDs
+before searching large membership lists. Batch transitions and new chunks
+decode afresh. Every page retains its raw verification, timestamp and resource
+checks; selected scopes, above-boundary membership exceptions, malformed
+containers and oversized-ID fallback keep their existing behavior. Schemas,
+normalization revisions, dlt persistence and allowances remain unchanged.
+Architecture and actual data/security review passed. The test engineer added
+37 regressions; independent verification passed 136 focused tests, plus scoped
+lint/format/diff checks. Security additionally checked seven cache transitions
+and 30 selection-parity cases without accessing the operator root.
+
+Installed proof 11 passed outside the checkout in 56.255 seconds, with audited
+package contents, read-only dbt resources and both offline workflows. Wheel
+SHA-256:
+`530f272134d362ef299d0949b1a0b8ab25d18b72204246ae2030a017585118c1`
+(154,707 bytes); sdist:
+`c4eece1ebdcffd5556a8bd20568ec3c0fa3c0377c11b2dc2a9c2082671539fd9`
+(206,846 bytes). Report SHA-256:
+`36cfbd8e881058b2be3de07015cecdb56613c756c75c4577c4bf6c26e1a06613`.
+The proof-11 real-data smoke passed at 11:00:08–11:00:50 UTC in 42.108566
+seconds: two attempts, 15,388 downloaded bytes and 54,189,186 retained bytes,
+one published market, two CTF outcomes and no quarantine. Its replay, raw
+rebuild, verified fresh restoration and injected-failure pointer checks passed.
+Report SHA-256:
+`a83e4594738a11517f73c64083a57f80239f1663e317096c0884f55045644114`.
+Full offline checks, committed-source/runtime attestation and exact-commit CI
+are pending for this refinement. Its actual large-load speed and final resource
+fit remain unmeasured; the catalogue root is quiescent.
 
 Remaining gates: complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup

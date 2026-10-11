@@ -28,7 +28,7 @@ from oddsfox_catalogue.inventory import (
     coverage_unit,
     expand_coverage_id_range,
 )
-from oddsfox_catalogue.load.rows import RowSet
+from oddsfox_catalogue.load.rows import PageContext, RowSet, rows_for_page
 from oddsfox_catalogue.load.runner import (
     LoadBlocked,
     LoadRuntime,
@@ -520,6 +520,333 @@ def test_indexed_predecessor_preserves_source_cursor_validation(
         else:
             scan = orphan_after_first(runtime, scan, pages)
             _adopt_durable_pages(runtime, batch, scan, directory)
+
+
+def catalogue_scope(mark=10):
+    return {
+        "revision": 2,
+        "kind": "catalogue",
+        "sealed": True,
+        "high_water": {"events": mark, "markets": mark},
+        "baseline": {"events": [], "markets": []},
+        "parent_event_ids": [],
+    }
+
+
+def scope_chunk(monkeypatch, tmp_path, batch_order):
+    """Stub only page I/O; retain real scope decoding, normalization and row accounting."""
+    batches = {
+        key: {
+            "batch_id": key,
+            "observation_date": "2026-10-10",
+            "scope_json": json.dumps(catalogue_scope(10 if key == "A" else 1)),
+        }
+        for key in set(batch_order)
+    }
+    pages, manifests, records, checks, decodes = [], {}, {}, [], []
+    for index, key in enumerate(batch_order, 1):
+        page = {
+            "page_id": f"{key}.page-{index}",
+            "batch_id": key,
+            "scan_id": f"{key}.scan-{index}",
+            "seq": 1,
+            "record_key": "events",
+            "endpoint": "/events/keyset",
+            "observed_at": FIXED_NOW.isoformat(),
+        }
+        pages.append(page)
+        manifests[page["page_id"]] = {
+            "page_id": page["page_id"],
+            "body_bytes": 100,
+            "body_sha256": str(index) * 64,
+            "http_status": 200,
+        }
+        records[page["page_id"]] = [
+            make_event(
+                str(index),
+                f"Scope row {index}",
+                markets=[make_market(str(index + 3), "Nested market"), {"id": "bad"}],
+            ),
+            None,
+        ]
+    ledger = SimpleNamespace(
+        get_batch=lambda key: batches[key],
+        get_scan=lambda key: {"scan_id": key},
+        page_for_scan=lambda key, seq: None,
+    )
+    runtime = LoadRuntime(Settings(tmp_path), ledger)
+
+    def read_manifest(settings, directory, page):
+        if page is None:
+            return None
+        checks.append(("manifest", page["page_id"]))
+        return manifests[page["page_id"]]
+
+    def validate(batch, scan, manifest, **kwargs):
+        checks.append(("identity", manifest["page_id"]))
+
+    def read_records(settings, directory, manifest, record_key, **kwargs):
+        checks.append(("records", manifest["page_id"]))
+        return records[manifest["page_id"]]
+
+    original_loads = json.loads
+
+    def loads(value, *args, **kwargs):
+        if value in [batch["scope_json"] for batch in batches.values()]:
+            decodes.append(value)
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr("oddsfox_catalogue.load.runner.read_indexed_manifest", read_manifest)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner.validate_page_identity", validate)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner.read_page_records", read_records)
+    monkeypatch.setattr(
+        "oddsfox_catalogue.load.runner._preflight_load_bytes",
+        lambda rt, size: checks.append(("bytes", size)),
+    )
+    monkeypatch.setattr("oddsfox_catalogue.load.runner.json.loads", loads)
+    return SimpleNamespace(
+        runtime=runtime,
+        pages=pages,
+        batches=batches,
+        manifests=manifests,
+        checks=checks,
+        decodes=decodes,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_order,missing,expected_decodes",
+    [("AA", None, 1), ("ABA", None, 3), ("ABA", 1, 1)],
+)
+def test_scope_cache_preserves_complete_rows_counts_and_every_page_preflight(
+    monkeypatch, tmp_path, batch_order, missing, expected_decodes
+):
+    fixture = scope_chunk(monkeypatch, tmp_path, batch_order)
+    if missing is not None:
+        fixture.manifests[fixture.pages[missing]["page_id"]]["http_status"] = 404
+        fixture.batches["B"]["scope_json"] = "invalid JSON skipped only for 404"
+    expected_rows, expected_counts = RowSet(), {}
+    for page in fixture.pages:
+        rows, counts = _rows_for_chunk(fixture.runtime, [page])
+        expected_rows.extend(rows)
+        expected_counts.update(counts)
+    fixture.decodes.clear()
+    fixture.checks.clear()
+    original_batches = copy.deepcopy(fixture.batches)
+    rows, counts = _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert rows == expected_rows and counts == expected_counts
+    assert rows.events and rows.markets and rows.quarantine
+    assert len(fixture.decodes) == expected_decodes
+    assert fixture.batches == original_batches
+    expected_checks = []
+    raw_bytes = 0
+    for page in fixture.pages:
+        raw_bytes += 100
+        expected_checks.extend(
+            [
+                ("manifest", page["page_id"]),
+                ("bytes", raw_bytes),
+                ("identity", page["page_id"]),
+                ("records", page["page_id"]),
+            ]
+        )
+        if fixture.manifests[page["page_id"]]["http_status"] != 404:
+            check = fixture.checks[len(expected_checks)]
+            assert check[0] == "bytes" and check[1] > 0
+            expected_checks.append(check)
+    assert fixture.checks == expected_checks
+
+
+def test_decoded_scope_is_not_reused_between_chunks(monkeypatch, tmp_path):
+    fixture = scope_chunk(monkeypatch, tmp_path, "A")
+    first = _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert len(fixture.decodes) == 1
+    assert _rows_for_chunk(fixture.runtime, fixture.pages) == first
+    assert len(fixture.decodes) == 2
+    fixture.batches["A"]["scope_json"] = json.dumps(catalogue_scope(0))
+    changed = _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert len(fixture.decodes) == 3
+    assert changed != first and not changed[0].events
+
+
+@pytest.mark.parametrize("scope", [{"revision": 1, "sealed": True}, {"revision": 2}])
+def test_new_non404_batch_validates_scope_on_its_first_use(monkeypatch, tmp_path, scope):
+    fixture = scope_chunk(monkeypatch, tmp_path, "AB")
+    fixture.batches["B"]["scope_json"] = json.dumps(scope)
+    with pytest.raises(LoadBlocked, match="supported sealed capture scope"):
+        _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert len(fixture.decodes) == 2
+    assert ("records", fixture.pages[1]["page_id"]) in fixture.checks
+
+
+@pytest.mark.parametrize("observed_at", [0, "not a timestamp", ""])
+def test_timestamp_validation_precedes_even_first_scope_decode(monkeypatch, tmp_path, observed_at):
+    fixture = scope_chunk(monkeypatch, tmp_path, "A")
+    fixture.pages[0]["observed_at"] = observed_at
+    fixture.batches["A"]["scope_json"] = "invalid JSON"
+    with pytest.raises(LoadBlocked, match="unparseable observed_at"):
+        _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert not fixture.decodes
+    assert ("records", fixture.pages[0]["page_id"]) in fixture.checks
+
+
+@pytest.mark.parametrize("failure", ["manifest", "identity", "records", "bytes"])
+def test_cached_scope_cannot_bypass_later_page_failure(monkeypatch, tmp_path, failure):
+    fixture = scope_chunk(monkeypatch, tmp_path, "AA")
+    if failure == "manifest":
+        fixture.manifests[fixture.pages[1]["page_id"]] = None
+        error, match = LoadBlocked, "not durable"
+    else:
+        name = {
+            "identity": "validate_page_identity",
+            "records": "read_page_records",
+            "bytes": "_preflight_load_bytes",
+        }[failure]
+        from oddsfox_catalogue.load import runner
+
+        original = getattr(runner, name)
+
+        def fail_on_second(*args, **kwargs):
+            second_page = (
+                args[1] == 200
+                if failure == "bytes"
+                else args[2]["page_id"] == fixture.pages[1]["page_id"]
+            )
+            if second_page:
+                raise DurabilityError("second-page guard failed")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(runner, name, fail_on_second)
+        error, match = DurabilityError, "second-page guard failed"
+    with pytest.raises(error, match=match):
+        _rows_for_chunk(fixture.runtime, fixture.pages)
+    assert len(fixture.decodes) == 1
+
+
+def scoped_rows(entity, value, scope):
+    ctx = PageContext("scope-page", BATCH, f"/{entity}/keyset", FIXED_NOW, entity)
+    record = make_market("1", "HWM market") if entity == "markets" else make_event("1", "HWM event")
+    record["id"] = value
+    return rows_for_page(ctx, [record], scope=scope)
+
+
+class MembershipTrap(str):
+    def __eq__(self, other):
+        pytest.fail("below-HWM selection scanned a baseline or parent list")
+
+    __hash__ = str.__hash__
+
+
+@pytest.mark.parametrize("entity", ["events", "markets"])
+@pytest.mark.parametrize("value", ["1", "99999999999999999999"])
+def test_bounded_integer_hwm_skips_membership_and_preserves_complete_rows(entity, value):
+    scope = catalogue_scope(int(value))
+    expected = scoped_rows(entity, value, scope)
+    assert getattr(expected, entity)
+    scope["baseline"][entity] = [MembershipTrap("unrelated")]
+    scope["parent_event_ids"] = [MembershipTrap("unrelated")] if entity == "events" else None
+    assert scoped_rows(entity, value, scope) == expected
+
+
+@pytest.mark.parametrize(
+    "entity,membership", [("events", "baseline"), ("events", "parent"), ("markets", "baseline")]
+)
+def test_above_hwm_baseline_and_parent_exceptions_are_retained(entity, membership):
+    scope = catalogue_scope(1)
+    assert scoped_rows(entity, "2", scope) == RowSet()
+    if membership == "baseline":
+        scope["baseline"][entity] = ["2"]
+    else:
+        scope["parent_event_ids"] = ["2"]
+    original = copy.deepcopy(scope)
+    assert scoped_rows(entity, "2", scope) == scoped_rows(entity, "2", None)
+    assert scope == original
+
+
+@pytest.mark.parametrize(
+    "entity,field,error",
+    [
+        ("events", "baseline", TypeError),
+        ("markets", "baseline", TypeError),
+        ("events", "parent", TypeError),
+        ("events", "missing_parent", KeyError),
+    ],
+)
+def test_hwm_shortcut_preserves_malformed_container_errors(entity, field, error):
+    scope = catalogue_scope(2)
+    if field == "baseline":
+        scope["baseline"][entity] = None
+    elif field == "parent":
+        scope["parent_event_ids"] = None
+    else:
+        scope.pop("parent_event_ids")
+    with pytest.raises(error):
+        scoped_rows(entity, "1", scope)
+
+
+def test_hwm_shortcut_requires_exact_list_containers():
+    checks = []
+
+    class ObservedList(list):
+        def __contains__(self, value):
+            checks.append(value)
+            return super().__contains__(value)
+
+    scope = catalogue_scope(2)
+    scope["baseline"]["events"] = ObservedList()
+    assert scoped_rows("events", "1", scope) == scoped_rows("events", "1", None)
+    assert checks == ["1"]
+    checks.clear()
+    scope["baseline"]["events"] = []
+    scope["parent_event_ids"] = ObservedList()
+    assert scoped_rows("events", "1", scope) == scoped_rows("events", "1", None)
+    assert checks == ["1"]
+
+
+@pytest.mark.parametrize("mark,accepted", [(2.0, True), (True, True), (False, False), (0, False)])
+def test_nonstandard_numeric_hwm_keeps_original_comparison_semantics(mark, accepted):
+    scope = catalogue_scope(mark)
+    expected = scoped_rows("events", "1", None) if accepted else RowSet()
+    assert scoped_rows("events", "1", scope) == expected
+
+
+def test_string_hwm_retains_baseline_exception_and_comparison_error():
+    scope = catalogue_scope("2")
+    with pytest.raises(TypeError):
+        scoped_rows("events", "1", scope)
+    scope["baseline"]["events"] = ["1"]
+    assert scoped_rows("events", "1", scope) == scoped_rows("events", "1", None)
+
+
+@pytest.mark.parametrize("value,mark", [("1", None), ("١", 2), ("bad", 2)])
+def test_existing_hwm_guards_still_precede_membership(value, mark):
+    scope = catalogue_scope(mark)
+    scope["baseline"]["events"] = None
+    scope["parent_event_ids"] = None
+    assert scoped_rows("events", value, scope) == scoped_rows("events", value, None)
+
+
+def test_oversized_decimal_baseline_id_quarantines_before_integer_conversion():
+    value = "9" * 5000
+    scope = catalogue_scope(10)
+    scope["baseline"]["events"] = [value]
+    rows = scoped_rows("events", value, scope)
+    assert rows == scoped_rows("events", value, None)
+    assert not rows.events and rows.quarantine[0]["reason"] == "record has an invalid id"
+
+
+@pytest.mark.parametrize(
+    "entity,membership",
+    [("events", "event_ids"), ("events", "parent_event_ids"), ("markets", "market_ids")],
+)
+def test_selected_scope_uses_explicit_ids_even_above_hwm(entity, membership):
+    scope = catalogue_scope(0)
+    scope.update(kind="selected", event_ids=[], market_ids=[])
+    scope["baseline"][entity] = ["1"]
+    assert scoped_rows(entity, "1", scope) == RowSet()
+    scope[membership] = ["2"]
+    assert scoped_rows(entity, "2", scope) == scoped_rows(entity, "2", None)
+    assert scoped_rows(entity, "1", scope) == RowSet()
 
 
 @pytest.mark.parametrize(

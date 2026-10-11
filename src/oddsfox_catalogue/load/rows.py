@@ -175,6 +175,14 @@ def rows_for_page(
         mark = scope["high_water"].get(entity)
         if mark is None or not value.isascii() or not value.isdecimal():
             return True
+        if (
+            isinstance(mark, int)
+            and len(value) <= 20
+            and type(scope["baseline"][entity]) is list
+            and (entity != "events" or type(scope.get("parent_event_ids")) is list)
+            and int(value) <= mark
+        ):
+            return True
         if value in scope["baseline"][entity] or (
             entity == "events" and value in scope["parent_event_ids"]
         ):
