@@ -657,7 +657,67 @@ Installed and real report SHA-256s are respectively
 `4ae676db4cc9ee700b9c35949d949362a6282236c956c9fe99eb4f8ac1a9bbba`
 and `a6570712367209b9650703948ced39d74b02b54ced42ad39ad9ea31de6fb5275`.
 
-Remaining gates: final streaming/accounting hosted CI, complete verified raw copy and fresh-root adoption,
+Commit `aa4b4cb0d76bbc6bd8828692d9f2237bc1f64ead` passed
+[exact-revision hosted CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38146389384).
+The complete raw-only fresh-root copy verified 69,954 pages / 140,055 files /
+4,284,587,741 bytes. Offline ledger reconstruction then verified all pages,
+5,415,266 top-level source records and 146 sealed scans. The named full load is
+still running under installed proof 16; the query-only checkpoint at
+2026-10-11 15:39 UTC contains 8,000 loaded pages / 786,042 source records /
+61,954 pending. This establishes progress, not complete catalogue readiness.
+
+A copied-input native Parquet experiment kept the same 200 pages, installation,
+sequential resources and resource limits. It used dlt's native Parquet format
+with a private experimental PyArrow 24 copy, rather than a new loader. All four
+bronze fingerprints, 29 semantic relations and seven public projections matched
+the default-format reference, and all 89 dbt nodes passed. The dlt phase measured
+18.301 versus 8.243 seconds (2.22 times faster), load plus registry 44.661 versus
+34.250 seconds (1.30 times faster), and total time 64.026 versus 51.593 seconds.
+Temporary bytes increased from 29,032,435 to 59,940,122, and retained bytes from
+899,056,690 to 933,372,053. These ordered, bounded measurements share the host
+with the actual catalogue load; they do not establish sustained throughput,
+peak memory or whole-catalogue fit. Result SHA-256:
+`fcbbd93a0fc9c18f8e610ca030a54cf9cd3b70a7ca7cdc095855d1f84ce137e6`.
+
+The production candidate declares dlt's Parquet extra and locks PyArrow 24;
+it does not import the experimental copy or another repository. Exact row-size
+admission uses the same strict JSON encoder in one call, preserving every
+checkpoint. A 5,539-row copied-input microbenchmark matched every original byte
+count and measured 0.248/0.300 seconds versus 0.149/0.192 seconds. This is a CPU
+microbenchmark, not a full-load result. A shared-connection experiment offered
+no measured gain, and JSONL failed required empty-schema materialization; neither
+is adopted. Gamma returned only 100 records for larger ordinary list requests
+and rejected larger ID filters, so acquisition page size remains unchanged.
+
+Installed proof 17 passed both offline workflows in 55.297 seconds, with all
+77 package files matching the candidate source and 38 read-only dbt resources.
+The audited wheel has 82 members and the sdist 86. Installed report SHA-256:
+`1877279a78b0f239d3fec594199c3fa87672968646986c8dbb5c87c447972da3`;
+wheel SHA-256:
+`1d12447d9b36764a03e3fdf692221a1aa3daaeaeade6e072aa40c5cd02173a6e`.
+The real public-market workflow passed all 24 steps in 40.652 seconds with
+two attempts / 15,380 downloaded bytes / 53,970,679 retained bytes / zero
+quarantine, including full semantic replay/rebuild/restoration and injected
+publication failure. Its report SHA-256 is
+`747adfb8debbeedc214b8c9099281942f3da5b0e9c8e21058b1d30c027965809`.
+
+Using that actual installed candidate, the same 200-page comparison passed
+all four bronze fingerprints, 29 semantic relations, seven public projections
+and 89 dbt nodes. Load plus registry measured 44.661 versus 26.764 seconds
+(40.1% less time), the dlt phase 18.301 versus 7.302 seconds, and total time
+64.026 versus 43.446 seconds. Serialization measured 9.885 versus 3.242 seconds.
+Retained bytes were 932,061,077 and temporary bytes 59,940,202, with the same
+ordering/cache/shared-host limitations as the earlier experiment. Result SHA-256:
+`ec363b1fda8ca545f4fb2865c3690b86ac15cf3a4410e930f0b2db578ea09f5c`.
+All 188 focused loader/runtime/scale/encoder checks passed, plus the subsequent
+old-format committed-but-unacknowledged to Parquet recovery regression.
+Independent actual-diff review found no blocking architecture, data or security
+issue. The shared native `scripts/verify` gate passed 1,115 tests in 475.32
+seconds, plus locked dependencies, Ruff, formatting, dbt parse and diff checks.
+The subsequently added format-transition regression passed separately; hosted CI
+must include all 1,116 tests. Exact-revision hosted CI remains pending.
+
+Remaining gates: final Parquet/encoder hosted CI and verified runtime adoption;
 complete bootstrap load/build/publication, daily refresh and reconcile; immutable release
 verification; full-root offline replay and semantic raw rebuild; verified fresh backup
 restoration; final acceptance evidence commit and passing hosted CI for that commit.

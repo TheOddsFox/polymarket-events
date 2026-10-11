@@ -113,7 +113,7 @@ def _run_resource(rt: LoadRuntime, resource: DltResource):
         temp_directory=rt.settings.temporary_dir,
         max_temp_bytes=remaining_temp_bytes(rt.settings),
     )
-    return pipeline.run(resource, destination=destination)
+    return pipeline.run(resource, destination=destination, loader_file_format="parquet")
 
 
 def _batch(rt: LoadRuntime, batch_id: str) -> dict[str, Any]:
@@ -138,7 +138,7 @@ def _encoded_row_bytes(row: dict[str, Any]) -> int:
             value.isoformat() if isinstance(value, datetime) else json.loads(canonical_json(value))
         ),
     )
-    return sum(len(part.encode()) for part in encoder.iterencode(row)) + 1
+    return len(encoder.encode(row).encode()) + 1
 
 
 def _reset_load_budget(rt: LoadRuntime) -> None:

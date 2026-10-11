@@ -205,7 +205,36 @@ def test_crash_before_registry_recovers_and_registers_once(tmp_path: Path) -> No
     assert _batch_status(settings, batch_id) == "loaded"
 
 
-def test_schema_drift_in_envelope_is_rejected(tmp_path: Path) -> None:
+def test_parquet_recovers_unacknowledged_old_format_commit(tmp_path: Path, monkeypatch) -> None:
+    from dlt.pipeline.pipeline import Pipeline
+
+    batch_id = _capture(tmp_path)
+    settings = make_settings(tmp_path)
+    original_run = Pipeline.run
+
+    def old_format_then_stop(self, *args, **kwargs):
+        kwargs["loader_file_format"] = "insert_values"
+        original_run(self, *args, **kwargs)
+        raise RuntimeError("stop after old-format resource commit")
+
+    with monkeypatch.context() as changed:
+        changed.setattr(Pipeline, "run", old_format_then_stop)
+        with pytest.raises(RuntimeError, match="old-format resource commit"):
+            _load(settings)
+    committed = _table_count(settings, "event_observations")
+    assert committed > 0
+    assert _registry_rows(settings) == []
+    with Ledger(settings.ledger_path) as ledger:
+        assert len(ledger.pending_load_pages(batch_id)) == len(ledger.pages_for_batch(batch_id))
+    recovered = _load(settings)
+    assert recovered.batches_registered == [batch_id]
+    assert _table_count(settings, "event_observations") == committed
+    assert _distinct_observations(settings, "event_observations") == committed
+    assert _registry_rows(settings) == [(batch_id, "loaded")]
+
+
+@pytest.mark.parametrize("file_format", ["insert_values", "parquet"])
+def test_schema_drift_in_envelope_is_rejected(tmp_path: Path, file_format) -> None:
     _capture(tmp_path)
     settings = make_settings(tmp_path)
     _load(settings)
@@ -227,7 +256,7 @@ def test_schema_drift_in_envelope_is_rejected(tmp_path: Path) -> None:
     ]
 
     with pytest.raises(PipelineStepFailed):
-        pipeline.run([event_resource(rows)])
+        pipeline.run([event_resource(rows)], loader_file_format=file_format)
 
     assert _table_count(settings, "event_observations") == _distinct_observations(
         settings, "event_observations"
@@ -358,8 +387,9 @@ def test_batch_over_quarantine_cap_is_blocked_and_not_registered(tmp_path: Path)
     "table,resource",
     [("event_observations", event_resource), ("market_observations", market_resource)],
 )
+@pytest.mark.parametrize("file_format", ["insert_values", "parquet"])
 def test_insert_only_merge_keys_on_observation_id_not_payload(
-    tmp_path: Path, table, resource
+    tmp_path: Path, table, resource, file_format
 ) -> None:
     """Regression: two observations with identical payloads must both be kept.
 
@@ -390,7 +420,7 @@ def test_insert_only_merge_keys_on_observation_id_not_payload(
         return result
 
     for observation_id in ["obs-a", "obs-b"]:
-        pipeline.run(resource([row(observation_id)]))
+        pipeline.run(resource([row(observation_id)]), loader_file_format=file_format)
 
     assert _query(settings, f"SELECT COUNT(*) FROM bronze.{table}") == 2
     assert _query(settings, f"SELECT COUNT(DISTINCT payload_hash) FROM bronze.{table}") == 1
@@ -440,7 +470,10 @@ def test_replay_blocks_conflicting_persisted_receipt_timestamp(tmp_path: Path) -
         _load(settings)
 
 
-def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize("file_format", ["insert_values", "parquet"])
+def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(
+    tmp_path: Path, file_format
+) -> None:
     """An empty first capture has canonical schemas without inventing an evidence row."""
     from oddsfox_catalogue.load.rows import PageContext, rows_for_page
     from oddsfox_catalogue.load.source import market_resource, quarantine_resource
@@ -448,7 +481,7 @@ def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(tmp_p
     settings = make_settings(tmp_path)
     pipeline = make_pipeline(settings.warehouse_path, settings.dlt_pipelines_dir, settings.load)
     for factory in (event_resource, market_resource, quarantine_resource):
-        pipeline.run(factory([], materialize_only=True))
+        pipeline.run(factory([], materialize_only=True), loader_file_format=file_format)
     for table in ("event_observations", "market_observations", "quarantined_records"):
         assert _table_count(settings, table) == 0
     with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
@@ -481,8 +514,8 @@ def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(tmp_p
         ],
     )
     for _ in range(2):
-        pipeline.run(event_resource(rows.events))
-        pipeline.run(quarantine_resource(rows.quarantine))
+        pipeline.run(event_resource(rows.events), loader_file_format=file_format)
+        pipeline.run(quarantine_resource(rows.quarantine), loader_file_format=file_format)
     assert _table_count(settings, "event_observations") == 1
     assert _table_count(settings, "quarantined_records") == 1
     with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
@@ -627,3 +660,84 @@ def test_cached_pipeline_refreshes_spill_allowance_before_every_run(tmp_path: Pa
         ]
         assert second == expected
         assert int(second[:-1]) < int(first[:-1])
+
+
+@pytest.mark.parametrize(
+    "table,factory,columns",
+    [
+        ("event_observations", event_resource, event_columns),
+        ("market_observations", market_resource, market_columns),
+    ],
+)
+def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
+    tmp_path: Path, table, factory, columns
+) -> None:
+    from datetime import timedelta, timezone
+
+    from oddsfox_catalogue.load.runner import _run_resource
+    from oddsfox_catalogue.load.runtime import confined_runtime
+
+    settings = make_settings(tmp_path)
+    received = FIXED_NOW.replace(microsecond=123456).astimezone(
+        timezone(timedelta(hours=5, minutes=30))
+    )
+    payload = {
+        "exact": "0.12345678901234567890123456789",
+        "nullable": None,
+        "active": None,
+        "text": '雪\\\n"' * 32768,
+        "labels": ["Yes", "No"],
+    }
+    row = {
+        "observation_id": "first",
+        "venue": "polymarket",
+        "entity_id": "1",
+        "batch_id": "batch",
+        "page_id": "page",
+        "observed_at": received,
+        "source_updated_at": None,
+        "endpoint": "/markets" if table == "market_observations" else "/events",
+        "payload_hash": "same-hash",
+        "normalized": payload,
+    }
+    if table == "market_observations":
+        row.update(source_kind="market_direct", json_pointer="/markets/0")
+    with Ledger(settings.ledger_path) as ledger, confined_runtime(settings.dlt_pipelines_dir):
+        runtime = LoadRuntime(settings, ledger)
+        _run_resource(runtime, factory([], materialize_only=True))
+        first = _run_resource(runtime, factory([row]))
+        formats = {
+            job.job_file_info.file_format
+            for package in first.load_packages
+            for job in package.jobs["completed_jobs"]
+        }
+        assert "parquet" in formats
+        assert "insert_values" not in formats
+        _run_resource(runtime, factory([row]))
+        _run_resource(
+            runtime,
+            factory([{**row, "observation_id": "second", "source_updated_at": received}]),
+        )
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+        schema = {
+            name: (kind, nullable)
+            for name, kind, nullable in connection.execute(
+                "SELECT column_name,data_type,is_nullable FROM information_schema.columns "
+                "WHERE table_schema='bronze' AND table_name=?",
+                [table],
+            ).fetchall()
+            if not name.startswith("_dlt_")
+        }
+        types = {"text": "VARCHAR", "timestamp": "TIMESTAMP WITH TIME ZONE", "json": "JSON"}
+        assert schema == {
+            name: (types[spec["data_type"]], "YES" if spec["nullable"] else "NO")
+            for name, spec in columns().items()
+        }
+        actual = connection.execute(
+            f"SELECT observation_id,observed_at,source_updated_at,normalized "
+            f"FROM bronze.{table} ORDER BY observation_id"
+        ).fetchall()
+        assert len(actual) == 2
+        assert actual[0][:3] == ("first", received, None)
+        assert actual[1][:3] == ("second", received, received)
+        assert [json.loads(values[3]) for values in actual] == [payload, payload]
