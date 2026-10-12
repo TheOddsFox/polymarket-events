@@ -154,7 +154,7 @@ def _cmd_batch_abandon(args: argparse.Namespace) -> int:
 
 def _cmd_load(args: argparse.Namespace) -> int:
     settings = load_settings()
-    summary = load_stage(settings, batch_id=args.batch_id)
+    summary = load_stage(settings, batch_id=args.batch_id, record_key=args.record_key)
     print(json.dumps(asdict(summary), indent=2, default=str))
     return 0
 
@@ -401,6 +401,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     load = sub.add_parser("load", help="load captured pages into bronze (idempotent)")
     load.add_argument("--batch-id", default=None, help="load only this batch")
+    load.add_argument(
+        "--record-key",
+        choices=("markets",),
+        help="load only native market pages of an explicit batch",
+    )
     load.set_defaults(handler=_cmd_load)
 
     dbt = sub.add_parser("dbt", help="run a dbt command against the warehouse")

@@ -28,7 +28,7 @@ from oddsfox_catalogue.dbt_runner import is_selected_dbt_command, run_dbt, with_
 from oddsfox_catalogue.gamma.http import GammaClient
 from oddsfox_catalogue.ids import MODES, iso_utc, utc_now
 from oddsfox_catalogue.limits import enforce_storage_limits
-from oddsfox_catalogue.load.runner import LoadRuntime, LoadSummary, load_pending
+from oddsfox_catalogue.load.runner import LoadBlocked, LoadRuntime, LoadSummary, load_pending
 from oddsfox_catalogue.publish import PublishBlocked, ReleaseInfo, current_release, publish_release
 from oddsfox_catalogue.runlock import current_git_sha, run_lock
 from oddsfox_catalogue.semantics import bounded_connection
@@ -152,17 +152,25 @@ def load_stage(
     settings: Settings,
     *,
     batch_id: str | None = None,
+    record_key: str | None = None,
     now: Callable[[], datetime] = utc_now,
 ) -> LoadSummary:
+    if record_key is not None and (record_key != "markets" or not batch_id):
+        raise LoadBlocked("market-page loading requires an explicit batch ID")
     with run_lock(settings.run_lock_path), _recorded(settings, "load", batch_id) as run:
         enforce_storage_limits(settings)
         ledger = Ledger(settings.ledger_path)
         try:
-            summary = load_pending(LoadRuntime(settings=settings, ledger=ledger, now=now), batch_id)
+            summary = load_pending(
+                LoadRuntime(settings=settings, ledger=ledger, now=now),
+                batch_id,
+                record_key=record_key,
+            )
         finally:
             ledger.close()
         run.counts = {
             "pages_loaded": summary.pages_loaded,
+            "pages_remaining": summary.pages_remaining,
             "event_rows": summary.event_rows,
             "market_rows": summary.market_rows,
             "quarantined": summary.quarantined,

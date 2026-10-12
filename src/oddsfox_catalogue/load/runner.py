@@ -102,6 +102,7 @@ class LoadSummary:
     quarantined: int = 0
     load_ids: list[str] = field(default_factory=list)
     batches_registered: list[str] = field(default_factory=list)
+    pages_remaining: int = 0
 
 
 def _pipeline(rt: LoadRuntime) -> dlt.Pipeline:
@@ -442,12 +443,21 @@ def _register_complete_batches(rt: LoadRuntime, summary: LoadSummary, batch_id: 
         )
 
 
-def load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
+def load_pending(
+    rt: LoadRuntime, batch_id: str | None = None, *, record_key: str | None = None
+) -> LoadSummary:
+    if record_key is not None:
+        if record_key != "markets" or not batch_id:
+            raise LoadBlocked("market-page loading requires an explicit batch ID")
+        if rt.ledger.get_batch(batch_id) is None:
+            raise LoadBlocked("market-page loading requires an existing batch")
     with confined_runtime(rt.settings.dlt_pipelines_dir):
-        return _load_pending(rt, batch_id)
+        return _load_pending(rt, batch_id, record_key=record_key)
 
 
-def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
+def _load_pending(
+    rt: LoadRuntime, batch_id: str | None = None, *, record_key: str | None = None
+) -> LoadSummary:
     """Load every fetched-but-unloaded page (optionally for one batch), then register batches.
 
     Raises ``LoadBlocked`` after registering every batch that passes the quarantine gate, if
@@ -471,6 +481,9 @@ def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
         enforce_storage_limits(rt.settings)
         summary = LoadSummary()
         pending = rt.ledger.pending_load_pages(batch_id)
+        pending_count = len(pending)
+        if record_key is not None:
+            pending = [page for page in pending if page["record_key"] == record_key]
         with bounded_connection(rt.settings, read_only=False) as connection:
             rt.connection = connection
             ensure_observation_views(connection, rt.settings.load.dataset_name)
@@ -489,6 +502,7 @@ def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
                     midpoint = len(part) // 2
                     work.extend((part[midpoint:], part[:midpoint]))
             _register_complete_batches(rt, summary, batch_id)
+        summary.pages_remaining = pending_count - summary.pages_loaded
         return summary
     finally:
         rt.connection = None

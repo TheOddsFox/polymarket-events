@@ -55,7 +55,14 @@ def storage(workspace, *, additional_bytes=0):
     return {"retained_bytes": used, "temporary_bytes": temp, "filesystem_free_bytes": free}
 
 
-def environment(root, arguments):
+def environment(root, arguments, *, load_pages=50):
+    parsed = build_parser().parse_args(arguments)
+    if type(load_pages) is not int or load_pages not in {50, 250}:
+        raise ValueError("acceptance load pages must be 50 or 250")
+    if load_pages == 250 and not (
+        parsed.command == "load" and parsed.record_key == "markets" and parsed.batch_id
+    ):
+        raise ValueError("250-page acceptance requires an explicit market-page batch load")
     env = {k: v for k, v in os.environ.items() if not k.startswith("CATALOGUE_")}
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
@@ -75,19 +82,19 @@ def environment(root, arguments):
         CATALOGUE_CAPTURE_MAX_RESPONSE_BYTES=str(16 * 1024**2),
         CATALOGUE_CAPTURE_MAX_DURATION_S="14400",
         CATALOGUE_CAPTURE_WORKERS="1",
-        CATALOGUE_LOAD_MAX_PAGES_PER_RUN="50",
+        CATALOGUE_LOAD_MAX_PAGES_PER_RUN=str(load_pages),
         CATALOGUE_LOAD_DUCKDB_MEMORY_LIMIT="2GB",
         CATALOGUE_LOAD_DUCKDB_THREADS="2",
         CATALOGUE_QUALITY_QUARANTINE_MAX_RATIO="0.01",
         CATALOGUE_QUALITY_OPEN_EVENTS_DROP_WARN_PCT="5",
         CATALOGUE_QUALITY_OPEN_EVENTS_DROP_ERROR_PCT="10",
     )
-    mode = build_parser().parse_args(arguments).mode if arguments[:1] == ["capture"] else None
+    mode = parsed.mode if parsed.command == "capture" else None
     env["CATALOGUE_GAMMA_REQUESTS_PER_SECOND"] = "10" if mode in {"daily", "reconcile"} else "2"
     return env
 
 
-def run(workspace, root, arguments, *, duration=14400, additional_bytes=0):
+def run(workspace, root, arguments, *, duration=14400, additional_bytes=0, load_pages=50):
     started = time.monotonic()
     if (
         isinstance(duration, bool)
@@ -122,6 +129,7 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0):
         parsed = build_parser().parse_args(arguments)
     except SystemExit as exc:
         raise ValueError("invalid acceptance catalogue arguments") from exc
+    env = environment(root, arguments, load_pages=load_pages)
     for name in ("scratch", "dest", "destination", "release", "path"):
         if (value := getattr(parsed, name, None)) is not None:
             confined(value, workspace)
@@ -131,7 +139,6 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0):
     elif arguments[:2] == ["backup", "restore"]:
         additional_bytes = max(additional_bytes, _union_bytes((parsed.path,)) + 16384)
     before = storage(workspace, additional_bytes=additional_bytes)
-    env = environment(root, arguments)
     if arguments[:1] == ["publish"] or arguments[:2] == ["backup", "create"]:
         # Native publication/copy admission must reserve space occupied by other roots and logs.
         env["CATALOGUE_CAPTURE_MAX_RETAINED_BYTES"] = str(
@@ -153,6 +160,7 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0):
         "duration_limit_s": duration,
         "additional_bytes_reserved": additional_bytes,
         "operator_retained_allowance_bytes": settings.capture.max_retained_bytes,
+        "load_pages": settings.load.max_pages_per_run,
         "status": "running",
     }
     atomic_write_bytes(output / "report.json", (json.dumps(report, sort_keys=True) + "\n").encode())
@@ -241,6 +249,7 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=14400)
     parser.add_argument("--reserve-bytes", type=int, default=0)
+    parser.add_argument("--load-pages", type=int, choices=(50, 250), default=50)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -252,6 +261,7 @@ def main(argv=None):
             command,
             duration=args.duration,
             additional_bytes=args.reserve_bytes,
+            load_pages=args.load_pages,
         )
     except (ValueError, OSError, TimeoutError):
         print("acceptance invocation failed; inspect its report and CLI logs", file=sys.stderr)

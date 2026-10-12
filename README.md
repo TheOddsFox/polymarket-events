@@ -227,6 +227,23 @@ there. Daily/reconcile captures use the approved 10 requests/second; other comma
 Committed defaults remain 64/8 GiB. Storage measurements are points, not atomic filesystem snapshots;
 an exhausted invocation fails and is not acceptance evidence. A stopped command may retain partial work.
 
+An explicit batch's native market-source pages can be loaded separately:
+
+```sh
+python -m oddsfox_catalogue.acceptance --workspace /absolute/path/to/repo/data \
+  --root /absolute/path/to/operator-root --load-pages 250 -- \
+  load --batch-id BATCH_ID --record-key markets
+```
+
+This filters committed source-page headers, preserves their order and leaves event pages pending.
+The load summary reports `pages_remaining`; batch registration, build certification and publication
+still require all pages. Repeat runs skip verified loaded checkpoints. Complete remaining pages
+with an ordinary supervised load at 50 pages. The supervisor permits 250 only for this explicit
+market-page batch command; all other stages keep 50. Ordinary CLI and Dagster defaults are unchanged.
+The same-page direct-market benchmark measured 67.0 versus 40.5 seconds and identical logical rows;
+this does not establish full-catalogue throughput. Event batching showed only a 4% gain with higher
+memory use, so event, refresh, reconcile and raw-rebuild acceptance stays at 50.
+
 ## Layout
 
 - `src/oddsfox_catalogue/`: capture, load, dbt runner, publish, rebuild, backup, Dagster definitions, CLI.
