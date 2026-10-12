@@ -75,10 +75,16 @@ completed-job cleanup. Old roots plus source, backup and restore project to 258.
 This is provisional: actual scan growth, compression and spill remain measured gates.
 The separate 32 GiB free-filesystem reserve is not available workspace headroom. Keep heavy
 dbt work out of the three-copy phase and separately preflight each scratch rebuild.
-The early removal of acknowledged completed job
-payloads requires the operator's pending decision; nothing has been removed.
+The operator approved removing verified completed job payloads after a successful
+source-bound raw rebuild and before backup. The pinned dlt cleanup method passed isolated
+replay and interruption checks; failed, pending and unacknowledged packages remain protected.
+No payloads have been removed from catalogue-wide roots.
 
-Catalogue-wide bootstrap loading, daily and reconcile collection, complete recovery,
-the final `data/catalogue`, cleanup and exact-commit hosted CI remain incomplete. Do not
+The retained raw inventory was copied into a fresh owned v4 root and its ledger reconstructed:
+140,055 files, 4,284,587,741 bytes, 69,954 original page identities and 146 complete scans.
+All capture fields match the old ledger, which remains unchanged. Bootstrap loading is now
+running offline. Daily/reconcile collection, complete recovery, the final `data/catalogue`
+and catalogue-wide cleanup remain incomplete. Commit `6b796ab` passed hosted CI, including
+the installed offline workflow; subsequent production edits require their own gates. Do not
 claim the bounded smoke proves operational completion. Measure full build/certification
 runtime as well as storage: views trade redundant storage for repeated computation.

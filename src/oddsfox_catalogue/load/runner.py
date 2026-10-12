@@ -347,6 +347,8 @@ def _load_chunk(
     _reset_load_budget(rt)
     rows, counts, serialized_bytes = _rows_for_chunk(rt, pages)
     _check_existing_observations(rt, rows)
+    # Read queries may spill; resource construction after this point is in-memory.
+    _reset_load_budget(rt)
     _preflight_load_bytes(rt, sum(serialized_bytes))
     load_id: str | None = None
 
@@ -355,7 +357,6 @@ def _load_chunk(
     # hints leak into event_observations). Each run is idempotent under insert-only merge,
     # so a crash between runs is safe.
     for resource, size in zip(_chunk_resources(rows), serialized_bytes, strict=True):
-        _reset_load_budget(rt)
         _preflight_load_bytes(rt, size)
         info = _run_resource(rt, resource)
         _reset_load_budget(rt)

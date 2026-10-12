@@ -830,15 +830,13 @@ def test_load_chunk_encodes_each_row_once_and_keeps_all_admission_calls(monkeypa
         ("preflight", 200),
         ("preflight", sum(page_totals)),
         "existing",
-        ("preflight", sum(sizes)),
         "reset",
+        ("preflight", sum(sizes)),
         ("preflight", sizes[0]),
         ("write", "event_observations_values"),
         "reset",
-        "reset",
         ("preflight", sizes[1]),
         ("write", "market_observations_values"),
-        "reset",
         "reset",
         ("preflight", sizes[2]),
         ("write", "quarantined_records"),
@@ -903,7 +901,10 @@ def test_resource_exhaustion_refreshes_admission_and_leaves_chunk_unacknowledged
     with pytest.raises(RequestBudgetExceeded, match="allowance"):
         _load_chunk(fixture.runtime, fixture.pages, summary)
     assert len(writes) == resource_index and not acknowledgments
-    assert operations[-1] == ("preflight", sizes[resource_index])
+    assert operations[-1] == (
+        "preflight",
+        sum(sizes) if resource_index == 0 else sizes[resource_index],
+    )
     assert (
         summary.pages_loaded
         == summary.event_rows
