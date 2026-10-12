@@ -22,7 +22,7 @@ from oddsfox_catalogue.semantics import bounded_connection
 
 MANIFEST = "backup.json"
 BACKUP_VERSION = 2
-MAX_MANIFEST_BYTES = 64 * 1024**2
+MAX_MANIFEST_BYTES = 128 * 1024**2
 MAX_MEMBERS = 1_000_000
 MAX_RETAINED_BYTES = 64 * 1024**3
 TREE_NAMES = ("raw", "metadata", "published", "dlt_pipelines")
@@ -152,6 +152,8 @@ def _unique_object(pairs):
 
 
 def _validated_manifest(backup_dir: Path, *, max_bytes: int = MAX_RETAINED_BYTES):
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("backup byte allowance must be a positive integer")
     backup_dir = _safe_path(backup_dir)
     manifest = json.loads(
         read_regular_bytes(
@@ -335,7 +337,9 @@ def create_backup(
         "directories": sorted(source_dirs),
         "files": files,
     }
-    encoded = (json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
+    encoded = (
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
     if len(encoded) > MAX_MANIFEST_BYTES or len(files) + len(source_dirs) > MAX_MEMBERS:
         raise ValueError("backup inventory exceeds limits")
     enforce_storage_limits(settings, additional_bytes=len(encoded))
@@ -355,9 +359,11 @@ def verify_backup(backup_dir: Path, *, max_bytes: int = MAX_RETAINED_BYTES) -> l
     return []
 
 
-def restore_backup(backup_dir: Path, destination: Path) -> Path:
+def restore_backup(
+    backup_dir: Path, destination: Path, *, max_bytes: int = MAX_RETAINED_BYTES
+) -> Path:
     """Verify first, then copy into an exclusively created fresh operator root."""
-    manifest, config = _validated_manifest(backup_dir)
+    manifest, config = _validated_manifest(backup_dir, max_bytes=max_bytes)
     destination = _safe_path(destination)
     if destination.is_relative_to(_safe_path(backup_dir)):
         raise ValueError("restoration destination cannot be inside its backup")

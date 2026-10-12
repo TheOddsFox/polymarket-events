@@ -47,9 +47,10 @@ def test_complete_build_certifies_all_declared_semantics(certified_root, tmp_pat
     "sql",
     [
         "UPDATE history.market_metrics SET volume='99999'",
-        "UPDATE history.market_history SET question='externally changed'",
+        "CREATE OR REPLACE VIEW history.market_history AS SELECT * REPLACE "
+        "('externally changed' AS question) FROM staging.stg_gamma__market_observations",
         "DELETE FROM core.market_event_bridge",
-        "UPDATE bronze.event_observations SET payload_hash='externally changed full source hash'",
+        "UPDATE bronze.event_observations_values SET payload_hash='externally changed full source hash'",
         "ALTER TABLE core.events_current ADD COLUMN externally_added INTEGER",
     ],
 )

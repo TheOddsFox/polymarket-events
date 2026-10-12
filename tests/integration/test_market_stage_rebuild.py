@@ -1,4 +1,4 @@
-"""A cached market stage must rebuild before fresh evidence can be published."""
+"""Live market views still require a complete certified build before publication."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def _observations(settings, relation):
     )
 
 
-def test_market_stage_replaces_stale_rows_and_preserves_observation_semantics(tmp_path):
+def test_market_views_preserve_observations_and_require_full_build_certification(tmp_path):
     world = _world()
     settings = _capture_and_load(tmp_path, world, FIXED_NOW)
     _build(settings)
@@ -77,7 +77,12 @@ def test_market_stage_replaces_stale_rows_and_preserves_observation_semantics(tm
         settings,
         "SELECT table_type FROM information_schema.tables "
         "WHERE table_schema='staging' AND table_name='stg_gamma__market_observations'",
-    ) == [("BASE TABLE",)]
+    ) == [("VIEW",)]
+    assert _rows(
+        settings,
+        "SELECT table_type FROM information_schema.tables "
+        "WHERE table_schema='core' AND table_name='markets_current'",
+    ) == [("VIEW",)]
     original = _observations(settings, stage)
     assert len(original) == 2 and all(count == 1 for _, count in original)
     assert _rows(settings, "SELECT question, source_kind FROM core.markets_current") == [
@@ -101,17 +106,19 @@ def test_market_stage_replaces_stale_rows_and_preserves_observation_semantics(tm
     settings = _capture_and_load(tmp_path, world, FIXED_NOW + timedelta(days=1))
     expected = _observations(settings, "bronze.market_observations")
     assert len(expected) == 4 and all(count == 1 for _, count in expected)
-    assert _observations(settings, stage) == original, "load leaves cached staging stale"
+    assert _observations(settings, stage) == expected
+    assert _observations(settings, "history.market_history") == expected
     assert read_build_validity(settings)["status"] == "dirty"
+    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct revised",)]
     with pytest.raises(PublishBlocked, match="certification"):
         publish_stage(settings, now=lambda: FIXED_NOW + timedelta(days=1))
     assert (settings.published_dir / CURRENT_POINTER).read_bytes() == pointer
     verify_release(settings, first.path)
 
     _build(settings, "--select", "markets_current market_history")
-    assert _observations(settings, stage) == original
-    assert _observations(settings, "history.market_history") == original
-    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct original",)]
+    assert _observations(settings, stage) == expected
+    assert _observations(settings, "history.market_history") == expected
+    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct revised",)]
     with pytest.raises(BuildInvalid, match="dirty"):
         assert_build_valid(settings)
     with pytest.raises(PublishBlocked, match="certification"):

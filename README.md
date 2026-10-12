@@ -178,6 +178,55 @@ the original raw evidence without modifying it. Semantic comparison covers bronz
 observation history, metrics, relationships, quarantine, every public projection and coverage.
 Documented processing columns and invocation snapshot contents are excluded from row equivalence.
 
+An explicitly named rebuild can resume after an interruption:
+
+```sh
+catalogue rebuild --verify --scratch /absolute/path/to/new/scratch
+catalogue rebuild --verify --scratch /absolute/path/to/scratch --resume
+```
+
+The checksummed scratch record binds source location, verified publication, capture inventory,
+coverage, semantic content, model/normalization/runtime revisions, effective dbt variables and
+configuration. Resume validates that binding before changing state. Initialization may recover
+its verified raw units; after initialization, loaded checkpoints are preserved. Failed full builds
+rerun completely. Completed comparisons still revalidate actual warehouse certification and content.
+Arbitrary directories, unsafe paths and overlaps with protected source evidence are rejected.
+The same owner may nest stage locks; competing threads and processes remain excluded.
+
+Backup verification and restore default to a 64 GiB trusted allowance. A larger finite allowance
+must be supplied explicitly; a backup cannot authorize it through its settings:
+
+```sh
+catalogue backup verify BACKUP --max-retained-bytes 274877906944
+catalogue backup restore BACKUP --destination FRESH_ROOT --max-retained-bytes 274877906944
+```
+
+Version-2 backup manifests use compact JSON and a shared 128 MiB maximum. Inventory, checksum,
+member-count, path and fresh-destination checks remain mandatory. Make accepts `MAX_RETAINED_BYTES`
+for backup verification/restoration and `SCRATCH` / `REBUILD_RESUME=1` for explicit rebuilds.
+
+For finite catalogue-wide acceptance, run one installed CLI stage at a time:
+
+```sh
+python -m oddsfox_catalogue.acceptance --workspace /absolute/path/to/repo/data \
+  --root /absolute/path/to/operator-root -- load --batch-id BATCH_ID
+```
+
+For a fresh root containing its own verified copy of retained raw captures, first run the
+same supervisor with `-- ledger rebuild`, then load the original batch ID. Ledger rebuild
+is offline and requires an absent ledger; it refuses to overwrite existing checkpoints.
+
+This manual supervisor records a separate `completion-proof/<id>/report.json` and bounded logs.
+It enforces the approved 256 GiB combined workspace and 32 GiB combined temporary envelope,
+reserves 32 GiB filesystem free space, and supervises a four-hour invocation. It preflights backup
+and restore copies, monitors retained sibling roots, and sends one supported child SIGHUP on failure
+before waiting for shutdown. It never retries, increases caps, prunes, or starts a following stage.
+Use `--reserve-bytes N` for an explicit measured rebuild-growth reservation. The accounting workspace
+must contain every operator/recovery output; the operator paths and CLI destination flags are confined
+there. Daily/reconcile captures use the approved 10 requests/second; other commands retain two.
+Committed defaults remain 64/8 GiB. Storage measurements are points, not atomic filesystem snapshots;
+an exhausted invocation fails and is not acceptance evidence. A stopped command may retain partial work.
+
 ## Layout
 
 - `src/oddsfox_catalogue/`: capture, load, dbt runner, publish, rebuild, backup, Dagster definitions, CLI.

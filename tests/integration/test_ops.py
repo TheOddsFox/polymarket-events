@@ -184,6 +184,42 @@ def test_rebuild_rejects_existing_scratch_without_deleting_evidence(built_root, 
     assert (scratch / "keep").read_bytes() == b"diagnostic evidence"
 
 
+def test_rebuild_resume_preserves_committed_load_checkpoints(built_root, tmp_path, monkeypatch):
+    import oddsfox_catalogue.rebuild as module
+
+    settings = copy_built(built_root, tmp_path / "source")
+    scratch = tmp_path / "rebuild"
+    original_write = module._write_record
+    original_initialize = module.rebuild_from_raw
+    initializes = []
+    interrupted = []
+
+    def initialize(settings, ledger):
+        initializes.append(settings.root)
+        return original_initialize(settings, ledger)
+
+    def write(path, binding, phase):
+        if phase == "build" and not interrupted:
+            interrupted.append(True)
+            raise RuntimeError("after durable load, before build checkpoint")
+        return original_write(path, binding, phase)
+
+    monkeypatch.setattr(module, "rebuild_from_raw", initialize)
+    monkeypatch.setattr(module, "_write_record", write)
+    with pytest.raises(RuntimeError, match="after durable load"):
+        module.rebuild_and_verify(settings, scratch=scratch)
+    rebuilt = module.scratch_settings(settings, scratch)
+    with Ledger(rebuilt.ledger_path) as ledger:
+        before = ledger._all("SELECT page_id, loaded_at, dlt_load_id FROM pages ORDER BY page_id")
+    assert before and all(row["loaded_at"] for row in before)
+    report = module.rebuild_and_verify(settings, scratch=scratch, resume=True)
+    assert report.matched, report.mismatches
+    with Ledger(rebuilt.ledger_path) as ledger:
+        after = ledger._all("SELECT page_id, loaded_at, dlt_load_id FROM pages ORDER BY page_id")
+    assert after == before
+    assert initializes == [scratch]
+
+
 def test_rebuild_detects_metrics_and_relationship_mutation(built_root, tmp_path: Path):
     settings = copy_built(built_root, tmp_path)
     with duckdb.connect(str(settings.warehouse_path)) as connection:

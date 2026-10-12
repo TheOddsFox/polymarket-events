@@ -145,9 +145,7 @@ def test_restore_rejects_destination_symlink_ancestor(backup, tmp_path):
 def test_manifest_duplicate_keys_are_not_silently_overwritten(backup):
     path = backup / MANIFEST
     text = path.read_text()
-    path.write_text(
-        text.replace('"backup_version": 2,', '"backup_version": 1, "backup_version": 2,')
-    )
+    path.write_text('{"backup_version":1,' + text[1:])
     assert any("duplicate" in problem for problem in verify_backup(backup))
 
 
@@ -214,3 +212,19 @@ def test_restoration_never_writes_inside_the_verified_backup(backup):
     with pytest.raises(ValueError, match="inside its backup"):
         restore_backup(backup, backup / "new")
     assert verify_backup(backup) == []
+
+
+def test_trusted_restore_allowance_is_checked_before_creating_destination(backup, tmp_path):
+    destination = tmp_path / "restored"
+    with pytest.raises(ValueError, match="byte.*limit"):
+        restore_backup(backup, destination, max_bytes=1)
+    assert not destination.exists()
+    assert restore_backup(backup, destination, max_bytes=65536) == destination
+
+
+@pytest.mark.parametrize("allowance", [True, False, 0, -1, 1.5, "65536"])
+def test_backup_allowances_must_be_positive_integers(backup, tmp_path, allowance):
+    assert verify_backup(backup, max_bytes=allowance)
+    with pytest.raises(ValueError, match="positive integer"):
+        restore_backup(backup, tmp_path / "restored", max_bytes=allowance)
+    assert not (tmp_path / "restored").exists()

@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from oddsfox_catalogue import __version__
-from oddsfox_catalogue.backup import create_backup, restore_backup, verify_backup
+from oddsfox_catalogue.backup import (
+    MAX_RETAINED_BYTES,
+    create_backup,
+    restore_backup,
+    verify_backup,
+)
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import (
     abandon_batch,
@@ -236,7 +241,7 @@ def _cmd_backup_create(args: argparse.Namespace) -> int:
     settings = load_settings()
     with run_lock(settings.run_lock_path):
         dest = create_backup(settings, dest_root=args.dest)
-    problems = verify_backup(dest)
+    problems = verify_backup(dest, max_bytes=settings.capture.max_retained_bytes)
     print(
         json.dumps({"backup": str(dest), "verified": not problems, "problems": problems}, indent=2)
     )
@@ -244,22 +249,22 @@ def _cmd_backup_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_backup_verify(args: argparse.Namespace) -> int:
-    problems = verify_backup(args.path)
+    problems = verify_backup(args.path, max_bytes=args.max_retained_bytes)
     print(json.dumps({"verified": not problems, "problems": problems}, indent=2))
     return 0 if not problems else 4
 
 
 def _cmd_backup_restore(args: argparse.Namespace) -> int:
-    destination = restore_backup(args.path, args.destination)
+    destination = restore_backup(args.path, args.destination, max_bytes=args.max_retained_bytes)
     print(json.dumps({"restored": True, "destination": str(destination)}, indent=2))
     return 0
 
 
-def _cmd_rebuild(_: argparse.Namespace) -> int:
+def _cmd_rebuild(args: argparse.Namespace) -> int:
     """Rebuild from raw in a scratch area and compare fingerprints with the live warehouse."""
     settings = load_settings()
     with run_lock(settings.run_lock_path):
-        report = rebuild_and_verify(settings)
+        report = rebuild_and_verify(settings, scratch=args.scratch, resume=args.resume)
     print(
         json.dumps(
             {
@@ -443,12 +448,14 @@ def build_parser() -> argparse.ArgumentParser:
     backup_create.set_defaults(handler=_cmd_backup_create)
     backup_verify = backup_sub.add_parser("verify", help="re-hash a backup and list problems")
     backup_verify.add_argument("path", type=Path)
+    backup_verify.add_argument("--max-retained-bytes", type=int, default=MAX_RETAINED_BYTES)
     backup_verify.set_defaults(handler=_cmd_backup_verify)
     backup_restore = backup_sub.add_parser(
         "restore", help="verify and restore into a fresh operator root"
     )
     backup_restore.add_argument("path", type=Path)
     backup_restore.add_argument("--destination", type=Path, required=True)
+    backup_restore.add_argument("--max-retained-bytes", type=int, default=MAX_RETAINED_BYTES)
     backup_restore.set_defaults(handler=_cmd_backup_restore)
 
     rebuild = sub.add_parser(
@@ -457,6 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild.add_argument(
         "--verify", action="store_true", required=True, help="compare fingerprints (required)"
     )
+    rebuild.add_argument("--scratch", type=Path, help="explicit fresh or resumable scratch root")
+    rebuild.add_argument("--resume", action="store_true", help="resume only bound explicit scratch")
     rebuild.set_defaults(handler=_cmd_rebuild)
     return parser
 

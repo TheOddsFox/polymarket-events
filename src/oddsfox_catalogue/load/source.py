@@ -7,8 +7,8 @@ Every resource shares one contract:
 * ``schema_contract`` freezes columns and data types. Unknown fields belong
   in immutable raw pages; bronze keeps their canonical hash and normalized
   fields. A changed envelope fails the load instead of drifting.
-* ``normalized`` and quarantine ``payload`` use ``json``, which stops dlt from
-  exploding nested objects into child tables.
+* Normalized fields use canonical JSON-valued text columns, compressed independently.
+  Quarantine ``payload`` stays JSON; neither representation creates child tables.
 * Resources must be created immediately before their ``pipeline.run``. Building
   several resources first and running them later corrupts dlt's shared schema.
 """
@@ -28,6 +28,7 @@ from duckdb import DuckDBPyConnection
 
 from oddsfox_catalogue.config import LoadSettings
 from oddsfox_catalogue.load.runtime import confined_runtime
+from oddsfox_catalogue.load.storage import EVENT_FIELDS, MARKET_FIELDS, stored_rows
 
 PIPELINE_NAME = "polymarket_catalogue"
 SCHEMA_CONTRACT = {"tables": "evolve", "columns": "freeze", "data_type": "freeze"}
@@ -104,6 +105,13 @@ def market_columns() -> dict[str, dict[str, Any]]:
     return _copy_columns({**ENVELOPE_COLUMNS, **MARKET_EXTRA_COLUMNS})
 
 
+def stored_columns(columns: dict[str, dict[str, Any]], fields: tuple[str, ...]):
+    return {
+        **{key: hint for key, hint in columns.items() if key != "normalized"},
+        **{f"n_{key}": dict(_TEXT_REQUIRED) for key in fields},
+    }
+
+
 def _resource(
     data: Iterable[dict[str, Any]],
     *,
@@ -125,9 +133,9 @@ def _resource(
 
 def event_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource:
     return _resource(
-        rows,
-        name=EVENT_TABLE,
-        columns=event_columns(),
+        stored_rows(rows, EVENT_FIELDS),
+        name=EVENT_TABLE + "_values",
+        columns=stored_columns(event_columns(), EVENT_FIELDS),
         primary_key="observation_id",
         **kwargs,
     )
@@ -135,9 +143,9 @@ def event_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource
 
 def market_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource:
     return _resource(
-        rows,
-        name=MARKET_TABLE,
-        columns=market_columns(),
+        stored_rows(rows, MARKET_FIELDS),
+        name=MARKET_TABLE + "_values",
+        columns=stored_columns(market_columns(), MARKET_FIELDS),
         primary_key="observation_id",
         **kwargs,
     )

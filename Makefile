@@ -67,12 +67,12 @@ backup:
 
 # Usage: make verify-backup BACKUP=data/backups/20261008T060000Z
 verify-backup:
-	$(CATALOGUE) backup verify "$(BACKUP)"
+	$(CATALOGUE) backup verify "$(BACKUP)" $(if $(MAX_RETAINED_BYTES),--max-retained-bytes "$(MAX_RETAINED_BYTES)")
 
 # Usage: make restore-backup BACKUP=... DESTINATION=/absolute/path/to/fresh/root
 restore-backup:
-	$(CATALOGUE) backup restore "$(BACKUP)" --destination "$(DESTINATION)"
+	$(CATALOGUE) backup restore "$(BACKUP)" --destination "$(DESTINATION)" $(if $(MAX_RETAINED_BYTES),--max-retained-bytes "$(MAX_RETAINED_BYTES)")
 
 # Rebuild from raw in a scratch area and compare table fingerprints with the live warehouse.
 rebuild:
-	$(CATALOGUE) rebuild --verify
+	$(CATALOGUE) rebuild --verify $(if $(SCRATCH),--scratch "$(SCRATCH)") $(if $(REBUILD_RESUME),--resume)

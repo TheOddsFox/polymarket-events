@@ -44,6 +44,7 @@ from oddsfox_catalogue.load.runner import (
     _rows_for_chunk,
 )
 from oddsfox_catalogue.load.source import event_columns, market_columns
+from oddsfox_catalogue.load.storage import EVENT_FIELDS, MARKET_FIELDS, stored_rows
 from oddsfox_catalogue.publish import _validate_coverage
 
 BATCH = "20261010T142904Z-bootstrap"
@@ -715,7 +716,11 @@ def streamed_relation_totals(rows):
     )
     return tuple(
         sum(sum(len(part.encode()) for part in encoder.iterencode(row)) + 1 for row in relation)
-        for relation in (rows.events, rows.markets, rows.quarantine)
+        for relation in (
+            stored_rows(rows.events, EVENT_FIELDS),
+            stored_rows(rows.markets, MARKET_FIELDS),
+            rows.quarantine,
+        )
     )
 
 
@@ -786,7 +791,7 @@ def test_load_chunk_encodes_each_row_once_and_keeps_all_admission_calls(monkeypa
     encoded = []
 
     def encode(row):
-        encoded.append(id(row))
+        encoded.append(row.get("observation_id", row.get("quarantine_id")))
         return _encoded_row_bytes(row)
 
     original = copy.deepcopy(fixture.records)
@@ -795,7 +800,11 @@ def test_load_chunk_encodes_each_row_once_and_keeps_all_admission_calls(monkeypa
     summary = LoadSummary()
     _load_chunk(fixture.runtime, fixture.pages, summary)
     relations = (expected_rows.events, expected_rows.markets, expected_rows.quarantine)
-    assert [data for _, data in writes] == list(relations)
+    assert [data for _, data in writes] == [
+        list(stored_rows(expected_rows.events, EVENT_FIELDS)),
+        list(stored_rows(expected_rows.markets, MARKET_FIELDS)),
+        expected_rows.quarantine,
+    ]
     assert len(encoded) == len(set(encoded)) == sum(map(len, relations))
     page_totals = [
         sum(
@@ -824,11 +833,11 @@ def test_load_chunk_encodes_each_row_once_and_keeps_all_admission_calls(monkeypa
         ("preflight", sum(sizes)),
         "reset",
         ("preflight", sizes[0]),
-        ("write", "event_observations"),
+        ("write", "event_observations_values"),
         "reset",
         "reset",
         ("preflight", sizes[1]),
-        ("write", "market_observations"),
+        ("write", "market_observations_values"),
         "reset",
         "reset",
         ("preflight", sizes[2]),

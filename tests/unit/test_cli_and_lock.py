@@ -2,6 +2,9 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -46,10 +49,34 @@ def test_status_without_ledger_is_harmless(
 
 def test_run_lock_is_exclusive(tmp_path: Path) -> None:
     lock_path = tmp_path / ".state" / "catalogue.lock"
-    with run_lock(lock_path), pytest.raises(RunBusy), run_lock(lock_path):
-        pass
+
+    def competing_writer():
+        with pytest.raises(RunBusy), run_lock(lock_path):
+            pass
+
+    with run_lock(lock_path), ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(competing_writer).result(timeout=5)
     with run_lock(lock_path):
         pass
+
+
+def test_nested_owner_lock_preserves_process_exclusion_after_inner_error(tmp_path):
+    path = tmp_path / "owner.lock"
+    code = (
+        "from filelock import FileLock, Timeout\n"
+        "import sys\n"
+        "try:\n FileLock(sys.argv[1]).acquire(timeout=0)\n"
+        "except Timeout:\n sys.exit(3)\n"
+    )
+    with run_lock(path):
+        with (
+            pytest.raises(RuntimeError, match="inner"),
+            run_lock(tmp_path / "nested" / ".." / "owner.lock", timeout=0.1),
+        ):
+            raise RuntimeError("inner")
+        result = subprocess.run([sys.executable, "-c", code, str(path)], timeout=5)
+        assert result.returncode == 3
+    assert subprocess.run([sys.executable, "-c", code, str(path)], timeout=5).returncode == 0
 
 
 def test_capture_rejects_unknown_mode() -> None:

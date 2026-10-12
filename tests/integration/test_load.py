@@ -33,9 +33,38 @@ from oddsfox_catalogue.load.source import (
     market_columns,
     market_resource,
 )
+from oddsfox_catalogue.load.storage import (
+    EVENT_FIELDS,
+    MARKET_FIELDS,
+    ensure_observation_views,
+    stored_rows,
+)
+from oddsfox_catalogue.normalization import normalize_event, normalize_market
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
 LOAD_CHILD = TESTS_DIR / "fakes" / "load_child.py"
+
+
+def _materialize_views(settings):
+    with duckdb.connect(str(settings.warehouse_path)) as connection:
+        ensure_observation_views(connection, settings.load.dataset_name)
+
+
+def _normalized(table):
+    if table == "event_observations":
+        return normalize_event(make_event("1", "Event"))
+    return normalize_market(
+        make_market("1", "Market"),
+        {
+            "observation_id": "obs",
+            "page_id": "page",
+            "capture_id": "batch",
+            "received_at": FIXED_NOW.isoformat(),
+            "source_kind": "market_direct",
+            "json_pointer": "/markets/0",
+            "payload_sha256": "hash",
+        },
+    )
 
 
 def _capture(root: Path) -> str:
@@ -245,12 +274,16 @@ def test_adaptive_parquet_load_recovers_committed_parent_resource(tmp_path, monk
         assert rt.connection is not None
         owners.append(rt.connection)
         info = original_write(rt, resource)
-        if resource.name == "event_observations" and current_part == page_ids and not rejected:
+        if (
+            resource.name == "event_observations_values"
+            and current_part == page_ids
+            and not rejected
+        ):
             formats = {
                 job.job_file_info.file_format
                 for package in info.load_packages
                 for job in package.jobs["completed_jobs"]
-                if job.job_file_info.table_name == "event_observations"
+                if job.job_file_info.table_name == "event_observations_values"
             }
             assert "parquet" in formats and "insert_values" not in formats
             with rt.connection.cursor() as connection:
@@ -347,30 +380,30 @@ def test_market_merge_sql_failure_rolls_back_and_retries_with_same_owner(tmp_pat
     def execute_many(self, statements, *args, **kwargs):
         nonlocal failed, rollback_observed
         rendered = " ".join(statements)
-        target_merge = '"bronze"."market_observations"' in rendered and "MERGE INTO" in rendered
+        target_merge = (
+            '"bronze"."market_observations_values"' in rendered and "MERGE INTO" in rendered
+        )
         if target_merge and not failed:
-            # DuckDB's one-statement merge normally autocommits. The fault injector opens
-            # a real transaction on dlt's borrowed cursor to exercise SQL rollback/retry.
-            with self.begin_transaction():
-                result = original_many(self, statements, *args, **kwargs)
-                assert (
-                    self.native_connection.execute(
-                        "SELECT count(*) FROM bronze.market_observations"
-                    ).fetchone()[0]
-                    > 0
-                )
-                assert (
-                    self.native_connection.execute(
-                        "SELECT count(*) FROM bronze.event_observations"
-                    ).fetchone()[0]
-                    > 0
-                )
-                failed = True
-                original_sql(self, "SELEC synthetic_transaction_failure")
+            # dlt wraps this physical merge in a transaction; fail after writing its rows.
+            result = original_many(self, statements, *args, **kwargs)
+            assert (
+                self.native_connection.execute(
+                    "SELECT count(*) FROM bronze.market_observations_values"
+                ).fetchone()[0]
+                > 0
+            )
+            assert (
+                self.native_connection.execute(
+                    "SELECT count(*) FROM bronze.event_observations"
+                ).fetchone()[0]
+                > 0
+            )
+            failed = True
+            original_sql(self, "SELEC synthetic_transaction_failure")
             return result
         if target_merge and failed and not rollback_observed:
             assert self.native_connection.execute(
-                "SELECT count(*) FROM bronze.market_observations"
+                "SELECT count(*) FROM bronze.market_observations_values"
             ).fetchone() == (0,)
             rollback_observed = True
         return original_many(self, statements, *args, **kwargs)
@@ -447,7 +480,7 @@ settings = make_settings(Path(sys.argv[1]))
 original = runner._run_resource
 def committed_parent(rt, resource):
     result = original(rt, resource)
-    if resource.name == 'event_observations':
+    if resource.name == 'event_observations_values':
         assert rt.connection.execute('SELECT count(*) FROM bronze.event_observations').fetchone()[0] > 0
         wal = Path(str(settings.warehouse_path)+'.wal')
         assert wal.is_file() and wal.stat().st_size > 0, 'owner must retain committed WAL before crash'
@@ -477,7 +510,7 @@ raise AssertionError('crash hook not reached')
         # A writable reopen recovers the retained WAL before simulating changed persisted evidence.
         with duckdb.connect(str(settings.warehouse_path)) as connection:
             connection.execute(
-                "UPDATE bronze.event_observations SET normalized='{}' WHERE entity_id='101'"
+                "UPDATE bronze.event_observations_values SET n_title='null' WHERE entity_id='101'"
             )
         with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
             _load(settings)
@@ -550,7 +583,7 @@ def test_parquet_recovers_unacknowledged_old_format_commit(
         kwargs["loader_file_format"] = "parquet" if old_format == "parquet_snappy" else old_format
         info = original_run(self, *args, **kwargs)
         if old_format == "parquet_snappy":
-            jobs = _parquet_codecs(info, "event_observations")
+            jobs = _parquet_codecs(info, "event_observations_values")
             assert all(codecs == {"SNAPPY"} for codecs in jobs.values())
             old_jobs.update({path: sha256(path.read_bytes()).hexdigest() for path in jobs})
         raise RuntimeError("stop after old-format resource commit")
@@ -565,6 +598,7 @@ def test_parquet_recovers_unacknowledged_old_format_commit(
     Container()[PluggableRunContext] = PluggableRunContext(
         CatalogueRunContext(settings.dlt_pipelines_dir)
     )
+    _materialize_views(settings)
     committed = _table_count(settings, "event_observations")
     assert committed > 0
     assert _registry_rows(settings) == []
@@ -574,7 +608,7 @@ def test_parquet_recovers_unacknowledged_old_format_commit(
 
     def current_format_run(self, resource, *args, **kwargs):
         info = original_run(self, resource, *args, **kwargs)
-        if resource.name in ("event_observations", "market_observations"):
+        if resource.name in ("event_observations_values", "market_observations_values"):
             new_codecs.extend(_parquet_codecs(info, resource.name).values())
         return info
 
@@ -611,7 +645,7 @@ def test_schema_drift_in_envelope_is_rejected(tmp_path: Path, file_format) -> No
             "source_updated_at": None,
             "endpoint": "/events/keyset",
             "payload_hash": "h",
-            "normalized": {},
+            "normalized": _normalized("event_observations"),
             "unexpected_new_column": "boom",
         }
     ]
@@ -774,7 +808,7 @@ def test_insert_only_merge_keys_on_observation_id_not_payload(
             "source_updated_at": None,
             "endpoint": "/events/keyset",
             "payload_hash": "same-hash",
-            "normalized": {},
+            "normalized": _normalized(table),
         }
         if table == "market_observations":
             result.update(source_kind="market_direct", json_pointer="/markets/0")
@@ -782,6 +816,7 @@ def test_insert_only_merge_keys_on_observation_id_not_payload(
 
     for observation_id in ["obs-a", "obs-b"]:
         pipeline.run(resource([row(observation_id)]), loader_file_format=file_format)
+    _materialize_views(settings)
 
     assert _query(settings, f"SELECT COUNT(*) FROM bronze.{table}") == 2
     assert _query(settings, f"SELECT COUNT(DISTINCT payload_hash) FROM bronze.{table}") == 1
@@ -795,7 +830,7 @@ def test_replay_blocks_conflicting_persisted_normalization(tmp_path: Path) -> No
     connection = duckdb.connect(str(settings.warehouse_path))
     try:
         connection.execute(
-            "UPDATE bronze.event_observations SET normalized = '{}' WHERE entity_id = '101'"
+            "UPDATE bronze.event_observations_values SET n_title = 'null' WHERE entity_id = '101'"
         )
     finally:
         connection.close()
@@ -817,7 +852,7 @@ def test_replay_blocks_conflicting_persisted_receipt_timestamp(tmp_path: Path) -
     connection = duckdb.connect(str(settings.warehouse_path))
     try:
         connection.execute(
-            "UPDATE bronze.event_observations SET observed_at = observed_at + INTERVAL '1 second' WHERE entity_id = '101'"
+            "UPDATE bronze.event_observations_values SET observed_at = observed_at + INTERVAL '1 second' WHERE entity_id = '101'"
         )
     finally:
         connection.close()
@@ -843,6 +878,7 @@ def test_empty_materialization_keeps_insert_only_merge_on_next_real_record(
     pipeline = make_pipeline(settings.warehouse_path, settings.dlt_pipelines_dir, settings.load)
     for factory in (event_resource, market_resource, quarantine_resource):
         pipeline.run(factory([], materialize_only=True), loader_file_format=file_format)
+    _materialize_views(settings)
     for table in ("event_observations", "market_observations", "quarantined_records"):
         assert _table_count(settings, table) == 0
     with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
@@ -959,7 +995,11 @@ def test_byte_heavy_selected_load_stays_inside_documented_reservation(tmp_path: 
         )
         encoded = sum(
             _encoded_row_bytes(row)
-            for relation in (rows.events, rows.markets, rows.quarantine)
+            for relation in (
+                stored_rows(rows.events, EVENT_FIELDS),
+                stored_rows(rows.markets, MARKET_FIELDS),
+                rows.quarantine,
+            )
             for row in relation
         )
         assert sum(sizes) == encoded
@@ -1043,13 +1083,15 @@ def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
     received = FIXED_NOW.replace(microsecond=123456).astimezone(
         timezone(timedelta(hours=5, minutes=30))
     )
-    payload = {
+    nested = {
         "exact": "0.12345678901234567890123456789",
         "nullable": None,
         "active": None,
         "text": '雪\\\n"' * 32768,
         "labels": ["Yes", "No"],
     }
+    payload = _normalized(table)
+    payload.update(active=None, tags=[nested], description=nested["text"])
     row = {
         "observation_id": "first",
         "venue": "polymarket",
@@ -1076,7 +1118,9 @@ def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
         }
         assert "parquet" in formats
         assert "insert_values" not in formats
-        assert all(codecs == {"ZSTD"} for codecs in _parquet_codecs(first, table).values())
+        assert all(
+            codecs == {"ZSTD"} for codecs in _parquet_codecs(first, table + "_values").values()
+        )
         _run_resource(runtime, factory([row]))
         _run_resource(
             runtime,
@@ -1095,8 +1139,7 @@ def test_native_parquet_preserves_json_and_nullable_timestamp_schema(
         }
         types = {"text": "VARCHAR", "timestamp": "TIMESTAMP WITH TIME ZONE", "json": "JSON"}
         assert schema == {
-            name: (types[spec["data_type"]], "YES" if spec["nullable"] else "NO")
-            for name, spec in columns().items()
+            name: (types[spec["data_type"]], "YES") for name, spec in columns().items()
         }
         actual = connection.execute(
             f"SELECT observation_id,observed_at,source_updated_at,normalized "

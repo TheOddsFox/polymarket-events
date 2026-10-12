@@ -5,15 +5,25 @@ Use a fresh operator root. Retain old evidence and state separately; neither mig
 compatibility views are provided. The independent `oddsfox.polymarket.metadata.v1` JSON bundle
 shape remains supported, using the same normalization rules.
 
-The internal warehouse layout is `oddsfox.polymarket.warehouse.v3`. Bronze event and
+The internal warehouse layout is `oddsfox.polymarket.warehouse.v4`. Bronze event and
 market observations retain the full canonical source hash, normalized fields and
 provenance; the complete source JSON remains in checksummed raw captures. Quarantine
-still retains its decoded payload. This avoids serializing and storing a second full
-source copy for every valid observation. Load and dbt reject the previous warehouse
+still retains its decoded payload. Normalized fields are stored separately as canonical JSON-valued text so DuckDB can
+compress repeated values independently. The logical bronze observation views reconstruct
+the original JSON, preserving nulls, nested values and exact financial strings. Frozen field
+sets reject drift; partial loads repair absent views before checkpoints and reject altered
+views. No source observations are dropped. This also avoids storing a second full source
+copy for every valid observation. Load and dbt reject the previous warehouse
 stamp before changing its warehouse or build certification. Use a fresh root and
 retain the previous root and its matching installation; no state migration is provided.
 The public catalogue.v2 and metadata.v1 schemas remain unchanged, and immutable release
 verification remains independent of the warehouse layout.
+
+Market staging, history and current markets are views over the retained evidence rather than
+duplicate physical copies. Their logical columns and observation grain are unchanged.
+Publication and aggregate relations still require a full successful build and certification;
+loading new evidence dirties that certification even though the views can already read it.
+This saves retained and recovery storage at the cost of recomputing those projections.
 
 The six original filenames contain explicit replacement projections: `events.parquet`,
 `markets.parquet`, `outcomes.parquet`, `event_tags.parquet`, `event_series.parquet` and
@@ -75,6 +85,13 @@ warehouse relation and public projection, including observation history, metrics
 It excludes `_dlt*`, `loaded_at`, `load_id`, `batch_loaded_at`, `built_through` and operational
 `marts.catalogue_snapshots` contents. These exclusions describe processing rather than source facts.
 Backup restoration verifies every inventoried file before copying into a fresh root.
+
+Explicit `rebuild --verify --scratch PATH --resume` uses a bounded, checksummed phase record.
+It revalidates source inventory, release, content, runtime, models and configuration, preserves
+committed load checkpoints, and requires complete scratch certification before comparing rows.
+This does not change the public contract or digest revision. Trusted backup verification/restore
+allowances may be supplied through `--max-retained-bytes`; defaults stay 64 GiB and manifests cannot
+raise the caller's allowance. Version-2 backup JSON is compact and bounded to 128 MiB.
 
 Coverage uses integer `coverage_schema_revision: 1` and retains one unit per response.
 For validated contiguous ID-range requests, `id_range.start` and `id_range.end` are

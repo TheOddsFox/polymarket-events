@@ -61,6 +61,12 @@ from oddsfox_catalogue.load.source import (
     quarantine_resource,
     registry_resource,
 )
+from oddsfox_catalogue.load.storage import (
+    EVENT_FIELDS,
+    MARKET_FIELDS,
+    ensure_observation_views,
+    stored_row,
+)
 from oddsfox_catalogue.semantics import bounded_connection
 from oddsfox_catalogue.warehouse_version import ensure_warehouse_contract
 
@@ -121,7 +127,13 @@ def _run_resource(rt: LoadRuntime, resource: DltResource):
         max_temp_bytes=remaining_temp_bytes(rt.settings),
         connection=rt.connection,
     )
-    return pipeline.run(resource, destination=destination, loader_file_format="parquet")
+    info = pipeline.run(resource, destination=destination, loader_file_format="parquet")
+    if rt.connection is not None:
+        ensure_observation_views(rt.connection, rt.settings.load.dataset_name)
+    else:
+        with bounded_connection(rt.settings, read_only=False) as connection:
+            ensure_observation_views(connection, rt.settings.load.dataset_name)
+    return info
 
 
 def _batch(rt: LoadRuntime, batch_id: str) -> dict[str, Any]:
@@ -234,7 +246,10 @@ def _rows_for_chunk(
         for index, relation in enumerate(
             (page_rows.events, page_rows.markets, page_rows.quarantine)
         ):
-            serialized_bytes[index] += sum(_encoded_row_bytes(row) for row in relation)
+            fields = (EVENT_FIELDS, MARKET_FIELDS, None)[index]
+            serialized_bytes[index] += sum(
+                _encoded_row_bytes(stored_row(row, fields) if fields else row) for row in relation
+            )
         _preflight_load_bytes(rt, sum(serialized_bytes))
         rows.extend(page_rows)
 
@@ -457,6 +472,7 @@ def _load_pending(rt: LoadRuntime, batch_id: str | None = None) -> LoadSummary:
         pending = rt.ledger.pending_load_pages(batch_id)
         with bounded_connection(rt.settings, read_only=False) as connection:
             rt.connection = connection
+            ensure_observation_views(connection, rt.settings.load.dataset_name)
             for chunk in _chunks(pending, rt.settings.load.max_pages_per_run):
                 work = [chunk]
                 while work:

@@ -18,9 +18,10 @@ class RunBusy(RuntimeError):
 def run_lock(path: Path, timeout: float = 0.0) -> Iterator[None]:
     """Hold an OS file lock for the duration of a run. Fails fast by default."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = FileLock(str(path), timeout=timeout)
+    # Rebuild owns the lock while invoking the same owner's existing stage functions.
+    lock = FileLock(str(path), is_singleton=True)
     try:
-        lock.acquire()
+        lock.acquire(timeout=timeout)
     except Timeout as exc:
         raise RunBusy(f"another catalogue run holds {path}") from exc
     try:

@@ -93,7 +93,11 @@ def test_raw_rebuild_detects_quarantine_content_and_observation_history_schema_d
             "FROM core.int_market_outcomes WHERE NOT usable "
             "UNION ALL SELECT 'polymarket', '10', 'external', 'invented identity failure'"
         )
-        connection.execute("ALTER TABLE history.market_history ADD COLUMN unexpected VARCHAR")
+        connection.execute(
+            "CREATE OR REPLACE VIEW history.market_history AS "
+            "SELECT *, CAST(NULL AS VARCHAR) AS unexpected "
+            "FROM staging.stg_gamma__market_observations"
+        )
     report = rebuild_and_verify(settings)
     assert not report.matched
     for relation in (

@@ -27,7 +27,7 @@ def test_fresh_stamp_and_read_only_verification(tmp_path):
         assert connection.execute("SELECT * FROM catalogue_meta.contract").fetchall() == [
             (WAREHOUSE_CONTRACT, NORMALIZATION_REVISION)
         ]
-    assert WAREHOUSE_CONTRACT == "oddsfox.polymarket.warehouse.v3"
+    assert WAREHOUSE_CONTRACT == "oddsfox.polymarket.warehouse.v4"
     assert CONTRACT == "oddsfox.polymarket.catalogue.v2" and CONTRACT != WAREHOUSE_CONTRACT
     original = hashlib.sha256(settings.warehouse_path.read_bytes()).hexdigest()
     ensure_warehouse_contract(settings)
