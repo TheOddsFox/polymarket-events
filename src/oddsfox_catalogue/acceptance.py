@@ -231,6 +231,8 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0, load_
                 raise ValueError("acceptance diagnostics exceed their byte allowance")
             report["returncode"] = process.returncode
             report["after"] = storage(workspace, temporary_paths=tuple(temporary_paths))
+            if time.monotonic() - started >= duration:
+                raise TimeoutError("acceptance invocation deadline exhausted")
             report["status"] = "passed" if process.returncode == 0 else "failed"
     except BaseException as exc:
         report["status"] = "failed"

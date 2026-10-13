@@ -333,6 +333,82 @@ def test_immediate_exit_cannot_bypass_final_deadline(tmp_path, monkeypatch):
     assert report["status"] == "failed" and report["returncode"] == 0
 
 
+@pytest.mark.parametrize("entrypoint", ["run", "main"])
+@pytest.mark.parametrize("final_elapsed", [19.5, 20.0, 20.5], ids=["within", "exact", "over"])
+def test_final_storage_counts_toward_deadline_after_successful_child(
+    tmp_path, monkeypatch, entrypoint, final_elapsed
+):
+    clock = {"now": 0.0}
+    scans, launches, waits, signals, restored = [], [], [], [], []
+    measured = {"retained_bytes": 0, "temporary_bytes": 0, "filesystem_free_bytes": 10**12}
+
+    class Process:
+        pid = 12345
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+        def send_signal(self, signum):
+            signals.append(signum)
+
+    def storage(workspace, **kwargs):
+        assert workspace == tmp_path
+        scans.append(clock["now"])
+        if len(scans) == 1:
+            assert launches == []
+        else:
+            assert len(scans) == 2 and len(launches) == 1
+            # Only the final workspace scan consumes time; every prior deadline check sees zero.
+            clock["now"] = final_elapsed
+        return dict(measured)
+
+    def launch(*args, **kwargs):
+        launches.append(True)
+        return Process()
+
+    monkeypatch.setattr(acceptance.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(acceptance, "storage", storage)
+    monkeypatch.setattr(acceptance, "_runtime_revision", lambda: {"synthetic": True})
+    monkeypatch.setattr(acceptance.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        acceptance, "_install_termination_handlers", lambda: lambda: restored.append(True)
+    )
+    exhausted = final_elapsed >= 20
+    if entrypoint == "main":
+        result = acceptance.main(
+            [
+                "--workspace",
+                str(tmp_path),
+                "--root",
+                str(tmp_path / "root"),
+                "--duration",
+                "20",
+                "--",
+                "status",
+            ]
+        )
+        assert result == (3 if exhausted else 0)
+        assert restored == [True]
+    elif exhausted:
+        with pytest.raises(TimeoutError, match="deadline"):
+            acceptance.run(tmp_path, tmp_path / "root", ["status"], duration=20)
+    else:
+        assert acceptance.run(tmp_path, tmp_path / "root", ["status"], duration=20) == 0
+    report = json.loads(next((tmp_path / "completion-proof").glob("*/report.json")).read_bytes())
+    assert report["status"] == ("failed" if exhausted else "passed")
+    assert report.get("error_type") == ("TimeoutError" if exhausted else None)
+    assert report["duration_s"] == final_elapsed and report["duration_limit_s"] == 20
+    assert report["after"] == measured and report["returncode"] == 0
+    assert report["stop_signal_sent"] is None and signals == []
+    assert scans == [0.0, 0.0] and launches == [True] and waits == [None]
+    assert not (tmp_path / "root").exists()
+
+
 def test_restore_reservation_uses_parsed_path_when_options_precede_backup(tmp_path, monkeypatch):
     backup = tmp_path / "backup"
     backup.mkdir()

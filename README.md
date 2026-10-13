@@ -226,6 +226,7 @@ must contain every operator/recovery output; the operator paths and CLI destinat
 there. Daily/reconcile captures use the approved 10 requests/second; other commands retain two.
 Committed defaults remain 64/8 GiB. Storage measurements are points, not atomic filesystem snapshots;
 an exhausted invocation fails and is not acceptance evidence. A stopped command may retain partial work.
+The invocation deadline includes final storage accounting.
 
 Before launch, the supervisor reserves temporary usage in unrelated roots and gives the
 child the remaining operation allowance. Explicit rebuild scratch shares that allowance;
