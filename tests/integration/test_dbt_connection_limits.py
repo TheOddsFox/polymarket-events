@@ -16,6 +16,7 @@ from dbt.config.profile import Profile
 from dbt.config.renderer import ProfileRenderer
 from dbt_common.context import set_invocation_context
 
+from oddsfox_catalogue import dbt_runner
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.dbt_runner import dbt_environment
 from oddsfox_catalogue.resources import dbt_project_dir
@@ -44,7 +45,7 @@ def _profile(settings: Settings, *, threads: int | None = 2):
 
 
 @pytest.mark.parametrize("threads", [None, 1, 2])
-def test_packaged_profile_constrains_engine_and_scheduler(tmp_path, threads):
+def test_packaged_profile_constrains_engine_with_single_model_scheduler(tmp_path, threads):
     settings = Settings(tmp_path)
     scheduler_threads, credentials = _profile(settings, threads=threads)
     env = LocalEnvironment(credentials)
@@ -60,11 +61,58 @@ def test_packaged_profile_constrains_engine_and_scheduler(tmp_path, threads):
             .fetchone()
         )
         assert actual == (threads or 1, "1.8 GiB", str(settings.temporary_dir), "8.0 GiB")
-        assert scheduler_threads == actual[0]
+        assert scheduler_threads == 1
     finally:
         if handle is not None:
             handle.close()
         env.close()
+
+
+@pytest.mark.parametrize("scheduler", [None, 2])
+def test_tiny_real_dbt_scheduler_override_preserves_two_thread_engine(
+    tmp_path: Path, monkeypatch, scheduler
+):
+    project = tmp_path / "project"
+    models = project / "models"
+    models.mkdir(parents=True)
+    (project / "dbt_project.yml").write_text(
+        "name: scheduler_probe\nversion: '1.0'\nconfig-version: 2\n"
+        "profile: oddsfox_catalogue\nmodels:\n  scheduler_probe:\n    +materialized: table\n"
+    )
+    (models / "scheduler_probe.sql").write_text(
+        "SELECT current_setting('threads')::INTEGER AS engine_threads, "
+        "current_setting('memory_limit') AS engine_memory_limit\n"
+    )
+    actual_run = dbt_runner.subprocess.run
+    calls = []
+
+    def bounded_run(*args, **kwargs):
+        calls.append(True)
+        return actual_run(*args, **kwargs, timeout=90)
+
+    monkeypatch.setattr(dbt_runner.subprocess, "run", bounded_run)
+    warehouse, work = tmp_path / "tiny.duckdb", tmp_path / "work"
+    arguments = ["run"] + ([] if scheduler is None else ["--threads", str(scheduler)])
+    result = dbt_runner.run_dbt_at(
+        arguments,
+        project_dir=project,
+        profiles_dir=dbt_project_dir(),
+        warehouse=warehouse,
+        work_dir=work,
+        memory_limit="32MiB",
+        max_temp_bytes=32 * 1024**2,
+        threads=2,
+    )
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+    assert calls == [True]
+    recorded = json.loads((work / "target" / "run_results.json").read_text())
+    assert recorded["args"].get("threads") == scheduler
+    assert f"Concurrency: {scheduler or 1} threads" in result.stdout
+    assert len(recorded["results"]) == 1 and recorded["results"][0]["status"] == "success"
+    with duckdb.connect(str(warehouse), read_only=True) as connection:
+        assert connection.execute("SELECT * FROM main.scheduler_probe").fetchall() == [
+            (2, "32.0 MiB")
+        ]
 
 
 @pytest.mark.parametrize("legacy_settings", [False, True])

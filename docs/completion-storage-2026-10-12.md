@@ -89,6 +89,19 @@ must remain quiescent during the sequential acceptance run. Earlier periodic-onl
 had no measured cap violation, but did not prevent a child from allocating space occupied
 by unrelated roots.
 
+The subsequent full build stopped after 79 of 89 successful dbt steps. Its saved supervisor
+report contains only the exception type; a post-stop storage check reproduced combined
+temporary allowance exhaustion, without establishing the precise failure-time peak.
+Twenty orphaned DuckDB spill files totaling 23,727,013,888 B were inventoried and removed
+under the root lock after dead-owner, no-user, path and file-identity checks. Raw captures,
+the warehouse/WAL, ledger, dlt jobs and failed-build evidence remain intact.
+
+The packaged profile now schedules one dbt model or test at a time, retaining the configured
+DuckDB SQL thread count and memory. This reaches replay, raw rebuild and Dagster as well
+as explicit builds. Native dbt task overrides remain available. Serial scheduling requires
+fresh full-scale certification; it does not establish storage fit or eliminate repeated
+selection work. The latest full-data build and recovery gates remain incomplete.
+
 The retained raw inventory was copied into a fresh owned v4 root and its ledger reconstructed:
 140,055 files, 4,284,587,741 bytes, 69,954 original page identities and 146 complete scans.
 All capture fields match the old ledger, which remains unchanged. All bootstrap pages are now

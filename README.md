@@ -233,6 +233,11 @@ source fingerprinting reserves existing scratch jobs without changing the bound 
 configuration. Reports record the child allowance separately from the global 32 GiB cap.
 Keep other roots quiescent during these manually operated acceptance invocations.
 
+The packaged dbt profile runs one model or test at a time. `load.duckdb_threads`
+controls SQL parallelism within DuckDB independently; acceptance keeps two SQL threads
+and the `2GB` memory setting. Native dbt `--threads N` can override task scheduling.
+Replay, raw rebuild and Dagster use the same packaged default.
+
 An explicit batch's native market-source pages can be loaded separately:
 
 ```sh
