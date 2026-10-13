@@ -102,6 +102,15 @@ as explicit builds. Native dbt task overrides remain available. Serial schedulin
 fresh full-scale certification; it does not establish storage fit or eliminate repeated
 selection work. The latest full-data build and recovery gates remain incomplete.
 
+Membership collection now joins selected observations directly. It preserves associations
+for unusable identities and conflicting asset owners while keeping complete current/outcome
+validation mandatory. A bounded retained-input profile compared 15,621 observations and
+15,621 bridge rows with identical nine-column schemas and row multisets. Mean execution
+was 113.66 ms before and 20.49 ms after the join change. The fixture contained only explicit,
+usable, conflict-free memberships; separate regressions cover the other membership cases.
+The profile used `2GB`, two SQL threads, zero disk spill and a 90-second deadline. Its
+5.55× result does not prove full-catalogue speed or recovery storage fit.
+
 The retained raw inventory was copied into a fresh owned v4 root and its ledger reconstructed:
 140,055 files, 4,284,587,741 bytes, 69,954 original page identities and 146 complete scans.
 All capture fields match the old ledger, which remains unchanged. All bootstrap pages are now
