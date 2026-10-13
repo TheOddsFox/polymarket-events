@@ -63,6 +63,9 @@ canonical DuckDB JSON in UTC, SHA-256 each row, sort those fixed-width hashes, t
 SHA-256 over the ordered schema and hash lines. Row counts and duplicate hashes are retained.
 This compares exact semantic multisets without sorting large payload strings; equality relies
 on SHA-256 collision resistance. Physical Parquet bytes have separate checksums.
+Hash projection finishes in a private temporary table before sorting, so source operators
+and the hash sorter do not need to remain active together. Only fixed-width hashes are
+stored there; the table is removed after streaming, within the existing spill allowance.
 
 Warehouse validity is recorded separately in the capture SQLite ledger. Mutations first mark it
 dirty; a complete validated build certifies its captured inputs, coverage, model and normalization
@@ -71,14 +74,14 @@ under the root lock. Immutable verification checks only the release and does not
 warehouse or ledger. The current pointer includes the release-manifest digest.
 
 The packaged dbt profile passes configured engine threads, memory and temporary-storage
-limits to DuckDB when the connection opens. Its scheduler uses the same thread value.
+limits to DuckDB when the connection opens. Its scheduler runs one model or test at a time,
+independently of the configured SQL engine threads.
 Spill-directory settings are not reapplied for every adapter cursor after temporary
 storage has been used. These settings preserve the operator's configured resource limits.
-Market staging is a full table rebuilt by dbt, so current and history models reuse the
-same parsed observation projection. It extracts scalar and JSON paths in two grouped
-calls in a shared streaming projection, preserving the original casts, missing values
-and explicit JSON nulls. Loading makes its previous contents stale and dirties
-certification; publication requires a complete successful rebuild of all models and tests.
+Market staging is a view over the stored observation fields, preserving its complete
+projection, missing values and explicit JSON nulls. Full semantic verification also checks
+the canonical logical bronze views. Loading dirties certification; publication requires
+a complete successful rebuild of all models and tests.
 
 Offline rebuild uses exactly the complete capture inventory and compares every declared semantic
 warehouse relation and public projection, including observation history, metrics and quarantine.

@@ -100,7 +100,7 @@ The packaged profile now schedules one dbt model or test at a time, retaining th
 DuckDB SQL thread count and memory. This reaches replay, raw rebuild and Dagster as well
 as explicit builds. Native dbt task overrides remain available. Serial scheduling requires
 fresh full-scale certification; it does not establish storage fit or eliminate repeated
-selection work. The latest full-data build and recovery gates remain incomplete.
+selection work. Full-data certification and recovery gates remain incomplete.
 
 Membership collection now joins selected observations directly. It preserves associations
 for unusable identities and conflicting asset owners while keeping complete current/outcome
@@ -110,6 +110,17 @@ was 113.66 ms before and 20.49 ms after the join change. The fixture contained o
 usable, conflict-free memberships; separate regressions cover the other membership cases.
 The profile used `2GB`, two SQL threads, zero disk spill and a 90-second deadline. Its
 5.55× result does not prove full-catalogue speed or recovery storage fit.
+
+The next full-data run passed all 26 models and 63 tests in 2,156.70 seconds. Its membership
+table built in 57.57 seconds; the previous query was still unfinished after 23.52 minutes.
+Certification then failed while fingerprinting the warehouse at the unchanged `2GB` limit;
+the CLI exited after 5,489.16 seconds and no release was published.
+
+Fingerprinting now finishes row hashing before sorting the compact hashes. A 250,000-row
+join regression at 32 MiB memory, 64 MiB spill and two SQL threads reproduces the old OOM.
+Disabling insertion-order preservation alone also fails. Separating the operators succeeds
+with the exact independently calculated schema, count and digest. Full-scale fingerprinting,
+fresh complete certification and all recovery gates remain required.
 
 The retained raw inventory was copied into a fresh owned v4 root and its ledger reconstructed:
 140,055 files, 4,284,587,741 bytes, 69,954 original page identities and 146 complete scans.
@@ -136,7 +147,7 @@ must pass for changed production bytes before adoption.
 
 The subsequent full build created the outcome table in 3,018 seconds and passed its
 current-market build-provenance check in 2,632 seconds. Those repeated selection queries
-still carry outcome payloads through recency windows. The frozen installed build remains
+still carry outcome payloads through recency windows. That older frozen installed build remained
 incomplete; no certification or publication can be inferred from individual passing nodes.
 
 A query-only change ranks five envelope fields before joining the winner back to its
