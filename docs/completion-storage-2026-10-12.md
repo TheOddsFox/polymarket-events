@@ -103,8 +103,31 @@ Full projections took 0.572 versus 0.403 seconds; median hash-null checks took 0
 do not establish full-scale speed or memory fit. Installed, live and full-catalogue acceptance
 must pass for changed production bytes before adoption.
 
+The subsequent full build created the outcome table in 3,018 seconds and passed its
+current-market build-provenance check in 2,632 seconds. Those repeated selection queries
+still carry outcome payloads through recency windows. The frozen installed build remains
+incomplete; no certification or publication can be inferred from individual passing nodes.
+
+A query-only change ranks five envelope fields before joining the winner back to its
+complete observation. A paired 15,621-row check preserved all 49 selected-view columns,
+schemas and exact rows. One bounded scaling case created 1,999,488 virtual observations
+with four receipts per synthetic market key. Both queries returned 499,872 selected rows
+with identical three-field schemas and semantic digest:
+`98cc0a80cc0c1541aace6ed2024d48f869ed29fd3eecc75c743f29a14b812ff6`.
+The projected query took 27.85 versus 4.34 seconds; separate-process peak RSS was
+2,226,044,928 versus 612,286,464 B. Both used `2GB`, two threads and zero spill. The entire
+scaling experiment took 40.46 seconds under a 90-second deadline, with no network requests
+or changes to the owned source fixture.
+
+The scaling fingerprint compares market ID, outcomes and usability, which are identical
+across the four receipts; it does not prove the winning locator. Separate regression tests
+assert observation IDs, source kinds and receipt times, including older direct observations,
+tied timestamps, winning nulls and out-of-order insertion. The full certification boundary
+also checks invalid duplicate IDs and corruption in non-winning evidence. These experiments
+support the narrower query but do not establish actual catalogue-wide speed or memory fit.
+
 Daily/reconcile collection, complete recovery, the final `data/catalogue`
-and catalogue-wide cleanup remain incomplete. Commit `6b796ab` passed hosted CI, including
-the installed offline workflow; subsequent production edits require their own gates. Do not
+and catalogue-wide cleanup remain incomplete. Accepted production revisions have passed hosted
+CI, including the installed offline workflow; subsequent production edits require their own gates. Do not
 claim the bounded smoke proves operational completion. Measure full build/certification
 runtime as well as storage: views trade redundant storage for repeated computation.

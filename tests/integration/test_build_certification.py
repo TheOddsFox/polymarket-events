@@ -1,6 +1,7 @@
 """Real builds bind all semantic relations and refuse stale, partial and changed state."""
 
 import hashlib
+import json
 from dataclasses import replace
 
 import duckdb
@@ -175,6 +176,64 @@ def test_changed_quality_requires_new_certification(certified_root, tmp_path):
     changed = replace(settings, quality=replace(settings.quality, quarantine_max_ratio=0.0))
     with pytest.raises(BuildInvalid, match="changed"):
         assert_build_valid(changed)
+
+
+def test_duplicate_observation_ids_cannot_certify_join_back_selection(certified_root, tmp_path):
+    settings = copy_built(certified_root, tmp_path)
+    release = publish_stage(settings)
+    pointer = (settings.published_dir / CURRENT_POINTER).read_bytes()
+    with duckdb.connect(str(settings.warehouse_path)) as connection:
+        observation_id = connection.execute(
+            "SELECT observation_id FROM core.int_market_selected "
+            "WHERE source_kind='market_direct' ORDER BY observation_id LIMIT 1"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO bronze.market_observations_values "
+            "SELECT * FROM bronze.market_observations_values WHERE observation_id=?",
+            [observation_id],
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM core.int_market_selected WHERE observation_id=?",
+            [observation_id],
+        ).fetchone() == (2,)
+    result = dbt_stage(settings, ["build"])
+    assert result.returncode != 0
+    results = json.loads((result.target_path / "run_results.json").read_text())["results"]
+    assert any(
+        row["status"] == "fail" and "market_observations_observation_id" in row["unique_id"]
+        for row in results
+    )
+    assert read_build_validity(settings)["status"] == "dirty"
+    with pytest.raises(BuildInvalid, match="dirty"):
+        assert_build_valid(settings)
+    with pytest.raises(PublishBlocked):
+        publish_stage(settings)
+    assert (settings.published_dir / CURRENT_POINTER).read_bytes() == pointer
+    verify_release(settings, release.path)
+
+
+def test_nonwinning_corrupt_observation_still_blocks_full_certification(certified_root, tmp_path):
+    settings = copy_built(certified_root, tmp_path)
+    release = publish_stage(settings)
+    pointer = (settings.published_dir / CURRENT_POINTER).read_bytes()
+    with duckdb.connect(str(settings.warehouse_path)) as connection:
+        connection.execute(
+            "INSERT INTO bronze.market_observations_values SELECT * REPLACE "
+            "(observation_id || '-older-corrupt' AS observation_id, "
+            "observed_at - INTERVAL '1 DAY' AS observed_at, '{bad-json' AS n_capture_id) "
+            "FROM bronze.market_observations_values WHERE source_kind='market_direct' LIMIT 1"
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM core.int_market_selected "
+            "WHERE observation_id LIKE '%-older-corrupt'"
+        ).fetchone() == (0,)
+    with pytest.raises(duckdb.Error, match="Malformed JSON"):
+        dbt_stage(settings, ["build"])
+    assert read_build_validity(settings)["status"] == "dirty"
+    with pytest.raises(PublishBlocked):
+        publish_stage(settings)
+    assert (settings.published_dir / CURRENT_POINTER).read_bytes() == pointer
+    verify_release(settings, release.path)
 
 
 def test_subset_build_stays_dirty_and_uses_a_fresh_target(certified_root, tmp_path):

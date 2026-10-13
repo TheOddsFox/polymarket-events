@@ -251,6 +251,14 @@ matched every staging value and view schema; the narrow hash check improved abou
 while the full projection improved about 1.4 times. Neither measurement proves catalogue-wide
 build speed or memory fit. The query used `2GB`, two threads and zero disk spill.
 
+Current-market selection ranks only observation keys and receipt fields, then joins the
+winning ID back to its complete row. Source priority, tied-receipt ordering, explicit nulls
+and full-history counts remain unchanged. A bounded scaling check with 1,999,488 repeated
+observations returned identical projected contents in 4.34 versus 27.85 seconds, with peak
+process memory of 0.61 versus 2.23 GB. It used the same `2GB`, two threads and no disk spill;
+synthetic scaling does not prove full-catalogue fit. Certification still rejects duplicate
+observation IDs and corrupt older evidence.
+
 ## Layout
 
 - `src/oddsfox_catalogue/`: capture, load, dbt runner, publish, rebuild, backup, Dagster definitions, CLI.

@@ -284,6 +284,129 @@ def _insert_stored(connection, record, *, observation_id="observation-1", batch_
     )
 
 
+@pytest.fixture(scope="module")
+def selection_queries():
+    def render(text):
+        def ref(name):
+            assert name == "stg_gamma__market_observations"
+            return "selection_stage"
+
+        return Template(text, undefined=StrictUndefined).render(ref=ref, config=lambda **kwargs: "")
+
+    return (
+        render(REFERENCE.with_name("market_selection_wide.sql").read_text()),
+        render(dbt_project_dir().joinpath("models/core/int_market_selected.sql").read_text()),
+    )
+
+
+def _selected_equivalent(connection, stage_query, queries):
+    connection.execute("CREATE TEMP VIEW selection_stage AS " + stage_query)
+    outputs = []
+    for index, query in enumerate(queries):
+        name = f"selected_{index}"
+        connection.execute(f"CREATE TEMP VIEW {name} AS {query}")
+        schema = connection.execute(
+            "SELECT column_name,data_type,is_nullable FROM information_schema.columns "
+            "WHERE table_name=? ORDER BY ordinal_position",
+            [name],
+        ).fetchall()
+        rows = connection.execute(f"SELECT * FROM {name} ORDER BY venue,market_id").fetchall()
+        assert len(schema) == 49
+        outputs.append((schema, rows))
+    assert outputs[0] == outputs[1]
+    return [
+        dict(zip([column[0] for column in outputs[0][0]], row, strict=True))
+        for row in outputs[0][1]
+    ]
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["source-order", "reverse-order"])
+def test_narrow_selection_preserves_winner_identity_whole_row_and_full_history(
+    stored_connection, stored_queries, selection_queries, reverse
+):
+    observations = [
+        ("direct-a", "201", "polymarket", "market_direct", 10, "batch-1"),
+        ("direct-b", "201", "polymarket", "market_direct", 11, "batch-1"),
+        ("direct-c", "201", "polymarket", "market_direct", 11, "batch-1"),
+        ("embedded-newer", "201", "polymarket", "event_embedded", 13, "batch-1"),
+        ("unregistered-newest", "201", "polymarket", "market_direct", 14, "not-loaded"),
+        ("embedded-old", "202", "polymarket", "event_embedded", 10, "batch-1"),
+        ("embedded-latest", "202", "polymarket", "event_embedded", 12, "batch-1"),
+        ("other-venue", "201", "other", "market_direct", 11, "batch-1"),
+    ]
+    for observation_id, market_id, venue, kind, day, batch_id in (
+        reversed(observations) if reverse else observations
+    ):
+        record = _record()
+        record.update(question=observation_id, usable=True)
+        if observation_id == "direct-c":
+            record.update(question=None, active=None, closed=None, memberships=[], usable=False)
+        _insert_stored(stored_connection, record, observation_id=observation_id, batch_id=batch_id)
+        stored_connection.execute(
+            "UPDATE bronze.market_observations_values SET entity_id=?,venue=?,source_kind=?,observed_at=? "
+            "WHERE observation_id=?",
+            [market_id, venue, kind, datetime(2026, 10, day, 10, tzinfo=UTC), observation_id],
+        )
+    rows = _selected_equivalent(stored_connection, stored_queries[1], selection_queries)
+    assert [(row["venue"], row["market_id"], row["observation_id"]) for row in rows] == [
+        ("other", "201", "other-venue"),
+        ("polymarket", "201", "direct-c"),
+        ("polymarket", "202", "embedded-latest"),
+    ]
+    winner = rows[1]
+    assert (winner["source_kind"], winner["observed_at"]) == (
+        "market_direct",
+        datetime(2026, 10, 11, 10, tzinfo=UTC),
+    )
+    assert (
+        winner["question"],
+        winner["active"],
+        winner["closed"],
+        winner["usable"],
+        winner["event_refs_json"],
+    ) == (None, None, None, False, "[]")
+    assert [(row["observation_count"], row["first_observed_at"]) for row in rows] == [
+        (1, datetime(2026, 10, 11, 10, tzinfo=UTC)),
+        (4, datetime(2026, 10, 10, 10, tzinfo=UTC)),
+        (2, datetime(2026, 10, 10, 10, tzinfo=UTC)),
+    ]
+    assert rows[2]["source_kind"] == "event_embedded"
+    assert rows[2]["observed_at"] == datetime(2026, 10, 12, 10, tzinfo=UTC)
+
+
+def test_narrow_selection_preserves_empty_view_schema(
+    stored_connection, stored_queries, selection_queries
+):
+    assert _selected_equivalent(stored_connection, stored_queries[1], selection_queries) == []
+
+
+def test_narrow_selection_window_carries_only_ordering_identity_fields(
+    stored_connection, stored_queries, selection_queries
+):
+    _insert_stored(stored_connection, _record())
+    _selected_equivalent(stored_connection, stored_queries[1], selection_queries)
+    pending = json.loads(
+        stored_connection.execute(
+            "EXPLAIN (FORMAT JSON) SELECT market_id,outcomes_json,usable FROM selected_1"
+        ).fetchone()[1]
+    )
+    windows = []
+    while pending:
+        node = pending.pop()
+        pending.extend(node["children"])
+        if node["name"] == "WINDOW":
+            windows.append(node)
+        assert node["name"] not in {"CTE", "CTE_SCAN"}
+    assert len(windows) == 1
+    assert set(windows[0]["children"][0]["extra_info"]["Projections"]) == {
+        "observation_id",
+        "venue",
+        "market_id",
+        "observed_at",
+        "source_kind",
+    }
+
+
 def _stored_equivalent(connection, queries):
     rows = _equivalent(connection, queries)
     schemas = []
