@@ -96,6 +96,188 @@ def test_events_release_matches_the_mart(built_root, tmp_path) -> None:
     assert info.tables["events"]["rows"] == mart
 
 
+def test_complete_binding_runs_once_after_candidate_verification_before_promotion(
+    built_root, tmp_path, monkeypatch
+):
+    from oddsfox_catalogue import certification, publish
+    from oddsfox_catalogue.semantics import SEMANTIC_RELATIONS
+
+    settings = _copy_of_built(built_root, tmp_path)
+    events, bindings = [], []
+    original_binding = certification._binding
+    original_export = publish._export_release
+    original_verify = publish.verify_release
+    original_replace = publish.os.replace
+
+    def binding(*args, **kwargs):
+        value = original_binding(*args, **kwargs)
+        bindings.append(value)
+        events.append("complete binding")
+        return value
+
+    def export(*args, **kwargs):
+        value = original_export(*args, **kwargs)
+        events.append("export complete")
+        return value
+
+    def verify(selected, path, *args, **kwargs):
+        value = original_verify(selected, path, *args, **kwargs)
+        if Path(path).name.startswith(".staging-"):
+            events.append("candidate verified")
+        return value
+
+    def replace(source, destination):
+        if Path(destination).name == CURRENT_POINTER:
+            events.append("pointer promotion")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(certification, "_binding", binding)
+    monkeypatch.setattr(publish, "_export_release", export)
+    monkeypatch.setattr(publish, "verify_release", verify)
+    monkeypatch.setattr(publish.os, "replace", replace)
+    info = publish_release(settings, now=FIXED_NOW)
+    assert len(bindings) == 1
+    assert events == [
+        "export complete",
+        "candidate verified",
+        "complete binding",
+        "pointer promotion",
+    ]
+    assert set(bindings[0]["warehouse"]["relations"]) == set(SEMANTIC_RELATIONS)
+    assert len(bindings[0]["warehouse"]["schemas"]) == 30
+    assert set(bindings[0]["published"]) == set(PROJECTION_TABLE_QUERIES)
+    assert bindings[0]["capture"]["batch_ids"]
+    assert current_release(settings)["release_id"] == info.release_id
+
+
+@pytest.mark.parametrize("when_corrupted", ["before", "during_export"])
+def test_nonpublic_history_corruption_blocks_after_candidate_verification_and_keeps_pointer(
+    built_root, tmp_path, monkeypatch, when_corrupted
+):
+    from oddsfox_catalogue import certification, publish
+
+    settings = _copy_of_built(built_root, tmp_path)
+    first = publish_release(settings, now=FIXED_NOW)
+    previous = (settings.published_dir / CURRENT_POINTER).read_bytes()
+    events = []
+    original_binding = certification._binding
+    original_export = publish._export_release
+    original_verify = publish.verify_release
+
+    def corrupt_history():
+        with duckdb.connect(str(settings.warehouse_path)) as connection:
+            connection.execute("UPDATE history.market_metrics SET volume='99999'")
+
+    def binding(*args, **kwargs):
+        value = original_binding(*args, **kwargs)
+        events.append("complete binding")
+        return value
+
+    def export(*args, **kwargs):
+        value = original_export(*args, **kwargs)
+        if when_corrupted == "during_export":
+            corrupt_history()
+        events.append("export complete")
+        return value
+
+    def verify(selected, path, *args, **kwargs):
+        value = original_verify(selected, path, *args, **kwargs)
+        if Path(path).name.startswith(".staging-"):
+            events.append("candidate verified")
+        return value
+
+    if when_corrupted == "before":
+        corrupt_history()
+    monkeypatch.setattr(certification, "_binding", binding)
+    monkeypatch.setattr(publish, "_export_release", export)
+    monkeypatch.setattr(publish, "verify_release", verify)
+    with pytest.raises(PublishBlocked, match="changed during candidate export"):
+        publish_release(settings, now=FIXED_NOW + timedelta(days=1))
+    assert events == ["export complete", "candidate verified", "complete binding"]
+    assert (settings.published_dir / CURRENT_POINTER).read_bytes() == previous
+    assert current_release(settings)["release_id"] == first.release_id
+    verify_release(settings, first.path)
+    candidates = list((settings.published_dir / "releases").glob(".staging-*"))
+    assert len(candidates) == 1
+    verify_release(settings, candidates[0])
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "dirty",
+        "checksum",
+        "quality",
+        "model",
+        "warehouse_stamp",
+        "empty_capture",
+        "empty_projections",
+        "projection_rows_bool",
+    ],
+)
+def test_invalid_admission_blocks_export_and_retains_previous_pointer(
+    built_root, tmp_path, monkeypatch, damage
+):
+    import hashlib
+    from dataclasses import replace
+
+    from oddsfox_catalogue import certification, publish
+    from oddsfox_catalogue.capture.ledger import Ledger
+
+    settings = _copy_of_built(built_root, tmp_path)
+    first = publish_release(settings, now=FIXED_NOW)
+    previous = (settings.published_dir / CURRENT_POINTER).read_bytes()
+    if damage == "dirty":
+        certification.mark_dirty(settings, "synthetic mutation")
+    elif damage == "checksum":
+        with Ledger(settings.ledger_path) as ledger:
+            row = ledger.build_validity()
+            ledger.set_build_validity(
+                "valid",
+                row["updated_at"],
+                payload_json=row["payload_json"] + " ",
+                payload_sha256=hashlib.sha256(row["payload_json"].encode()).hexdigest(),
+            )
+    elif damage == "quality":
+        settings = replace(settings, quality=replace(settings.quality, quarantine_max_ratio=0.0))
+    elif damage == "model":
+        monkeypatch.setattr(certification, "_model_revision", lambda *_: "changed")
+    elif damage == "warehouse_stamp":
+        with duckdb.connect(str(settings.warehouse_path)) as connection:
+            connection.execute("UPDATE catalogue_meta.contract SET contract='legacy'")
+    else:
+        with Ledger(settings.ledger_path) as ledger:
+            row = ledger.build_validity()
+            receipt = json.loads(row["payload_json"])
+            if damage == "empty_capture":
+                receipt["binding"]["capture"] = {}
+            elif damage == "empty_projections":
+                receipt["binding"]["published"] = {name: {} for name in PROJECTION_TABLE_QUERIES}
+            else:
+                receipt["binding"]["published"]["outcomes"]["rows"] = False
+            payload = json.dumps(receipt)
+            ledger.set_build_validity(
+                "valid",
+                row["updated_at"],
+                payload_json=payload,
+                payload_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+            )
+    monkeypatch.setattr(
+        certification, "_binding", lambda *_: pytest.fail("invalid admission ran full queries")
+    )
+    monkeypatch.setattr(
+        publish, "_export_release", lambda *_: pytest.fail("invalid admission exported a candidate")
+    )
+    with pytest.raises(PublishBlocked, match="certification"):
+        publish_release(settings, now=FIXED_NOW + timedelta(days=1))
+    if damage in {"empty_capture", "empty_projections", "projection_rows_bool"}:
+        monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
+        assert main(["publish"]) == 3
+    assert (settings.published_dir / CURRENT_POINTER).read_bytes() == previous
+    assert current_release(settings)["release_id"] == first.release_id
+    assert list((settings.published_dir / "releases").iterdir()) == [first.path]
+
+
 @pytest.mark.parametrize("removed", ["page", "scan", "gzip_header"])
 def test_missing_registered_capture_inventory_blocks_and_retains_pointer(
     built_root, tmp_path, removed
@@ -114,7 +296,7 @@ def test_missing_registered_capture_inventory_blocks_and_retains_pointer(
         payload = json.loads(manifest.read_bytes())["file"]
         (manifest.parent / payload).unlink()
         manifest.unlink()
-    with pytest.raises(PublishBlocked, match="certification"):
+    with pytest.raises(PublishBlocked, match="certification|capture inventory"):
         publish_release(settings, now=FIXED_NOW + timedelta(days=1))
     assert current_release(settings)["release_id"] == first.release_id
 
@@ -419,12 +601,19 @@ def test_immutable_verification_does_not_depend_on_dirty_or_missing_warehouse(bu
 
 
 def test_corrupt_candidate_leaves_previous_pointer_and_evidence(built_root, tmp_path, monkeypatch):
+    import oddsfox_catalogue.certification as certification
     import oddsfox_catalogue.publish as module
 
     settings = _copy_of_built(built_root, tmp_path)
     first = publish_release(settings, now=FIXED_NOW)
     previous = (settings.published_dir / CURRENT_POINTER).read_bytes()
     original = module._export_release
+    original_binding = certification._binding
+    full_calls = []
+
+    def binding(*args, **kwargs):
+        full_calls.append(True)
+        return original_binding(*args, **kwargs)
 
     def corrupt(*args, **kwargs):
         manifest = original(*args, **kwargs)
@@ -432,11 +621,13 @@ def test_corrupt_candidate_leaves_previous_pointer_and_evidence(built_root, tmp_
         return manifest
 
     monkeypatch.setattr(module, "_export_release", corrupt)
+    monkeypatch.setattr(certification, "_binding", binding)
     with pytest.raises(PublishBlocked, match="verification"):
         publish_release(settings, now=FIXED_NOW + timedelta(days=1))
     assert (settings.published_dir / CURRENT_POINTER).read_bytes() == previous
     assert current_release(settings)["release_id"] == first.release_id
     assert list((settings.published_dir / "releases").glob(".staging-*"))
+    assert full_calls == []
 
 
 def test_pointer_write_failure_preserves_previous_verified_release(

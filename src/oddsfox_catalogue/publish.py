@@ -433,12 +433,16 @@ def publish_release(
     settings: Settings, *, now: datetime | None = None, git_sha: str | None = None
 ) -> ReleaseInfo:
     """Caller holds the root writer lock; certify and verify before pointer promotion."""
-    from oddsfox_catalogue.certification import BuildInvalid, assert_build_valid
+    from oddsfox_catalogue.certification import (
+        BuildInvalid,
+        assert_build_valid,
+        read_certified_receipt,
+    )
 
     if not settings.warehouse_path.exists():
         raise BaselineMissing("no warehouse; run capture, load and a complete build first")
     try:
-        receipt = assert_build_valid(settings)
+        receipt = read_certified_receipt(settings)
         current_release(settings)
     except BuildInvalid as exc:
         raise PublishBlocked("warehouse build certification is invalid") from exc

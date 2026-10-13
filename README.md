@@ -141,9 +141,10 @@ A fresh pre-build parse pins the required node inventory independently of the bu
 removed or disabled tests, changed source and mismatched variables cannot certify a build.
 
 The certificate binds complete registered captures, coverage, normalization and model revisions,
-effective quality settings, warehouse schemas and semantic content. Publication checks the actual
-warehouse again under the root lock, so external dbt edits also invalidate admission. The candidate
-release is verified before `current.json` switches atomically. A failed operation leaves the
+effective quality settings, warehouse schemas and semantic content. Publication admits a compatible
+receipt, exports matching projections and verifies the candidate. It then checks the complete actual
+warehouse binding under the root lock before `current.json` switches atomically. External edits
+block promotion; changes outside public projections may be detected after export. A failed operation leaves the
 previous verified release available. Releases and interrupted artifacts are retained; there is no
 automatic pruning.
 

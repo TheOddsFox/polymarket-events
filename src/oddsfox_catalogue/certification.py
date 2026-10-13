@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime
@@ -13,7 +14,13 @@ import duckdb
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.writer import read_regular_bytes
 from oddsfox_catalogue.config import Settings
-from oddsfox_catalogue.contract import CONTRACT, NORMALIZATION_REVISION
+from oddsfox_catalogue.contract import (
+    CONTRACT,
+    NORMALIZATION_REVISION,
+    projection_queries,
+    projection_schemas,
+)
+from oddsfox_catalogue.fingerprints import SEMANTIC_DIGEST_REVISION
 from oddsfox_catalogue.ids import iso_utc, utc_now
 from oddsfox_catalogue.inventory import capture_inventory
 from oddsfox_catalogue.semantics import (
@@ -277,7 +284,7 @@ def capture_binding(settings: Settings):
     }
 
 
-def _binding(settings: Settings, effective_vars):
+def _configuration_binding(settings: Settings, effective_vars):
     ensure_warehouse_contract(settings)
     return {
         "contract": CONTRACT,
@@ -286,6 +293,12 @@ def _binding(settings: Settings, effective_vars):
         "model_revision": _model_revision(settings),
         "quality": asdict(settings.quality),
         "effective_vars": effective_vars,
+    }
+
+
+def _binding(settings: Settings, effective_vars):
+    return {
+        **_configuration_binding(settings, effective_vars),
         "capture": capture_binding(settings),
         "warehouse": warehouse_snapshot(settings),
         "published": published_snapshot(settings),
@@ -387,8 +400,8 @@ def certify_build(settings: Settings, target_path: Path):
     return receipt
 
 
-def assert_build_valid(settings: Settings):
-    """Detect partial loads/builds, changed quality, raw tampering and external dbt writes."""
+def read_certified_receipt(settings: Settings):
+    """Admit a compatible receipt; actual data still requires assert_build_valid."""
     row = read_build_validity(settings)
     if row is None or row["status"] != "valid":
         raise BuildInvalid("warehouse is dirty or uncertified; run a complete dbt build")
@@ -408,7 +421,61 @@ def assert_build_valid(settings: Settings):
         binding = receipt["binding"]
         if not isinstance(binding, dict) or not isinstance(binding.get("effective_vars"), dict):
             raise BuildInvalid("build receipt binding is malformed")
-        if _binding(settings, binding["effective_vars"]) != binding:
+        configuration = _configuration_binding(settings, binding["effective_vars"])
+        if (
+            set(binding) != set(configuration) | {"capture", "warehouse", "published"}
+            or any(
+                not isinstance(binding[key], dict) for key in ("capture", "warehouse", "published")
+            )
+            or set(binding["published"]) != set(projection_queries())
+            or any(not isinstance(value, dict) for value in binding["published"].values())
+        ):
+            raise BuildInvalid("build receipt binding is malformed")
+        if any(binding[key] != value for key, value in configuration.items()):
+            raise BuildInvalid("build receipt configuration changed; rebuild before publication")
+        capture = binding["capture"]
+        if (
+            set(capture) != {"batch_ids", "inventory", "coverage"}
+            or not isinstance(capture["batch_ids"], list)
+            or not capture["batch_ids"]
+            or any(not isinstance(value, str) for value in capture["batch_ids"])
+            or capture["batch_ids"] != sorted(set(capture["batch_ids"]))
+        ):
+            raise BuildInvalid("build receipt capture is malformed")
+        for descriptor in (capture["inventory"], capture["coverage"]):
+            if (
+                not isinstance(descriptor, dict)
+                or set(descriptor) != {"bytes", "sha256"}
+                or type(descriptor["bytes"]) is not int
+                or descriptor["bytes"] < 0
+                or not isinstance(descriptor["sha256"], str)
+                or not re.fullmatch(r"[a-f0-9]{64}", descriptor["sha256"])
+            ):
+                raise BuildInvalid("build receipt capture descriptor is malformed")
+        schemas = projection_schemas()
+        for name, descriptor in binding["published"].items():
+            if (
+                set(descriptor) != {"rows", "schema", "semantic_sha256", "semantic_digest_revision"}
+                or type(descriptor["rows"]) is not int
+                or descriptor["rows"] < 0
+                or descriptor["schema"] != schemas[name]
+                or descriptor["semantic_digest_revision"] != SEMANTIC_DIGEST_REVISION
+                or not isinstance(descriptor["semantic_sha256"], str)
+                or not re.fullmatch(r"[a-f0-9]{64}", descriptor["semantic_sha256"])
+            ):
+                raise BuildInvalid("build receipt projection descriptor is malformed")
+    except (KeyError, TypeError, ValueError, duckdb.Error) as exc:
+        if isinstance(exc, BuildInvalid):
+            raise
+        raise BuildInvalid("build receipt or warehouse is invalid") from exc
+    return receipt
+
+
+def assert_build_valid(settings: Settings):
+    """Detect partial loads/builds, changed quality, raw tampering and external dbt writes."""
+    receipt = read_certified_receipt(settings)
+    try:
+        if _binding(settings, receipt["binding"]["effective_vars"]) != receipt["binding"]:
             raise BuildInvalid(
                 "warehouse or its certified inputs have changed; rebuild before publication"
             )

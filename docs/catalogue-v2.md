@@ -69,8 +69,10 @@ stored there; the table is removed after streaming, within the existing spill al
 
 Warehouse validity is recorded separately in the capture SQLite ledger. Mutations first mark it
 dirty; a complete validated build certifies its captured inputs, coverage, model and normalization
-revisions, quality configuration, schemas and semantic digests. Publication recomputes that binding
-under the root lock. Immutable verification checks only the release and does not require the
+revisions, quality configuration, schemas and semantic digests. Publication first admits a compatible
+receipt and verifies its matching candidate, then recomputes the complete actual binding once
+under the root lock before promotion. Non-public changes may leave unpromoted staging evidence.
+Immutable verification checks only the release and does not require the
 warehouse or ledger. The current pointer includes the release-manifest digest.
 
 The packaged dbt profile passes configured engine threads, memory and temporary-storage

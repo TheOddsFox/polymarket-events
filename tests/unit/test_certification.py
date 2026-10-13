@@ -75,6 +75,33 @@ def write_artifacts(target, manifest, results):
     (target / "run_results.json").write_text(json.dumps(results))
 
 
+def receipt_binding(settings):
+    from oddsfox_catalogue.certification import _configuration_binding
+    from oddsfox_catalogue.contract import projection_schemas
+    from oddsfox_catalogue.fingerprints import SEMANTIC_DIGEST_REVISION
+
+    return {
+        **_configuration_binding(settings, {}),
+        "capture": {
+            "batch_ids": ["20261010T000000Z-bootstrap"],
+            "inventory": {"bytes": 0, "sha256": "0" * 64},
+            "coverage": {"bytes": 0, "sha256": "1" * 64},
+        },
+        "warehouse": {"state": "same"},
+        "published": {
+            name: {
+                "rows": 0,
+                "schema": schema,
+                "semantic_sha256": hashlib.sha256(
+                    json.dumps(schema, sort_keys=True).encode() + b"\n"
+                ).hexdigest(),
+                "semantic_digest_revision": SEMANTIC_DIGEST_REVISION,
+            }
+            for name, schema in projection_schemas().items()
+        },
+    }
+
+
 def test_status_inspection_does_not_create_state(tmp_path):
     settings = make_settings(tmp_path)
     assert read_build_validity(settings) is None
@@ -173,19 +200,34 @@ def test_required_test_inventory_is_independent_of_build_artifacts(tmp_path, dam
 
 
 def test_receipt_detects_changes_and_tampering(tmp_path, monkeypatch):
+    from oddsfox_catalogue.certification import read_certified_receipt
+
     settings = make_settings(tmp_path)
     target, manifest, results = artifacts(settings)
     prepare_dbt_execution(settings, target)
     write_artifacts(target, manifest, results)
-    binding = {"effective_vars": {}, "warehouse": "same"}
-    monkeypatch.setattr("oddsfox_catalogue.certification._binding", lambda *_: deepcopy(binding))
+    binding = receipt_binding(settings)
+    calls = []
+
+    def full_binding(*args):
+        calls.append(True)
+        return deepcopy(binding)
+
+    monkeypatch.setattr("oddsfox_catalogue.certification._binding", full_binding)
     monkeypatch.setattr("oddsfox_catalogue.pipeline.open_event_drop_warning", lambda *_: None)
     certify_build(settings, target)
+    calls.clear()
+    assert read_certified_receipt(settings)["binding"] == binding
+    assert calls == []
     assert assert_build_valid(settings)["binding"] == binding
-    binding["warehouse"] = "external edit"
+    assert calls == [True]
+    binding["warehouse"]["state"] = "external edit"
+    assert read_certified_receipt(settings)["binding"]["warehouse"] == {"state": "same"}
+    assert calls == [True]
     with pytest.raises(BuildInvalid, match="changed"):
         assert_build_valid(settings)
-    binding["warehouse"] = "same"
+    assert calls == [True, True]
+    binding["warehouse"]["state"] = "same"
     with Ledger(settings.ledger_path) as ledger:
         row = ledger.build_validity()
         ledger.set_build_validity(
@@ -196,6 +238,119 @@ def test_receipt_detects_changes_and_tampering(tmp_path, monkeypatch):
         )
     with pytest.raises(BuildInvalid, match="checksum"):
         assert_build_valid(settings)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "dirty",
+        "checksum",
+        "malformed_json",
+        "oversized",
+        "binding_list",
+        "vars_list",
+        "extra_binding",
+        "capture_list",
+        "warehouse_list",
+        "missing_public",
+        "public_member_list",
+        "contract",
+        "normalization",
+        "warehouse_contract",
+        "model_revision",
+        "quality",
+        "capture_empty",
+        "batch_ids_empty",
+        "batch_ids_type",
+        "batch_ids_order",
+        "capture_descriptor_missing",
+        "capture_bytes_bool",
+        "capture_bytes_float",
+        "capture_hash",
+        "projection_empty",
+        "projection_missing",
+        "projection_rows_bool",
+        "projection_schema",
+        "projection_revision",
+        "projection_hash",
+    ],
+)
+def test_cheap_receipt_admission_rejects_invalid_or_incompatible_receipts_without_full_queries(
+    tmp_path, monkeypatch, damage
+):
+    from oddsfox_catalogue.certification import read_certified_receipt
+
+    settings = make_settings(tmp_path)
+    receipt = {"revision": 1, "binding": receipt_binding(settings), "warning": "雪"}
+    binding = receipt["binding"]
+    if damage == "binding_list":
+        receipt["binding"] = []
+    elif damage == "vars_list":
+        binding["effective_vars"] = []
+    elif damage == "extra_binding":
+        binding["unexpected"] = {}
+    elif damage == "capture_list":
+        binding["capture"] = []
+    elif damage == "warehouse_list":
+        binding["warehouse"] = []
+    elif damage == "missing_public":
+        del binding["published"]["outcomes"]
+    elif damage == "public_member_list":
+        binding["published"]["outcomes"] = []
+    elif damage in {"contract", "warehouse_contract", "model_revision"}:
+        binding[damage] = "changed"
+    elif damage == "normalization":
+        binding["normalization_revision"] = "changed"
+    elif damage == "quality":
+        binding["quality"]["quarantine_max_ratio"] = 0.0
+    elif damage == "capture_empty":
+        binding["capture"] = {}
+    elif damage == "batch_ids_empty":
+        binding["capture"]["batch_ids"] = []
+    elif damage == "batch_ids_type":
+        binding["capture"]["batch_ids"] = [True]
+    elif damage == "batch_ids_order":
+        binding["capture"]["batch_ids"] = ["later", "earlier"]
+    elif damage == "capture_descriptor_missing":
+        del binding["capture"]["inventory"]["sha256"]
+    elif damage == "capture_bytes_bool":
+        binding["capture"]["inventory"]["bytes"] = False
+    elif damage == "capture_bytes_float":
+        binding["capture"]["coverage"]["bytes"] = 0.0
+    elif damage == "capture_hash":
+        binding["capture"]["coverage"]["sha256"] = "A" * 64
+    elif damage == "projection_empty":
+        binding["published"] = {name: {} for name in binding["published"]}
+    elif damage == "projection_missing":
+        del binding["published"]["outcomes"]["semantic_sha256"]
+    elif damage == "projection_rows_bool":
+        binding["published"]["outcomes"]["rows"] = False
+    elif damage == "projection_schema":
+        binding["published"]["outcomes"]["schema"][0]["type"] = "INTEGER"
+    elif damage == "projection_revision":
+        binding["published"]["outcomes"]["semantic_digest_revision"] = "unknown"
+    elif damage == "projection_hash":
+        binding["published"]["outcomes"]["semantic_sha256"] = "A" * 64
+    payload = "{" if damage == "malformed_json" else json.dumps(receipt, ensure_ascii=False)
+    checksum = hashlib.sha256(payload.encode()).hexdigest()
+    if damage == "checksum":
+        checksum = "0" * 64
+    if damage == "oversized":
+        # A receipt within its character limit can exceed its byte limit through Unicode.
+        monkeypatch.setattr("oddsfox_catalogue.certification.ARTIFACT_LIMIT", len(payload))
+    with Ledger(settings.ledger_path) as ledger:
+        ledger.set_build_validity(
+            "dirty" if damage == "dirty" else "valid",
+            iso_utc(utc_now()),
+            payload_json=payload,
+            payload_sha256=checksum,
+        )
+    monkeypatch.setattr(
+        "oddsfox_catalogue.certification._binding",
+        lambda *_: pytest.fail("invalid admission must not compute a full binding"),
+    )
+    with pytest.raises(BuildInvalid):
+        read_certified_receipt(settings)
 
 
 def test_reused_successful_artifacts_cannot_certify_a_new_mutation(tmp_path, monkeypatch):
