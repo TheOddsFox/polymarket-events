@@ -251,6 +251,42 @@ Path(sys.argv[1]).write_text(json.dumps({'cli': cli.__file__, 'smoke': smoke.__f
                 argv.extend(("--market-id", market_id))
             run_command(argv, runtime, proof_env, output / f"{workflow}-smoke.log", timeout=1830)
             report = json.loads((proof / "report.json").read_text())
+            if workflow == "catalogue":
+                step_env = dict(proof_env, CATALOGUE_ROOT=report["catalogue_root"])
+                scratch = proof / "stepped-rebuild"
+                for number in range(5):
+                    result_path = proof / f"rebuild-step-{number}.json"
+                    step_args = ["rebuild", "--verify", "--scratch", str(scratch), "--step"]
+                    if number:
+                        step_args.append("--resume")
+                    run_command(
+                        [
+                            str(python),
+                            "-I",
+                            "-c",
+                            "import contextlib,io,pathlib,sys; "
+                            "from oddsfox_catalogue.cli import main; "
+                            "captured=io.StringIO(); "
+                            "\nwith contextlib.redirect_stdout(captured): code=main(sys.argv[2:])"
+                            "\npathlib.Path(sys.argv[1]).write_text(captured.getvalue())"
+                            "\nraise SystemExit(code)",
+                            str(result_path),
+                            *step_args,
+                        ],
+                        runtime,
+                        step_env,
+                        output / f"rebuild-step-{number}.log",
+                        timeout=1830,
+                    )
+                    result = json.loads(result_path.read_text())
+                    if (
+                        result["pending"] is not (number < 4)
+                        or result["matched"] is not (number == 4)
+                        or result["mismatches"]
+                    ):
+                        raise ValueError("installed stepped rebuild claimed incorrect completion")
+                    if number == 4 and len(result["tables"]) != 68:
+                        raise ValueError("installed stepped rebuild omitted semantic comparisons")
             measured = source.accounting()
         allowed = {f"/markets/{market_id}" for market_id in market_ids}
         if workflow == "catalogue":

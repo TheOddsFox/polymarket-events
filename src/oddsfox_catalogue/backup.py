@@ -64,11 +64,18 @@ def _stream_file(
     path: Path, *, destination: Path | None = None, max_bytes: int = MAX_RETAINED_BYTES
 ):
     path = _safe_path(path)
+    ancestors = {}
+    for parent in path.parents:
+        info = parent.stat()
+        ancestors[parent] = (info.st_dev, info.st_ino)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     digest, size = hashlib.sha256(), 0
     with os.fdopen(fd, "rb") as source:
-        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError("backup member is not a regular file")
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        identity = tuple(getattr(before, field) for field in fields)
         target = None
         if destination is not None:
             _safe_path(destination)
@@ -84,6 +91,18 @@ def _stream_file(
             if target is not None:
                 target.flush()
                 os.fsync(target.fileno())
+            _safe_path(path)
+            after = os.fstat(source.fileno())
+            current = path.lstat()
+            if (
+                tuple(getattr(after, field) for field in fields) != identity
+                or tuple(getattr(current, field) for field in fields) != identity
+            ):
+                raise ValueError("backup source changed during streaming")
+            for parent, value in ancestors.items():
+                info = parent.stat()
+                if (info.st_dev, info.st_ino) != value:
+                    raise ValueError("backup source ancestor changed during streaming")
         finally:
             if target is not None:
                 target.close()
@@ -232,15 +251,36 @@ def _validated_manifest(backup_dir: Path, *, max_bytes: int = MAX_RETAINED_BYTES
     return manifest, config
 
 
-def _snapshot_ledger(source: Path, dest: Path) -> None:
+def _snapshot_ledger(source: Path, dest: Path, *, max_bytes: int | None = None) -> None:
     _safe_path(source)
+    _safe_path(dest)
+    if max_bytes is not None:
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("ledger snapshot byte allowance must be positive")
+        if dest.exists():
+            raise FileExistsError("bounded ledger snapshot requires a fresh destination")
     src = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
     try:
+        if max_bytes is not None:
+            src.execute("BEGIN")
+            page_size = src.execute("PRAGMA page_size").fetchone()[0]
+            if src.execute("PRAGMA page_count").fetchone()[0] * page_size > max_bytes:
+                raise ValueError("ledger snapshot exceeds byte allowance")
+
+            def bounded_progress(status, remaining, total):
+                if total * page_size > max_bytes or dest.stat().st_size > max_bytes:
+                    raise ValueError("ledger snapshot exceeds byte allowance")
+
         dst = sqlite3.connect(dest)
         try:
-            src.backup(dst)
+            if max_bytes is None:
+                src.backup(dst)
+            else:
+                src.backup(dst, pages=256, progress=bounded_progress)
         finally:
             dst.close()
+        if max_bytes is not None and dest.stat().st_size > max_bytes:
+            raise ValueError("ledger snapshot exceeds byte allowance")
     finally:
         src.close()
 

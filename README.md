@@ -186,6 +186,20 @@ catalogue rebuild --verify --scratch /absolute/path/to/new/scratch
 catalogue rebuild --verify --scratch /absolute/path/to/scratch --resume
 ```
 
+For catalogue-scale recovery, add `--step` to each explicitly supervised invocation.
+The first invocation validates and seals the source; successive `--resume --step` invocations
+initialize, load, build and certify, then compare scratch. A successful paused phase reports
+`pending: true, matched: false`; completion requires `pending: false, matched: true` and all
+68 comparisons. `--step` requires a named scratch path. `make rebuild` accepts `REBUILD_STEP=1`.
+Each phase keeps its own finite deadline. Offline replay can likewise use separate supervised
+`load`, `dbt -- build`, `publish` and `verify` stages, with equal before/after semantic bindings.
+
+Version-2 rebuild checkpoints reference an immutable source-owned registration bound to the
+scratch path. Every resume and checkpoint verifies the original source seal, including raw and
+publication inventories, DuckDB/WAL, a consistent bounded SQLite snapshot, runtime, models and
+configuration. Generated jobs, logs and temporary files are excluded. Keep the source frozen.
+Older checkpoints and reused scratch registrations require a different fresh scratch path.
+
 The checksummed scratch record binds source location, verified publication, capture inventory,
 coverage, semantic content, model/normalization/runtime revisions, effective dbt variables and
 configuration. Resume validates that binding before changing state. Initialization may recover

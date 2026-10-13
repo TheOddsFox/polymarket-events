@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import platform
+import re
+import tempfile
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -13,9 +15,16 @@ from importlib.metadata import distributions
 from pathlib import Path
 from typing import Any
 
+from oddsfox_catalogue.backup import (
+    _inventory,
+    _safe_path,
+    _snapshot_ledger,
+    _stream_file,
+    _unique_object,
+)
 from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import rebuild_from_raw
-from oddsfox_catalogue.capture.writer import atomic_write_bytes, read_regular_bytes
+from oddsfox_catalogue.capture.writer import _fsync_dir, atomic_write_bytes, read_regular_bytes
 from oddsfox_catalogue.certification import (
     _model_revision,
     assert_build_valid,
@@ -29,6 +38,8 @@ from oddsfox_catalogue.limits import (
     _union_bytes,
     directory_bytes,
     enforce_storage_limits,
+    remaining_temp_bytes,
+    retained_bytes,
     temporary_bytes,
 )
 from oddsfox_catalogue.pipeline import dbt_stage, load_stage
@@ -47,6 +58,7 @@ from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT
 VERIFIED_TABLES = SEMANTIC_RELATIONS
 REBUILD_RECORD = "rebuild.json"
 REBUILD_RECORD_LIMIT = 64 * 1024**2
+REGISTRATIONS = "source-bindings"
 
 
 @dataclass
@@ -55,6 +67,7 @@ class RebuildReport:
     rebuilt_to: Path
     tables: dict[str, dict[str, Any]] = field(default_factory=dict)
     mismatches: list[str] = field(default_factory=list)
+    pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +125,7 @@ def _combined_limits(settings: Settings, rebuilt: Settings):
         settings.root,
         settings.data_dir,
         settings.state_dir,
+        settings.dlt_pipelines_dir,
         settings.warehouse_path,
         settings.warehouse_path.with_name(settings.warehouse_path.name + ".wal"),
         rebuilt.root,
@@ -157,8 +171,7 @@ def _runtime_revision():
     )
 
 
-def _source_binding(settings, *, query_settings=None):
-    query_settings = query_settings or settings
+def _source_configuration(settings):
     effective_vars = {}
     receipt = read_build_validity(settings)
     if receipt is not None and receipt["status"] == "valid":
@@ -187,6 +200,13 @@ def _source_binding(settings, *, query_settings=None):
             name: asdict(getattr(settings, name))
             for name in ("quality", "gamma", "load", "capture")
         },
+    }
+
+
+def _source_binding(settings, *, query_settings=None):
+    query_settings = query_settings or settings
+    return {
+        **_source_configuration(settings),
         "release": current_release(query_settings),
         "capture": capture_binding(query_settings),
         "warehouse": warehouse_snapshot(query_settings),
@@ -194,8 +214,126 @@ def _source_binding(settings, *, query_settings=None):
     }
 
 
-def _write_record(scratch, binding, phase):
-    record = {"revision": 1, "binding": binding, "phase": phase}
+def _source_seal(settings, *, query_settings=None):
+    """Exact evidence bytes plus a consistent SQLite snapshot, not a lock-based cache."""
+    query_settings = query_settings or settings
+    seal = {"context": _source_configuration(settings)}
+    for name, root in (("raw", settings.raw_dir), ("published", settings.published_dir)):
+        _safe_path(root)
+        if not root.exists():
+            seal[name] = None
+            continue
+        files, directories = _inventory(root)
+        seal[name] = json_descriptor(
+            {
+                "directories": directories,
+                "files": {
+                    name: _stream_file(root / name, max_bytes=size)
+                    for name, size in sorted(files.items())
+                },
+            }
+        )
+        if _inventory(root) != (files, directories):
+            raise ValueError("rebuild source inventory changed during sealing")
+    for name, path in (
+        ("warehouse", settings.warehouse_path),
+        ("warehouse_wal", settings.warehouse_path.with_name(settings.warehouse_path.name + ".wal")),
+    ):
+        _safe_path(path)
+        seal[name] = (
+            _stream_file(path, max_bytes=settings.capture.max_retained_bytes)
+            if path.exists()
+            else None
+        )
+    if seal["warehouse"] is None:
+        raise ValueError("rebuild source warehouse is missing")
+    _safe_path(settings.ledger_path)
+    estimate = settings.ledger_path.stat().st_size
+    wal = settings.ledger_path.with_name(settings.ledger_path.name + "-wal")
+    _safe_path(wal)
+    if wal.exists():
+        estimate += wal.stat().st_size
+    if estimate <= 0 or estimate > remaining_temp_bytes(query_settings):
+        raise ValueError("ledger snapshot exceeds temporary allowance")
+    enforce_storage_limits(query_settings, additional_bytes=estimate)
+    query_settings.temporary_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="rebuild-ledger-", dir=query_settings.temporary_dir
+    ) as d:
+        snapshot = Path(d) / "ledger.sqlite"
+        _snapshot_ledger(settings.ledger_path, snapshot, max_bytes=estimate)
+        enforce_storage_limits(query_settings)
+        seal["ledger"] = _stream_file(snapshot, max_bytes=estimate)
+    return seal
+
+
+def _source_query_settings(settings, rebuilt):
+    source_temporary = temporary_bytes(settings)
+    combined_temporary = _union_bytes(
+        (
+            settings.temporary_dir,
+            settings.dlt_pipelines_dir,
+            rebuilt.temporary_dir,
+            rebuilt.dlt_pipelines_dir,
+        )
+    )
+    source_retained = retained_bytes(settings)
+    combined_retained = _union_bytes(
+        (
+            settings.root,
+            settings.data_dir,
+            settings.state_dir,
+            settings.dlt_pipelines_dir,
+            settings.warehouse_path,
+            settings.warehouse_path.with_name(settings.warehouse_path.name + ".wal"),
+            rebuilt.root,
+        )
+    )
+    return replace(
+        settings,
+        capture=replace(
+            settings.capture,
+            max_temp_bytes=settings.capture.max_temp_bytes - combined_temporary + source_temporary,
+            max_retained_bytes=settings.capture.max_retained_bytes
+            - combined_retained
+            + source_retained,
+        ),
+    )
+
+
+def _registration_path(settings, scratch):
+    identity = hashlib.sha256(str(scratch).encode()).hexdigest()
+    return settings.state_dir / "rebuild" / REGISTRATIONS / f"{identity}.json", identity
+
+
+def _write_registration(settings, scratch, binding, seal):
+    path, identity = _registration_path(settings, scratch)
+    _safe_path(path)
+    value = {
+        "revision": 1,
+        "identity": identity,
+        "scratch": str(scratch),
+        "binding": binding,
+        "seal": seal,
+    }
+    body = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode()
+    if len(body) > REBUILD_RECORD_LIMIT:
+        raise ValueError("rebuild source registration exceeds byte allowance")
+    enforce_storage_limits(settings, additional_bytes=len(body))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_dir(path.parent)
+    return {"identity": identity, "sha256": hashlib.sha256(body).hexdigest()}
+
+
+def _write_record(scratch, registration, phase):
+    record = {"revision": 2, "registration": registration, "phase": phase}
     record["sha256"] = json_descriptor(record)["sha256"]
     body = (
         json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
@@ -205,28 +343,77 @@ def _write_record(scratch, binding, phase):
     atomic_write_bytes(scratch / REBUILD_RECORD, body)
 
 
-def _read_record(scratch, binding):
+def _read_record(scratch):
     record = json.loads(
         read_regular_bytes(
             scratch / REBUILD_RECORD, max_bytes=REBUILD_RECORD_LIMIT, trusted_root=scratch
-        )
+        ),
+        object_pairs_hook=_unique_object,
     )
-    if not isinstance(record, dict) or set(record) != {"revision", "binding", "phase", "sha256"}:
+    if not isinstance(record, dict) or set(record) != {
+        "revision",
+        "registration",
+        "phase",
+        "sha256",
+    }:
         raise ValueError("invalid rebuild record")
     digest = record.pop("sha256")
-    if type(record["revision"]) is not int or record["revision"] != 1:
-        raise ValueError("unsupported rebuild record revision")
+    if type(record["revision"]) is not int or record["revision"] != 2:
+        raise ValueError("unsupported rebuild record revision; use fresh scratch")
     if json_descriptor(record)["sha256"] != digest:
         raise ValueError("rebuild record checksum mismatch")
-    if record["binding"] != binding:
-        raise ValueError("rebuild source or runtime binding changed")
-    if record["phase"] not in {"initialization", "load", "build", "comparison", "complete"}:
+    if not isinstance(record["phase"], str) or record["phase"] not in {
+        "initialization",
+        "load",
+        "build",
+        "comparison",
+        "complete",
+    }:
         raise ValueError("invalid rebuild phase")
-    return record["phase"]
+    registration = record["registration"]
+    if (
+        not isinstance(registration, dict)
+        or set(registration) != {"identity", "sha256"}
+        or any(
+            not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v)
+            for v in registration.values()
+        )
+    ):
+        raise ValueError("invalid rebuild source registration reference")
+    return record
+
+
+def _validated_rebuild_source(settings, scratch, *, query_settings=None):
+    query_settings = query_settings or _source_query_settings(
+        settings, scratch_settings(settings, scratch)
+    )
+    record = _read_record(scratch)
+    path, identity = _registration_path(settings, scratch)
+    reference = record["registration"]
+    if reference["identity"] != identity:
+        raise ValueError("rebuild source registration belongs to another scratch")
+    body = read_regular_bytes(path, max_bytes=REBUILD_RECORD_LIMIT, trusted_root=settings.state_dir)
+    if hashlib.sha256(body).hexdigest() != reference["sha256"]:
+        raise ValueError("rebuild source registration checksum mismatch")
+    value = json.loads(body, object_pairs_hook=_unique_object)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"revision", "identity", "scratch", "binding", "seal"}
+        or type(value["revision"]) is not int
+        or value["revision"] != 1
+        or value["identity"] != identity
+        or value["scratch"] != str(scratch)
+        or not isinstance(value["binding"], dict)
+        or not isinstance(value["seal"], dict)
+    ):
+        raise ValueError("invalid rebuild source registration")
+    if _source_seal(settings, query_settings=query_settings) != value["seal"]:
+        raise ValueError("rebuild source or runtime binding changed")
+    return value["binding"], record["phase"], reference
 
 
 def rebuild_and_verify(
-    settings: Settings, *, scratch: Path | None = None, resume: bool = False
+    settings: Settings, *, scratch: Path | None = None, resume: bool = False, step: bool = False
 ) -> RebuildReport:
     """Require complete evidence and rebuild into a new root, never deleting prior work.
 
@@ -235,6 +422,8 @@ def rebuild_and_verify(
     enforce_storage_limits(settings)
     if resume and scratch is None:
         raise ValueError("rebuild resume requires an explicit scratch root")
+    if step and scratch is None:
+        raise ValueError("rebuild step requires an explicit scratch root")
     scratch = scratch or settings.state_dir / "rebuild" / uuid.uuid4().hex
     if any(path.is_symlink() for path in (scratch, *scratch.parents)):
         raise ValueError("scratch root contains a symlink")
@@ -252,6 +441,7 @@ def rebuild_and_verify(
             settings.warehouse_path,
             settings.published_dir,
             settings.dlt_pipelines_dir,
+            settings.state_dir / "rebuild" / REGISTRATIONS,
         )
     ]
     if any(path.is_relative_to(scratch) for path in protected) or any(
@@ -271,28 +461,23 @@ def rebuild_and_verify(
         raise ValueError("rebuild resume requires existing bound scratch")
     rebuilt = scratch_settings(settings, scratch)
     _combined_limits(settings, rebuilt)
-    source_temporary = temporary_bytes(settings)
-    combined_temporary = _union_bytes(
-        (
-            settings.temporary_dir,
-            settings.dlt_pipelines_dir,
-            rebuilt.temporary_dir,
-            rebuilt.dlt_pipelines_dir,
-        )
-    )
     # Scratch bytes constrain source reads, but do not change the persisted operation policy.
-    query_settings = replace(
-        settings,
-        capture=replace(
-            settings.capture,
-            max_temp_bytes=settings.capture.max_temp_bytes - combined_temporary + source_temporary,
-        ),
-    )
-    binding = _source_binding(settings, query_settings=query_settings)
+    query_settings = _source_query_settings(settings, rebuilt)
     if resume:
         # Reject unrelated/changed scratch before the lock can create any state files there.
-        _read_record(scratch, binding)
-    phase = "initialization"
+        binding, phase, registration = _validated_rebuild_source(
+            settings, scratch, query_settings=query_settings
+        )
+    else:
+        registration_path, _ = _registration_path(settings, scratch)
+        if registration_path.exists() or registration_path.is_symlink():
+            raise FileExistsError("rebuild source registration exists; use a fresh scratch path")
+        seal = _source_seal(settings, query_settings=query_settings)
+        binding = _source_binding(settings, query_settings=query_settings)
+        if _source_seal(settings, query_settings=query_settings) != seal:
+            raise ValueError("rebuild source changed during semantic validation")
+        registration = _write_registration(settings, scratch, binding, seal)
+        phase = "initialization"
     scratch.parent.mkdir(parents=True, exist_ok=True)
     if not resume:
         scratch.mkdir()
@@ -323,10 +508,15 @@ def rebuild_and_verify(
         ),
     )
     with run_lock(rebuilt.run_lock_path):
-        if resume:
-            phase = _read_record(scratch, binding)
-        else:
-            _write_record(scratch, binding, phase)
+        if not resume:
+            _write_record(scratch, registration, phase)
+            if step:
+                return RebuildReport(False, rebuilt.warehouse_path, pending=True)
+
+        def checkpoint(next_phase):
+            _validated_rebuild_source(settings, scratch)
+            _write_record(scratch, registration, next_phase)
+
         if phase == "initialization":
             if rebuilt.warehouse_path.exists():
                 raise ValueError("initializing scratch already contains a warehouse")
@@ -334,13 +524,17 @@ def rebuild_and_verify(
                 if ledger._one("SELECT 1 FROM pages WHERE loaded_at IS NOT NULL LIMIT 1"):
                     raise ValueError("initializing scratch already contains load checkpoints")
                 rebuild_from_raw(rebuilt, ledger)
-            _write_record(scratch, binding, "load")
+            checkpoint("load")
             phase = "load"
+            if step:
+                return RebuildReport(False, rebuilt.warehouse_path, pending=True)
         if phase == "load":
             load_stage(rebuilt)
             _combined_limits(settings, rebuilt)
-            _write_record(scratch, binding, "build")
+            checkpoint("build")
             phase = "build"
+            if step:
+                return RebuildReport(False, rebuilt.warehouse_path, pending=True)
         if phase == "build":
             arguments = ["build"]
             if binding.get("effective_vars"):
@@ -352,7 +546,9 @@ def rebuild_and_verify(
                     rebuilt.warehouse_path,
                     mismatches=[f"dbt build failed in scratch: {built.stdout[-1000:]}"],
                 )
-            _write_record(scratch, binding, "comparison")
+            checkpoint("comparison")
+            if step:
+                return RebuildReport(False, rebuilt.warehouse_path, pending=True)
         receipt = assert_build_valid(rebuilt)
         fresh_warehouse = receipt["binding"]["warehouse"]
         fresh_published = receipt["binding"]["published"]
@@ -360,7 +556,7 @@ def rebuild_and_verify(
         _combined_limits(settings, rebuilt)
         report = _compare(rebuilt, binding, fresh_warehouse, fresh_published, fresh_capture)
         if report.matched:
-            _write_record(scratch, binding, "complete")
+            checkpoint("complete")
         _combined_limits(settings, rebuilt)
         return report
 

@@ -264,11 +264,14 @@ def _cmd_rebuild(args: argparse.Namespace) -> int:
     """Rebuild from raw in a scratch area and compare fingerprints with the live warehouse."""
     settings = load_settings()
     with run_lock(settings.run_lock_path):
-        report = rebuild_and_verify(settings, scratch=args.scratch, resume=args.resume)
+        report = rebuild_and_verify(
+            settings, scratch=args.scratch, resume=args.resume, step=args.step
+        )
     print(
         json.dumps(
             {
                 "matched": report.matched,
+                "pending": report.pending,
                 "rebuilt_to": str(report.rebuilt_to),
                 "tables": report.tables,
                 "mismatches": report.mismatches,
@@ -277,7 +280,7 @@ def _cmd_rebuild(args: argparse.Namespace) -> int:
             default=str,
         )
     )
-    return 0 if report.matched else 4
+    return 0 if report.matched or report.pending else 4
 
 
 def _cmd_status(_: argparse.Namespace) -> int:
@@ -471,6 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rebuild.add_argument("--scratch", type=Path, help="explicit fresh or resumable scratch root")
     rebuild.add_argument("--resume", action="store_true", help="resume only bound explicit scratch")
+    rebuild.add_argument("--step", action="store_true", help="run one verified recovery phase")
     rebuild.set_defaults(handler=_cmd_rebuild)
     return parser
 

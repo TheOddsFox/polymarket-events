@@ -75,4 +75,4 @@ restore-backup:
 
 # Rebuild from raw in a scratch area and compare table fingerprints with the live warehouse.
 rebuild:
-	$(CATALOGUE) rebuild --verify $(if $(SCRATCH),--scratch "$(SCRATCH)") $(if $(REBUILD_RESUME),--resume)
+	$(CATALOGUE) rebuild --verify $(if $(SCRATCH),--scratch "$(SCRATCH)") $(if $(REBUILD_RESUME),--resume) $(if $(REBUILD_STEP),--step)

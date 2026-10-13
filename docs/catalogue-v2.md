@@ -94,6 +94,14 @@ Backup restoration verifies every inventoried file before copying into a fresh r
 Explicit `rebuild --verify --scratch PATH --resume` uses a bounded, checksummed phase record.
 It revalidates source inventory, release, content, runtime, models and configuration, preserves
 committed load checkpoints, and requires complete scratch certification before comparing rows.
+Version-2 progress records reference the immutable original binding and byte seal under the
+source's `.state/rebuild/source-bindings`; the registration is bound to the canonical scratch
+path and cannot be replaced for a reused path. Each resumed phase verifies evidence bytes,
+consistent SQLite state including committed WAL, runtime, models and declared configuration
+before work and checkpoint commit. Owned temporary SQLite snapshots obey the same resource caps.
+`--step` separates source validation, initialization, load, full build/certification and full
+comparison into finite invocations. Pending phases explicitly report no semantic match; all
+68 comparisons remain required for completion. Old records fail closed and need fresh scratch.
 This does not change the public contract or digest revision. Trusted backup verification/restore
 allowances may be supplied through `--max-retained-bytes`; defaults stay 64 GiB and manifests cannot
 raise the caller's allowance. Version-2 backup JSON is compact and bounded to 128 MiB.
