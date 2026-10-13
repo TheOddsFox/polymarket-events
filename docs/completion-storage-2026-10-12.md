@@ -13,7 +13,7 @@ view definitions fail closed. Interrupted loads repair missing views before chec
 existing observations or committing page checkpoints.
 
 Market staging, market history and current markets are views, avoiding additional physical
-copies of the retained observations. Their queries, columns and observation grain are unchanged.
+copies of the retained observations. Their columns, semantic values and observation grain are unchanged.
 Loads still invalidate build certification; a subset build cannot publish. The public
 `catalogue.v2` and `metadata.v1` contracts are unchanged.
 
@@ -82,8 +82,28 @@ No payloads have been removed from catalogue-wide roots.
 
 The retained raw inventory was copied into a fresh owned v4 root and its ledger reconstructed:
 140,055 files, 4,284,587,741 bytes, 69,954 original page identities and 146 complete scans.
-All capture fields match the old ledger, which remains unchanged. Bootstrap loading is now
-running offline. Daily/reconcile collection, complete recovery, the final `data/catalogue`
+All capture fields match the old ledger, which remains unchanged. All bootstrap pages are now
+loaded: 1,138,596 event observations, 8,597,758 market observations and zero malformed-record
+quarantines. The first full build hit the unchanged `2GB` DuckDB memory limit; required models
+and tests failed, so the warehouse remains dirty and no catalogue-wide release was published.
+The failed invocation was stopped through the supported signal and its children reaped;
+the loaded checkpoints and raw evidence remain intact.
+
+A market-only staging change reads the existing field columns directly, avoiding full JSON
+reconstruction for narrow queries. Scalars use root JSON string extraction, and collections
+use root JSON extraction to preserve Unicode rendering and JSON-null distinctions. The original
+logical views remain unchanged; full semantic snapshots now validate their canonical definitions.
+Writable recovery of a missing view remains a loader responsibility.
+
+The paired retained-input benchmark used 15,621 market observations, `2GB`, two threads and no
+disk spill. Both staging views had the same 47-column schema and exact row digest:
+`c35c1d30ff738a6939e8c397da9ef171817fc44744ada6f8d929b926311434b2`.
+Full projections took 0.572 versus 0.403 seconds; median hash-null checks took 0.131 versus
+0.00132 seconds. Peak process memory was 516,472,832 B. These small, concurrent-build timings
+do not establish full-scale speed or memory fit. Installed, live and full-catalogue acceptance
+must pass for changed production bytes before adoption.
+
+Daily/reconcile collection, complete recovery, the final `data/catalogue`
 and catalogue-wide cleanup remain incomplete. Commit `6b796ab` passed hosted CI, including
 the installed offline workflow; subsequent production edits require their own gates. Do not
 claim the bounded smoke proves operational completion. Measure full build/certification

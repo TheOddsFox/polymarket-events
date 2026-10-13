@@ -36,6 +36,7 @@ sources:
               - not_null
 
       - name: market_observations
+        identifier: market_observations_values
         description: One row per market observed on one page, embedded or direct.
         meta:
           dagster:

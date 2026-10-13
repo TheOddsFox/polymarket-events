@@ -1,5 +1,6 @@
 """Real builds bind all semantic relations and refuse stale, partial and changed state."""
 
+import hashlib
 from dataclasses import replace
 
 import duckdb
@@ -13,8 +14,10 @@ from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.runner import run_capture
 from oddsfox_catalogue.certification import BuildInvalid, assert_build_valid, read_build_validity
 from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
-from oddsfox_catalogue.pipeline import dbt_stage
-from oddsfox_catalogue.semantics import SEMANTIC_RELATIONS
+from oddsfox_catalogue.pipeline import dbt_stage, publish_stage
+from oddsfox_catalogue.publish import CURRENT_POINTER, PublishBlocked, verify_release
+from oddsfox_catalogue.rebuild import rebuild_and_verify
+from oddsfox_catalogue.semantics import SEMANTIC_RELATIONS, warehouse_snapshot
 from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT
 
 
@@ -72,6 +75,99 @@ def test_processing_metadata_and_invocation_snapshots_are_not_semantic(certified
             "INSERT INTO marts.catalogue_snapshots SELECT * FROM marts.catalogue_snapshots"
         )
     assert_build_valid(settings)
+
+
+def test_canonical_logical_view_check_is_read_only(certified_root, tmp_path):
+    settings = copy_built(certified_root, tmp_path)
+    before = hashlib.sha256(settings.warehouse_path.read_bytes()).hexdigest()
+    original = warehouse_snapshot(settings)
+    assert warehouse_snapshot(settings) == original
+    assert hashlib.sha256(settings.warehouse_path.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["altered-market", "altered-event", "missing-market", "corrupt-unused-field"],
+)
+def test_physical_staging_cannot_bypass_logical_evidence_integrity(
+    certified_root, tmp_path, damage
+):
+    settings = copy_built(certified_root, tmp_path)
+    release = publish_stage(settings)
+    pointer = (settings.published_dir / CURRENT_POINTER).read_bytes()
+    with duckdb.connect(str(settings.warehouse_path)) as connection:
+        if damage == "altered-market":
+            connection.execute(
+                "CREATE OR REPLACE VIEW bronze.market_observations AS "
+                "SELECT * REPLACE ('altered' AS payload_hash) FROM bronze.market_observations_values"
+            )
+        elif damage == "altered-event":
+            connection.execute(
+                "CREATE OR REPLACE VIEW bronze.event_observations AS "
+                "SELECT * REPLACE ('altered' AS payload_hash) FROM bronze.event_observations_values"
+            )
+        elif damage == "missing-market":
+            connection.execute("DROP VIEW bronze.market_observations")
+        else:
+            connection.execute(
+                "UPDATE bronze.market_observations_values SET n_capture_id='{bad-json'"
+            )
+            assert connection.execute(
+                "SELECT count(*) FROM staging.stg_gamma__market_observations "
+                "WHERE semantic_hash IS NULL"
+            ).fetchone() == (0,)
+
+    before = hashlib.sha256(settings.warehouse_path.read_bytes()).hexdigest()
+    with pytest.raises(BuildInvalid):
+        assert_build_valid(settings)
+    with pytest.raises(PublishBlocked):
+        publish_stage(settings)
+    scratch = tmp_path / "reject-damaged-source"
+    with pytest.raises(
+        (ValueError, duckdb.Error), match="view does not match|read-only|Malformed JSON"
+    ):
+        rebuild_and_verify(settings, scratch=scratch)
+    assert not scratch.exists()
+    assert (settings.published_dir / CURRENT_POINTER).read_bytes() == pointer
+    assert hashlib.sha256(settings.warehouse_path.read_bytes()).hexdigest() == before
+    verify_release(settings, release.path)
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM duckdb_views() WHERE view_name='_catalogue_expected_observation_view'"
+        ).fetchone() == (0,)
+        if damage == "missing-market":
+            assert connection.execute(
+                "SELECT count(*) FROM duckdb_views() WHERE schema_name='bronze' "
+                "AND view_name='market_observations'"
+            ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("damage", ["altered-market", "corrupt-unused-field"])
+def test_complete_physical_source_build_cannot_certify_damaged_logical_evidence(
+    certified_root, tmp_path, damage
+):
+    settings = copy_built(certified_root, tmp_path)
+    release = publish_stage(settings)
+    pointer = (settings.published_dir / CURRENT_POINTER).read_bytes()
+    with duckdb.connect(str(settings.warehouse_path)) as connection:
+        if damage == "altered-market":
+            connection.execute(
+                "CREATE OR REPLACE VIEW bronze.market_observations AS "
+                "SELECT * FROM bronze.market_observations_values"
+            )
+        else:
+            connection.execute(
+                "UPDATE bronze.market_observations_values SET n_capture_id='{bad-json'"
+            )
+    with pytest.raises((ValueError, duckdb.Error), match="view does not match|Malformed JSON"):
+        dbt_stage(settings, ["build"])
+    assert read_build_validity(settings)["status"] == "dirty"
+    with pytest.raises(BuildInvalid, match="dirty"):
+        assert_build_valid(settings)
+    with pytest.raises(PublishBlocked):
+        publish_stage(settings)
+    assert (settings.published_dir / CURRENT_POINTER).read_bytes() == pointer
+    verify_release(settings, release.path)
 
 
 def test_changed_quality_requires_new_certification(certified_root, tmp_path):

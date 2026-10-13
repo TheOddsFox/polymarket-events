@@ -12,6 +12,7 @@ from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.contract import projection_queries
 from oddsfox_catalogue.fingerprints import semantic_fingerprint
 from oddsfox_catalogue.limits import enforce_storage_limits, remaining_temp_bytes
+from oddsfox_catalogue.load.storage import ensure_observation_views
 
 SEMANTIC_RELATIONS = (
     "bronze.event_observations",
@@ -138,6 +139,7 @@ def semantic_query(connection, relation: str) -> str:
 
 def warehouse_snapshot(settings: Settings):
     with bounded_connection(settings) as connection:
+        ensure_observation_views(connection, settings.load.dataset_name)
         return {
             "schemas": {
                 relation: relation_schema(connection, relation)

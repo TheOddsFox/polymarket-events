@@ -1,8 +1,9 @@
-"""Batched extraction must retain the original 47-column SQL projection."""
+"""Characterize logical extraction and the equivalent physical-field staging view."""
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,9 +11,12 @@ import duckdb
 import pytest
 from jinja2 import StrictUndefined, Template
 
+from oddsfox_catalogue.load.source import market_columns, stored_columns
+from oddsfox_catalogue.load.storage import MARKET_FIELDS, ensure_observation_views, stored_row
 from oddsfox_catalogue.resources import dbt_project_dir
 
 REFERENCE = Path(__file__).resolve().parents[1] / "fixtures/dbt/market_stage_individual_paths.sql"
+BATCHED_REFERENCE = REFERENCE.with_name("market_stage_batched_paths.sql")
 
 
 def _record():
@@ -54,10 +58,10 @@ def _record():
     }
 
 
-def _render(text):
+def _render(text, source_table="market_observations"):
     def source(schema, name):
         assert (schema, name) == ("bronze", "market_observations")
-        return "market_observations"
+        return source_table
 
     def ref(name):
         assert name == "stg_gamma__batches"
@@ -72,11 +76,7 @@ def _render(text):
 def queries():
     return (
         _render(REFERENCE.read_text()),
-        _render(
-            dbt_project_dir()
-            .joinpath("models/staging/stg_gamma__market_observations.sql")
-            .read_text()
-        ),
+        _render(BATCHED_REFERENCE.read_text()),
     )
 
 
@@ -225,3 +225,166 @@ def test_malformed_json_and_invalid_casts_fail_for_both_queries(
     for query in queries:
         with pytest.raises(exception, match=message):
             connection.execute(query).fetchall()
+
+
+@pytest.fixture(scope="module")
+def stored_queries():
+    return (
+        _render(BATCHED_REFERENCE.read_text(), "bronze.market_observations"),
+        _render(
+            dbt_project_dir()
+            .joinpath("models/staging/stg_gamma__market_observations.sql")
+            .read_text(),
+            "bronze.market_observations_values",
+        ),
+    )
+
+
+@pytest.fixture
+def stored_connection():
+    with duckdb.connect(
+        ":memory:", config={"threads": 1, "memory_limit": "64MiB", "max_temp_directory_size": "0B"}
+    ) as con:
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute("CREATE SCHEMA bronze")
+        hints = stored_columns(market_columns(), MARKET_FIELDS)
+        types = {"text": "VARCHAR", "timestamp": "TIMESTAMPTZ"}
+        definitions = ", ".join(
+            f'"{key}" {types[hint["data_type"]]}' + (" NOT NULL" if not hint["nullable"] else "")
+            for key, hint in hints.items()
+        )
+        con.execute(f"CREATE TABLE bronze.market_observations_values ({definitions})")
+        con.execute("CREATE TABLE batches (batch_id VARCHAR, batch_loaded_at TIMESTAMPTZ)")
+        con.execute("INSERT INTO batches VALUES ('batch-1', '2026-10-10T11:00:00Z')")
+        ensure_observation_views(con, "bronze")
+        yield con
+
+
+def _insert_stored(connection, record, *, observation_id="observation-1", batch_id="batch-1"):
+    row = {
+        "observation_id": observation_id,
+        "venue": "polymarket",
+        "entity_id": "201",
+        "batch_id": batch_id,
+        "page_id": "page-1",
+        "observed_at": datetime(2026, 10, 10, 10, tzinfo=UTC),
+        "source_updated_at": None,
+        "endpoint": "/markets/201",
+        "payload_hash": "source-hash",
+        "source_kind": "market_direct",
+        "json_pointer": "/markets/0",
+        "normalized": {**dict.fromkeys(MARKET_FIELDS), **record},
+    }
+    physical = stored_row(row, MARKET_FIELDS)
+    columns = ", ".join(f'"{key}"' for key in physical)
+    connection.execute(
+        f"INSERT INTO bronze.market_observations_values ({columns}) VALUES "
+        f"({', '.join('?' for _ in physical)})",
+        list(physical.values()),
+    )
+
+
+def _stored_equivalent(connection, queries):
+    rows = _equivalent(connection, queries)
+    schemas = []
+    for index, query in enumerate(queries):
+        name = f"model_{index}"
+        connection.execute(f"CREATE OR REPLACE TEMP VIEW {name} AS {query}")
+        schemas.append(
+            connection.execute(
+                "SELECT column_name,data_type,is_nullable FROM information_schema.columns "
+                "WHERE table_name=? ORDER BY ordinal_position",
+                [name],
+            ).fetchall()
+        )
+    assert schemas[0] == schemas[1]
+    assert len(schemas[0]) == 47
+    return rows
+
+
+def test_direct_fields_preserve_projection_schema_provenance_and_batch_filter(
+    stored_connection, stored_queries
+):
+    record = _record()
+    record.update(market_id="different-id", venue="different-venue", source_kind="different-kind")
+    for observation_id in ("observation-1", "observation-2"):
+        _insert_stored(stored_connection, record, observation_id=observation_id)
+    _insert_stored(stored_connection, record, observation_id="unregistered", batch_id="not-loaded")
+    rows = _stored_equivalent(stored_connection, stored_queries)
+    assert [row["observation_id"] for row in rows] == ["observation-1", "observation-2"]
+    for row in rows:
+        assert (row["market_id"], row["venue"], row["source_kind"]) == (
+            "201",
+            "polymarket",
+            "market_direct",
+        )
+        assert row["source_updated_at"] is None
+        assert row["question"] == record["question"]
+        for key in ("tick_size", "minimum_order_size", "volume", "liquidity"):
+            assert row[key] == record[key]
+        assert row["end_at"] == row["end_date"]
+
+
+@pytest.mark.parametrize("key", list(_record()))
+def test_direct_fields_preserve_explicit_normalized_nulls(stored_connection, stored_queries, key):
+    record = _record()
+    record[key] = None
+    _insert_stored(stored_connection, record)
+    _stored_equivalent(stored_connection, stored_queries)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["outcomes", "raw_outcomes", "raw_clob_token_ids", "raw_position_ids", "tags", "memberships"],
+)
+@pytest.mark.parametrize(
+    "value", [[], "[]", ["雪", None, 'quote"\\line\n'], {"nested": ["雪", 1, 1e-17, None]}]
+)
+def test_direct_json_preserves_unicode_nulls_order_and_raw_string_distinction(
+    stored_connection, stored_queries, key, value
+):
+    record = _record()
+    record[key] = value
+    _insert_stored(stored_connection, record)
+    _stored_equivalent(stored_connection, stored_queries)
+
+
+@pytest.mark.parametrize(
+    "key,value,message",
+    [
+        ("active", "bad-bool", "BOOL"),
+        ("closed", [True], "BOOL"),
+        ("created_at", "bad-date", "timestamp"),
+        ("end_at", {"year": 2026}, "timestamp"),
+    ],
+)
+def test_direct_fields_reject_invalid_casts(stored_connection, stored_queries, key, value, message):
+    record = _record()
+    record[key] = value
+    _insert_stored(stored_connection, record)
+    for query in stored_queries:
+        with pytest.raises(duckdb.ConversionException, match=message):
+            stored_connection.execute(query).fetchall()
+
+
+def test_narrow_hash_query_prunes_unrelated_fields_without_hiding_full_evidence_corruption(
+    stored_connection, stored_queries
+):
+    _insert_stored(stored_connection, _record())
+    stored_connection.execute(
+        "UPDATE bronze.market_observations_values SET n_capture_id='{bad-json'"
+    )
+    query = f"SELECT count(*) FROM ({stored_queries[1]}) WHERE semantic_hash IS NULL"
+    assert stored_connection.execute(query).fetchone() == (0,)
+    pending = json.loads(stored_connection.execute("EXPLAIN (FORMAT JSON) " + query).fetchone()[1])
+    scanned = []
+    while pending:
+        node = pending.pop()
+        pending.extend(node["children"])
+        if node.get("extra_info", {}).get("Table", "").endswith("market_observations_values"):
+            projections = node["extra_info"]["Projections"]
+            scanned.extend(projections if isinstance(projections, list) else [projections])
+            scanned.extend(re.findall(r"\bn_[a-z_]+\b", str(node["extra_info"].get("Filters", ""))))
+    assert set(scanned) == {"batch_id", "n_semantic_hash"}
+    with pytest.raises(duckdb.ConversionException, match="Malformed JSON"):
+        stored_connection.execute("SELECT normalized FROM bronze.market_observations").fetchall()

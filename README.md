@@ -244,6 +244,13 @@ The same-page direct-market benchmark measured 67.0 versus 40.5 seconds and iden
 this does not establish full-catalogue throughput. Event batching showed only a 4% gain with higher
 memory use, so event, refresh, reconcile and raw-rebuild acceptance stays at 50.
 
+Market staging reads the stored JSON fields directly, preserving its 47-column projection
+and registered-batch filter. Full semantic snapshots also validate the original logical bronze
+view definitions before certification and recovery. A paired 15,621-observation benchmark
+matched every staging value and view schema; the narrow hash check improved about 100 times,
+while the full projection improved about 1.4 times. Neither measurement proves catalogue-wide
+build speed or memory fit. The query used `2GB`, two threads and zero disk spill.
+
 ## Layout
 
 - `src/oddsfox_catalogue/`: capture, load, dbt runner, publish, rebuild, backup, Dagster definitions, CLI.
