@@ -227,6 +227,12 @@ there. Daily/reconcile captures use the approved 10 requests/second; other comma
 Committed defaults remain 64/8 GiB. Storage measurements are points, not atomic filesystem snapshots;
 an exhausted invocation fails and is not acceptance evidence. A stopped command may retain partial work.
 
+Before launch, the supervisor reserves temporary usage in unrelated roots and gives the
+child the remaining operation allowance. Explicit rebuild scratch shares that allowance;
+source fingerprinting reserves existing scratch jobs without changing the bound resume
+configuration. Reports record the child allowance separately from the global 32 GiB cap.
+Keep other roots quiescent during these manually operated acceptance invocations.
+
 An explicit batch's native market-source pages can be loaded separately:
 
 ```sh

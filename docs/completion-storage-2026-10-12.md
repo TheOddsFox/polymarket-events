@@ -80,6 +80,15 @@ source-bound raw rebuild and before backup. The pinned dlt cleanup method passed
 replay and interruption checks; failed, pending and unacknowledged packages remain protected.
 No payloads have been removed from catalogue-wide roots.
 
+Acceptance admission reserves unrelated temporary usage before launching each child.
+Configured source and explicit scratch temporary directories join the same global inventory,
+with nested paths counted once. Source fingerprinting also reserves existing scratch jobs;
+that transient read allowance does not replace the operation configuration bound on resume.
+The global cap remains 32 GiB, and reports expose the child operation allowance. Other roots
+must remain quiescent during the sequential acceptance run. Earlier periodic-only monitoring
+had no measured cap violation, but did not prevent a child from allocating space occupied
+by unrelated roots.
+
 The retained raw inventory was copied into a fresh owned v4 root and its ledger reconstructed:
 140,055 files, 4,284,587,741 bytes, 69,954 original page identities and 146 complete scans.
 All capture fields match the old ledger, which remains unchanged. All bootstrap pages are now

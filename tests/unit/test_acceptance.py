@@ -27,6 +27,103 @@ def test_combined_storage_counts_sibling_roots_and_temp_once(tmp_path, monkeypat
         acceptance.storage(tmp_path)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("custom_state", [False, True])
+def test_child_temp_quota_reserves_other_roots_and_stays_stable_as_scratch_grows(
+    tmp_path, monkeypatch, nested, custom_state
+):
+    monkeypatch.setattr(acceptance, "FREE_RESERVE", 0)
+    monkeypatch.setattr(acceptance, "TEMP_LIMIT", 100)
+    root = tmp_path / "source"
+    state = root / ("custom-state" if custom_state else ".state")
+    if custom_state:
+        (root / "config").mkdir(parents=True)
+        (root / "config/catalogue.toml").write_text('[paths]\nstate_dir="custom-state"\n')
+    own = state / "tmp"
+    own.mkdir(parents=True)
+    (own / "source-spill").write_bytes(b"s" * 10)
+    other = tmp_path / "other" / ".state" / "dlt"
+    other.mkdir(parents=True)
+    (other / "jobs").write_bytes(b"o" * 40)
+    scratch = state / "rebuild" / "proof" if nested else tmp_path / "scratch"
+    jobs = scratch / ".state" / "dlt"
+    jobs.mkdir(parents=True)
+    (jobs / "job").write_bytes(b"x" * 20)
+    environments = []
+
+    class Process:
+        pid = 12345
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def launch(*args, env, **kwargs):
+        environments.append(env)
+        return Process()
+
+    monkeypatch.setattr(acceptance.subprocess, "Popen", launch)
+    arguments = ["rebuild", "--verify", "--scratch", str(scratch), "--resume"]
+    assert acceptance.run(tmp_path, root, arguments) == 0
+    (jobs / "job").write_bytes(b"x" * 30)
+    assert acceptance.run(tmp_path, root, arguments) == 0
+    reports = [
+        json.loads(path.read_bytes())
+        for path in (tmp_path / "completion-proof").glob("*/report.json")
+    ]
+    assert sorted(report["before"]["temporary_bytes"] for report in reports) == [70, 80]
+    assert [env["CATALOGUE_CAPTURE_MAX_TEMP_BYTES"] for env in environments] == ["60", "60"]
+    assert all(report["operator_temporary_allowance_bytes"] == 60 for report in reports)
+    assert all(report["max_temp_bytes"] == 100 for report in reports)
+    assert all(env["CATALOGUE_LOAD_DUCKDB_MEMORY_LIMIT"] == "2GB" for env in environments)
+    assert all(env["CATALOGUE_LOAD_DUCKDB_THREADS"] == "2" for env in environments)
+
+
+def test_exhausted_other_root_temp_budget_does_not_launch(tmp_path, monkeypatch):
+    monkeypatch.setattr(acceptance, "FREE_RESERVE", 0)
+    monkeypatch.setattr(acceptance, "TEMP_LIMIT", 10)
+    jobs = tmp_path / "other" / ".state" / "dlt"
+    jobs.mkdir(parents=True)
+    (jobs / "job").write_bytes(b"x" * 10)
+    monkeypatch.setattr(
+        acceptance.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("launched")
+    )
+    with pytest.raises(ValueError, match="temporary allowance exhausted"):
+        acceptance.run(tmp_path, tmp_path / "source", ["status"])
+    assert not (tmp_path / "completion-proof").exists()
+
+
+def test_configured_temporary_paths_cannot_escape_workspace(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    (root / "config").mkdir(parents=True)
+    outside = tmp_path.parent / "outside-state"
+    (root / "config/catalogue.toml").write_text(
+        "[paths]\nstate_dir=" + json.dumps(str(outside)) + "\n"
+    )
+    monkeypatch.setattr(
+        acceptance.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("launched")
+    )
+    with pytest.raises(ValueError, match="inside.*workspace"):
+        acceptance.run(tmp_path, root, ["status"])
+    assert not outside.exists()
+
+
+def test_explicit_temporary_union_deduplicates_nested_and_repeated_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(acceptance, "FREE_RESERVE", 0)
+    custom = tmp_path / "custom"
+    nested = custom / "nested"
+    nested.mkdir(parents=True)
+    (custom / "first").write_bytes(b"a" * 10)
+    (nested / "second").write_bytes(b"b" * 20)
+    assert (
+        acceptance.storage(tmp_path, temporary_paths=(custom, nested, custom))["temporary_bytes"]
+        == 30
+    )
+
+
 @pytest.mark.parametrize("duration", [float("nan"), float("inf"), 0, -1, 14401, True])
 def test_invalid_deadlines_cannot_launch_a_child(tmp_path, duration):
     with pytest.raises(ValueError, match="finite"):
@@ -242,7 +339,7 @@ def test_restore_reservation_uses_parsed_path_when_options_precede_backup(tmp_pa
     (backup / "member").write_bytes(b"x" * 1000)
     observed = []
 
-    def storage(workspace, *, additional_bytes=0):
+    def storage(workspace, *, additional_bytes=0, temporary_paths=()):
         observed.append(additional_bytes)
         raise ValueError("stop after measured preflight")
 

@@ -157,7 +157,8 @@ def _runtime_revision():
     )
 
 
-def _source_binding(settings):
+def _source_binding(settings, *, query_settings=None):
+    query_settings = query_settings or settings
     effective_vars = {}
     receipt = read_build_validity(settings)
     if receipt is not None and receipt["status"] == "valid":
@@ -186,10 +187,10 @@ def _source_binding(settings):
             name: asdict(getattr(settings, name))
             for name in ("quality", "gamma", "load", "capture")
         },
-        "release": current_release(settings),
-        "capture": capture_binding(settings),
-        "warehouse": warehouse_snapshot(settings),
-        "published": published_snapshot(settings),
+        "release": current_release(query_settings),
+        "capture": capture_binding(query_settings),
+        "warehouse": warehouse_snapshot(query_settings),
+        "published": published_snapshot(query_settings),
     }
 
 
@@ -268,7 +269,26 @@ def rebuild_and_verify(
         raise ValueError("scratch root overlaps protected source evidence")
     if resume and not scratch.is_dir():
         raise ValueError("rebuild resume requires existing bound scratch")
-    binding = _source_binding(settings)
+    rebuilt = scratch_settings(settings, scratch)
+    _combined_limits(settings, rebuilt)
+    source_temporary = temporary_bytes(settings)
+    combined_temporary = _union_bytes(
+        (
+            settings.temporary_dir,
+            settings.dlt_pipelines_dir,
+            rebuilt.temporary_dir,
+            rebuilt.dlt_pipelines_dir,
+        )
+    )
+    # Scratch bytes constrain source reads, but do not change the persisted operation policy.
+    query_settings = replace(
+        settings,
+        capture=replace(
+            settings.capture,
+            max_temp_bytes=settings.capture.max_temp_bytes - combined_temporary + source_temporary,
+        ),
+    )
+    binding = _source_binding(settings, query_settings=query_settings)
     if resume:
         # Reject unrelated/changed scratch before the lock can create any state files there.
         _read_record(scratch, binding)

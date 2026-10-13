@@ -3,7 +3,7 @@
 import json
 import subprocess
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -52,7 +52,7 @@ def recovery(tmp_path, monkeypatch):
         step("comparison")
         return {"binding": binding}
 
-    monkeypatch.setattr(rebuild, "_source_binding", lambda settings: binding)
+    monkeypatch.setattr(rebuild, "_source_binding", lambda settings, **kwargs: binding)
     monkeypatch.setattr(rebuild, "VERIFIED_TABLES", ("core.rows",))
     monkeypatch.setattr(rebuild, "rebuild_from_raw", initialize)
     monkeypatch.setattr(rebuild, "load_stage", load)
@@ -95,6 +95,63 @@ def test_changed_binding_is_rejected_without_resetting_loaded_scratch(recovery, 
     assert counts == prior
     assert (scratch / rebuild.REBUILD_RECORD).read_bytes() == before
     assert (scratch / "loaded-unit").read_bytes() == b"committed"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_scratch_temp_growth_reserves_source_reads_without_changing_resume_policy(
+    recovery, tmp_path, monkeypatch, nested
+):
+    source, binding, _, fault = recovery
+    source = replace(source, capture=replace(source.capture, max_temp_bytes=100))
+    source.temporary_dir.mkdir(parents=True)
+    (source.temporary_dir / "source-spill").write_bytes(b"s" * 10)
+    scratch = source.state_dir / "rebuild" / "proof" if nested else tmp_path / "proof"
+    allowances = []
+
+    def source_binding(settings, *, query_settings):
+        allowances.append(query_settings.capture.max_temp_bytes)
+        return {**binding, "configuration": {"capture": asdict(settings.capture)}}
+
+    monkeypatch.setattr(rebuild, "_source_binding", source_binding)
+    fault["phase"] = "build"
+    with pytest.raises(RuntimeError, match="build"):
+        rebuild.rebuild_and_verify(source, scratch=scratch)
+    jobs = scratch / ".state" / "dlt"
+    jobs.mkdir(parents=True)
+    (jobs / "job").write_bytes(b"j" * 20)
+    assert rebuild.rebuild_and_verify(source, scratch=scratch, resume=True).matched
+    (jobs / "job").write_bytes(b"j" * 30)
+    assert rebuild.rebuild_and_verify(source, scratch=scratch, resume=True).matched
+    assert allowances == [100, 80, 70]
+    record = json.loads((scratch / rebuild.REBUILD_RECORD).read_bytes())
+    assert record["binding"]["configuration"]["capture"]["max_temp_bytes"] == 100
+    changed = replace(source, capture=replace(source.capture, max_temp_bytes=99))
+    before = (scratch / rebuild.REBUILD_RECORD).read_bytes()
+    with pytest.raises(ValueError, match="binding changed"):
+        rebuild.rebuild_and_verify(changed, scratch=scratch, resume=True)
+    assert (scratch / rebuild.REBUILD_RECORD).read_bytes() == before
+
+
+def test_source_binding_uses_query_allowance_but_retains_declared_configuration(
+    tmp_path, monkeypatch
+):
+    source = Settings(tmp_path)
+    queried = replace(source, capture=replace(source.capture, max_temp_bytes=1234))
+    calls = []
+    monkeypatch.setattr(rebuild, "read_build_validity", lambda settings: None)
+    monkeypatch.setattr(rebuild, "_runtime_revision", lambda: "runtime")
+    monkeypatch.setattr(rebuild, "_model_revision", lambda settings: "model")
+
+    def read(settings):
+        calls.append(settings)
+        return {"evidence": "unchanged"}
+
+    for name in ("current_release", "capture_binding", "warehouse_snapshot", "published_snapshot"):
+        monkeypatch.setattr(rebuild, name, read)
+    binding = rebuild._source_binding(source, query_settings=queried)
+    assert calls == [queried] * 4
+    assert binding["configuration"]["capture"] == asdict(source.capture)
+    assert binding["configuration"]["load"] == asdict(source.load)
 
 
 def test_record_tampering_fails_before_stage_mutation(recovery, tmp_path):

@@ -16,7 +16,7 @@ from oddsfox_catalogue.capture.writer import atomic_write_bytes
 from oddsfox_catalogue.cli import _install_termination_handlers, build_parser
 from oddsfox_catalogue.config import load_settings
 from oddsfox_catalogue.limits import _union_bytes
-from oddsfox_catalogue.rebuild import _runtime_revision
+from oddsfox_catalogue.rebuild import _runtime_revision, scratch_settings
 from oddsfox_catalogue.signals import SIGNALS, Terminated
 
 RETAINED_LIMIT = 256 * 1024**3
@@ -35,9 +35,9 @@ def confined(path, workspace):
     return path
 
 
-def storage(workspace, *, additional_bytes=0):
+def storage(workspace, *, additional_bytes=0, temporary_paths=()):
     used = _union_bytes((workspace,))
-    temporary = []
+    temporary = list(temporary_paths)
     for current, directories, _ in os.walk(workspace, followlinks=False):
         for name in directories:
             path = Path(current) / name
@@ -133,12 +133,27 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0, load_
     for name in ("scratch", "dest", "destination", "release", "path"):
         if (value := getattr(parsed, name, None)) is not None:
             confined(value, workspace)
+    settings = load_settings(root=root, env=env)
+    temporary_paths = [settings.temporary_dir, settings.dlt_pipelines_dir]
+    if parsed.command == "rebuild" and parsed.scratch is not None:
+        rebuilt = scratch_settings(settings, parsed.scratch)
+        temporary_paths.extend((rebuilt.temporary_dir, rebuilt.dlt_pipelines_dir))
+    for path in (settings.data_dir, settings.state_dir, settings.warehouse_path, *temporary_paths):
+        confined(path, workspace)
     root_bytes = _union_bytes((root,))
     if arguments[:2] == ["backup", "create"]:
         additional_bytes = max(additional_bytes, root_bytes + 128 * 1024**2)
     elif arguments[:2] == ["backup", "restore"]:
         additional_bytes = max(additional_bytes, _union_bytes((parsed.path,)) + 16384)
-    before = storage(workspace, additional_bytes=additional_bytes)
+    before = storage(
+        workspace, additional_bytes=additional_bytes, temporary_paths=tuple(temporary_paths)
+    )
+    temporary_allowance = (
+        TEMP_LIMIT - before["temporary_bytes"] + _union_bytes(tuple(temporary_paths))
+    )
+    if temporary_allowance <= 0:
+        raise ValueError("acceptance operation temporary allowance exhausted")
+    env["CATALOGUE_CAPTURE_MAX_TEMP_BYTES"] = str(temporary_allowance)
     if arguments[:1] == ["publish"] or arguments[:2] == ["backup", "create"]:
         # Native publication/copy admission must reserve space occupied by other roots and logs.
         env["CATALOGUE_CAPTURE_MAX_RETAINED_BYTES"] = str(
@@ -160,6 +175,7 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0, load_
         "duration_limit_s": duration,
         "additional_bytes_reserved": additional_bytes,
         "operator_retained_allowance_bytes": settings.capture.max_retained_bytes,
+        "operator_temporary_allowance_bytes": settings.capture.max_temp_bytes,
         "load_pages": settings.load.max_pages_per_run,
         "status": "running",
     }
@@ -198,7 +214,9 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0, load_
                 if any(os.fstat(f.fileno()).st_size > LOG_LIMIT for f in (stdout, stderr)):
                     raise ValueError("acceptance diagnostics exceed their byte allowance")
                 if time.monotonic() >= next_measure:
-                    report["latest_storage"] = storage(workspace)
+                    report["latest_storage"] = storage(
+                        workspace, temporary_paths=tuple(temporary_paths)
+                    )
                     atomic_write_bytes(
                         output / "report.json", (json.dumps(report, sort_keys=True) + "\n").encode()
                     )
@@ -212,7 +230,7 @@ def run(workspace, root, arguments, *, duration=14400, additional_bytes=0, load_
             if any(os.fstat(f.fileno()).st_size > LOG_LIMIT for f in (stdout, stderr)):
                 raise ValueError("acceptance diagnostics exceed their byte allowance")
             report["returncode"] = process.returncode
-            report["after"] = storage(workspace)
+            report["after"] = storage(workspace, temporary_paths=tuple(temporary_paths))
             report["status"] = "passed" if process.returncode == 0 else "failed"
     except BaseException as exc:
         report["status"] = "failed"
