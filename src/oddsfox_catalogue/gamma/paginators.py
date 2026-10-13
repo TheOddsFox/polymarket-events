@@ -15,6 +15,7 @@ from oddsfox_catalogue.gamma.http import (
     GammaClient,
     MalformedResponse,
     Response,
+    ResponseTooLarge,
     RetriesExhausted,
     ScanFailed,
 )
@@ -126,15 +127,27 @@ def keyset_pages(
     seq = start.seq
     high_water = base_params.get("_high_water")
     previous_hash = start.last_ids_hash
+    limit = base_params.get("limit")
+    adaptive = type(limit) is int and limit > 0
 
     while True:
         params = {key: value for key, value in base_params.items() if not key.startswith("_")}
         if cursor is not None:
             params["after_cursor"] = cursor
-        response = client.get(endpoint, params)
+        if adaptive:
+            params["limit"] = limit
+        try:
+            response = client.get(endpoint, params)
+        except ResponseTooLarge:
+            if not adaptive or limit == 1:
+                raise
+            limit = max(1, limit // 2)
+            continue
         if response.status != 200:
             raise MalformedResponse(f"{endpoint}: unexpected HTTP {response.status}")
         records, next_cursor = unpack(response.json, record_key)
+        if adaptive and len(records) > limit:
+            raise MalformedResponse(f"{endpoint}: response exceeds requested record limit")
 
         if next_cursor is not None:
             if next_cursor == cursor or next_cursor in seen:
@@ -169,6 +182,7 @@ def keyset_pages(
             response=response,
             terminal=terminal,
             ids_hash=ids_hash(source_ids),
+            page_unit_revision=3 if adaptive else 1,
         )
         if terminal:
             return

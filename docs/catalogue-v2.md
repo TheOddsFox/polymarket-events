@@ -130,6 +130,16 @@ Stop the previous process before upgrading. Once revision 2 pages exist, use a
 compatible verified installation for resume, replay and rebuild; older wheels
 cannot interpret those pages. Retain the previous environment for its older evidence.
 
+New cursor keysets with an explicit positive integer limit use `page_unit_revision: 3`.
+Only an oversized successful HTTP response triggers same-cursor limit halving; the
+lower limit remains in use for that invocation. Resume starts from the verified
+cursor and may halve the planned limit again. Failed attempts and partial bytes
+count toward the unchanged invocation allowances. A singleton that exceeds the
+body cap remains blocking. Native manifests retain the actual limit, bounded by
+the sealed plan, and every other filter and cursor must match exactly. Decoded
+record counts cannot exceed that limit. Revision 1/2 evidence stays readable;
+older installations cannot read revision 3. No source rows are synthesized or skipped.
+
 Live storage measurements tolerate temporary files removed by active jobs. Missing immutable
 evidence still fails inventory verification; unreadable paths, symlinks and special files fail
 storage checks. Where supported, accounting uses directory-relative stats and complete

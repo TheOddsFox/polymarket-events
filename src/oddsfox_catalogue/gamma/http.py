@@ -38,6 +38,10 @@ class MalformedResponse(GammaError):
     """Non-JSON, wrong shape, or a non-retryable HTTP error. Fails the scan."""
 
 
+class ResponseTooLarge(MalformedResponse):
+    """A successful response exceeded its unchanged streaming body allowance."""
+
+
 class RetriesExhausted(GammaError):
     """Transient failures persisted beyond the retry budget."""
 
@@ -438,7 +442,12 @@ class GammaClient:
                             self._max_body_bytes is not None
                             and len(chunks) + len(chunk) > self._max_body_bytes
                         ):
-                            raise MalformedResponse(f"{endpoint}: response exceeds byte limit")
+                            error = (
+                                ResponseTooLarge
+                                if streamed.status_code == 200
+                                else MalformedResponse
+                            )
+                            raise error(f"{endpoint}: response exceeds byte limit")
                         chunks.extend(chunk)
                     raw = httpx.Response(
                         streamed.status_code,

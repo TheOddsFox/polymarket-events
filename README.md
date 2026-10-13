@@ -112,6 +112,13 @@ automatically to pass a run. Production requests use Gamma HTTPS, with no redire
 credentials or proxies. Streamed error bodies and partial downloads count toward the allowance.
 Loopback source fixtures require explicit `CATALOGUE_GAMMA_ALLOW_LOOPBACK=1`.
 
+If a successful keyset response exceeds the body allowance, capture retries the
+same cursor with half as many records, down to one. Failed partial downloads and
+every attempt remain charged. The committed page keeps the native body and actual
+request limit; an oversized singleton or malformed response still blocks capture.
+After correcting a capture failure, explicitly resume its named batch. New keyset
+pages require an installation supporting page-unit revision 3 for offline recovery.
+
 ## Quality limits
 
 Each limit is a `[quality]` setting in the operator's `config/catalogue.toml`, overridable with

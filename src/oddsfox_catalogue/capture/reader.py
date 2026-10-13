@@ -65,12 +65,14 @@ def read_indexed_manifest(settings: Settings, directory: Path, page: dict[str, A
 
 def _page_revision(manifest: dict[str, Any], spec: ScanSpec) -> int:
     revision = manifest.get("page_unit_revision", 1)
-    if type(revision) is not int or revision not in {1, 2}:
+    if type(revision) is not int or revision not in {1, 2, 3}:
         raise DurabilityError("unsupported capture page unit revision")
     if revision == 2 and (
         spec.kind not in {"id_range", "keyset_ids"} or spec.param_dict.get("tail")
     ):
         raise DurabilityError("native leaf pages require a finite ID scan")
+    if revision == 3 and spec.kind != "keyset":
+        raise DurabilityError("adaptive keyset pages require a keyset scan")
     return revision
 
 
@@ -166,6 +168,13 @@ def validate_page_identity(
             {"terminal": seq == len(spec.input_ids), "output_cursor": None, "offset_end": None}
         )
     elif spec.kind == "keyset":
+        if revision == 3:
+            planned = params.get("limit")
+            native_params = manifest.get("params")
+            actual = native_params.get("limit") if isinstance(native_params, dict) else None
+            if type(planned) is not int or type(actual) is not int or not 1 <= actual <= planned:
+                raise DurabilityError("adaptive keyset limit is outside its committed allowance")
+            params["limit"] = actual
         params = {key: value for key, value in params.items() if not key.startswith("_")}
         input_cursor = cursor
         if cursor is not None:
@@ -289,6 +298,8 @@ def read_page_records(
             else:
                 _reject_window_mismatch(spec.endpoint, wanted, records, next_cursor)
         elif spec.kind == "keyset":
+            if _page_revision(manifest, spec) == 3 and count > manifest["params"]["limit"]:
+                raise MalformedResponse("keyset evidence exceeds its requested record limit")
             if next_cursor is not None and (
                 not records or next_cursor == manifest.get("input_cursor")
             ):
