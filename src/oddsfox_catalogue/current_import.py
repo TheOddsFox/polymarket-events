@@ -1,8 +1,10 @@
-"""Pinned legacy seed and independently verified event-only membership recovery."""
+"""Pinned legacy seed with verified membership and required missing-market recovery."""
 
 import hashlib
 import json
 import time
+from array import array
+from bisect import bisect_left
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +12,7 @@ from . import current_store as store
 from .capture.reader import read_page_records, validate_page_identity
 from .current_config import admit
 from .current_contract import SCHEMAS, CurrentError, ResponseRows, projection
-from .current_rows import _incomplete, entity_id
+from .current_rows import _incomplete, entity_id, project_response
 from .legacy_release import (
     JSON_LIMIT,
     MANIFEST_LIMIT,
@@ -21,7 +23,7 @@ from .legacy_release import (
 )
 
 
-def _event_pages(settings, release, manifest, raw_root, deadline):
+def _event_pages(settings, release, manifest, raw_root, deadline, supplement=None):
     inventory, _ = _read_json(release / "capture-inventory.json", release, JSON_LIMIT)
     coverage, _ = _read_json(release / "coverage.json", release, JSON_LIMIT)
     entries = {e["path"]: e for e in inventory}
@@ -99,6 +101,9 @@ def _event_pages(settings, release, manifest, raw_root, deadline):
         records = read_page_records(
             raw_settings, path.parent, page, "events", scan=scan, previous=prior
         )
+        if supplement is not None:
+            records = list(records)
+            supplement(records, page["observed_at"], "legacy-event:" + page["page_id"])
         previous[page["scan_id"]] = page
         yield _membership_response(
             records,
@@ -127,6 +132,150 @@ def _membership_response(records, *, received_at, response_id):
     return result
 
 
+def _seed_market_keys(conn):
+    """Keep exact canonical keys in packed low words, grouped by their high word."""
+    keys = {}
+    result = conn.execute("""SELECT market_id FROM markets WHERE venue='polymarket'
+        ORDER BY length(market_id),market_id""")
+    while rows := result.fetchmany(8192):
+        for (value,) in rows:
+            number = int(entity_id(value))
+            high = number >> 64
+            if high not in keys:
+                keys[high] = array("Q")
+            keys[high].append(number & (2**64 - 1))
+    return keys
+
+
+def _seed_has_market(keys, value):
+    number = int(entity_id(value))
+    bucket = keys.get(number >> 64)
+    if bucket is None:
+        return False
+    low = number & (2**64 - 1)
+    index = bisect_left(bucket, low)
+    return index < len(bucket) and bucket[index] == low
+
+
+def _supplement_evidence(conn, keys, records, received_at, response_id):
+    rows = []
+    for raw in records:
+        if not isinstance(raw, dict):
+            raise CurrentError("response contains a nonrecord item")
+        if not isinstance(raw.get("markets"), list):
+            continue
+        for child in raw["markets"]:
+            try:
+                mid = entity_id(child.get("id"))
+            except (CurrentError, AttributeError):
+                continue
+            if not _seed_has_market(keys, mid):
+                retained = {
+                    name: child.get(name)
+                    for name in (
+                        "question",
+                        "slug",
+                        "version",
+                        "conditionId",
+                        "active",
+                        "closed",
+                        "archived",
+                        "outcomes",
+                        "clobTokenIds",
+                        "positionIds",
+                    )
+                }
+                retained["id"] = mid
+                rows.append([mid, received_at, response_id, json.dumps(retained)])
+    if rows:
+        conn.execute(
+            """INSERT INTO seed_supplements
+            SELECT r[1],r[2]::TIMESTAMPTZ,r[3],r[4]::JSON
+            FROM (SELECT unnest(from_json(?,'[["VARCHAR"]]')) AS r)""",
+            [json.dumps(rows)],
+        )
+
+
+def _finish_supplements(conn):
+    conn.execute("""CREATE TEMP TABLE seed_selected AS
+        WITH required AS (
+            SELECT DISTINCT unnest(from_json(members,'["VARCHAR"]')) market_id
+            FROM seed_complete)
+        SELECT s.* FROM seed_supplements s JOIN required USING(market_id)
+        WHERE NOT EXISTS (SELECT 1 FROM markets m
+            WHERE m.venue='polymarket' AND m.market_id=s.market_id)
+        QUALIFY dense_rank() OVER (
+            PARTITION BY market_id ORDER BY receipt DESC,response DESC)=1""")
+    if conn.execute("SELECT 1 FROM seed_selected LIMIT 1").fetchone() is None:
+        conn.execute("DROP TABLE seed_selected")
+        conn.execute("DROP TABLE seed_supplements")
+        return
+    conn.execute("""CREATE TEMP TABLE seed_projected (
+        market_id VARCHAR,receipt TIMESTAMPTZ,response VARCHAR,market JSON,outcomes JSON)""")
+    previous = None
+    while True:
+        predicate = "" if previous is None else "WHERE (receipt,response)>(?::TIMESTAMPTZ,?)"
+        stamp = conn.execute(
+            f"SELECT receipt,response FROM seed_selected {predicate} GROUP BY ALL "
+            "ORDER BY receipt,response LIMIT 1",
+            [] if previous is None else list(previous),
+        ).fetchone()
+        if stamp is None:
+            break
+        # A winning response is bounded by the verified source page's response limit.
+        records = [
+            json.loads(row[0])
+            for row in conn.execute(
+                "SELECT market FROM seed_selected WHERE receipt=? AND response=?", list(stamp)
+            ).fetchall()
+        ]
+        projected = project_response(
+            records, "markets", received_at=stamp[0].isoformat(), response_id=stamp[1]
+        )
+        outcomes = {}
+        for row in projected.outcomes:
+            outcomes.setdefault(row["market_id"], []).append(row)
+        rows = [
+            [
+                row["market_id"],
+                stamp[0].isoformat(),
+                stamp[1],
+                json.dumps(row),
+                json.dumps(outcomes.get(row["market_id"], [])),
+            ]
+            for row in projected.markets
+        ]
+        conn.execute(
+            """INSERT INTO seed_projected
+            SELECT r[1],r[2]::TIMESTAMPTZ,r[3],r[4]::JSON,r[5]::JSON
+            FROM (SELECT unnest(from_json(?,'[["VARCHAR"]]')) AS r)""",
+            [json.dumps(rows)],
+        )
+        previous = stamp
+    market_type = json.dumps(dict(SCHEMAS["markets"]))
+    outcome_type = json.dumps([dict(SCHEMAS["outcomes"])])
+    conn.execute(f"""INSERT INTO markets SELECT m.* FROM (
+        SELECT from_json(market, '{market_type}') m FROM seed_projected)""")
+    conn.execute(f"""INSERT INTO outcomes SELECT o.* FROM (
+        SELECT unnest(from_json(outcomes, '{outcome_type}')) o FROM seed_projected)""")
+    conn.execute("""INSERT INTO _receipts
+        SELECT 'market','polymarket',market_id,receipt,response FROM seed_projected""")
+    conn.execute("""INSERT INTO _identity
+        SELECT 'polymarket',market_id,
+            CASE WHEN json_array_length(outcomes)>0 THEN outcomes END,
+            CASE WHEN json_array_length(outcomes)>0 THEN outcomes END,
+            CASE WHEN json_array_length(outcomes)=0 THEN receipt END,
+            CASE WHEN json_array_length(outcomes)=0 THEN response END
+        FROM seed_projected""")
+    conn.execute(f"""INSERT INTO _identity_claims
+        SELECT o.venue,o.market_id,role,o.asset_kind,o.asset_id FROM (
+            SELECT unnest(from_json(outcomes, '{outcome_type}')) o FROM seed_projected)
+        CROSS JOIN (VALUES ('candidate'),('accepted')) roles(role)""")
+    conn.execute("DROP TABLE seed_selected")
+    conn.execute("DROP TABLE seed_projected")
+    conn.execute("DROP TABLE seed_supplements")
+
+
 def _membership_evidence(conn, response):
     rows = [
         [
@@ -146,11 +295,14 @@ def _membership_evidence(conn, response):
         )
 
 
-def _finish_memberships(conn):
+def _finish_memberships(conn, *, supplement=False):
     for name, condition in (("seed_latest", ""), ("seed_complete", "WHERE members IS NOT NULL")):
         conn.execute(f"""CREATE TEMP TABLE {name} AS SELECT * FROM seed_evidence {condition}
             QUALIFY row_number() OVER (
                 PARTITION BY event_id ORDER BY receipt DESC,response DESC)=1""")
+    if supplement:
+        _finish_supplements(conn)
+        _identity_checks(conn)
     # Unknown parents remain evidence and fail closed, including empty/unknown arrays.
     if conn.execute("""SELECT 1 FROM seed_latest l LEFT JOIN events e
         ON e.venue='polymarket' AND e.event_id=l.event_id WHERE e.event_id IS NULL LIMIT 1""").fetchone():
@@ -199,7 +351,7 @@ def _identity(conn):
 
 
 def _identity_checks(conn):
-    conn.execute("""UPDATE markets SET usable=false,identity_error='invalid_identity'
+    conn.execute("""UPDATE markets SET usable=false,identity_error=coalesce(nullif(identity_error,''),'invalid_identity')
         WHERE NOT EXISTS (SELECT 1 FROM outcomes o WHERE o.venue=markets.venue
                            AND o.market_id=markets.market_id)""")
     conn.execute("""CREATE TEMP TABLE conflicts AS
@@ -259,12 +411,14 @@ def import_release(settings, conn, release_path, *, manifest_sha256, raw_root, d
         not isinstance(pending, dict)
         or set(pending) != {"version", "stage", "source"}
         or type(pending["version"]) is not int
-        or pending["version"] != 1
+        or pending["version"] != 2
         or not isinstance(pending["stage"], str)
         or pending["stage"] not in {"baseline", "evidence", "verify"}
         or pending["source"] != source
     ):
-        raise CurrentError("invalid seed_pending marker or seed source mismatch")
+        raise CurrentError(
+            "invalid seed_pending marker or seed source mismatch; use a fresh current root"
+        )
     if pending is None or pending["stage"] == "baseline":
         if store.generation(conn) != 0 or any(
             conn.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone()
@@ -279,7 +433,7 @@ def import_release(settings, conn, release_path, *, manifest_sha256, raw_root, d
         ):
             raise CurrentError("seed requires a pristine current store")
         if pending is None:
-            pending = {"version": 1, "stage": "baseline", "source": source}
+            pending = {"version": 2, "stage": "baseline", "source": source}
             store.set_state(conn, "seed_pending", pending)
     elif store.generation(conn) != 0:
         raise CurrentError("pending seed requires generation zero")
@@ -320,15 +474,24 @@ def import_release(settings, conn, release_path, *, manifest_sha256, raw_root, d
             _identity(conn)
             next_stage = "evidence"
         elif phase == "evidence":
-            _identity_checks(conn)
-            # Keep one append-only staging table: dropped per-page tables retain
+            keys = _seed_market_keys(conn)
+            conn.execute("""CREATE TEMP TABLE seed_supplements (
+                market_id VARCHAR,receipt TIMESTAMPTZ,response VARCHAR,market JSON)""")
+            # Keep append-only staging tables: dropped per-page tables retain
             # transaction memory until commit and exhaust the bounded import.
             conn.execute("""CREATE TEMP TABLE seed_evidence (
                 event_id VARCHAR,receipt TIMESTAMPTZ,response VARCHAR,members JSON)""")
-            for response in _event_pages(settings, release, manifest, raw_root, deadline):
+
+            def supplement(records, receipt, response_id):
+                _supplement_evidence(conn, keys, records, receipt, response_id)
+
+            for response in _event_pages(
+                settings, release, manifest, raw_root, deadline, supplement
+            ):
                 admit(settings, additional_bytes=8 * settings.limits.max_response_bytes)
                 _membership_evidence(conn, response)
-            _finish_memberships(conn)
+            del keys
+            _finish_memberships(conn, supplement=True)
             next_stage = "verify"
         else:
             result = store.validate_store(conn, allow_seeding=True)
@@ -340,7 +503,21 @@ def import_release(settings, conn, release_path, *, manifest_sha256, raw_root, d
                 )
                 for kind in ("events", "markets")
             }
+            supplement_hash = hashlib.sha256()
+            supplement_count = 0
+            supplemental = conn.execute("""SELECT id FROM _receipts
+                WHERE kind='market' AND venue='polymarket' AND response LIKE 'legacy-event:%'
+                ORDER BY id""")
+            while rows := supplemental.fetchmany(8192):
+                for (mid,) in rows:
+                    supplement_hash.update((mid + "\n").encode())
+                    supplement_count += 1
             seed = {
+                "supplement": {
+                    "policy": "verified-event-required-markets-v1",
+                    "markets": supplement_count,
+                    "market_ids_sha256": supplement_hash.hexdigest(),
+                },
                 "manifest_sha256": manifest_sha256,
                 "release_id": manifest["release_id"],
                 "source_catalogue_complete": False,

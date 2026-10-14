@@ -160,6 +160,68 @@ def test_delta_preserves_ten_old_memberships_and_uses_seed_frontiers(tmp_path, c
             benchmark.verify_expected(conn, tmp_path, delta)
 
 
+@pytest.mark.parametrize(
+    ("retained_event", "retained_market", "frontier"),
+    [(20, 30, 10), (12, 12, 25), (2**63 + 1, 2**64 + 1, 10)],
+)
+def test_source_allocates_after_retained_nested_entities_without_advancing_frontier(
+    retained_event, retained_market, frontier
+):
+    import duckdb
+
+    from fakes.world import make_event, make_market
+    from oddsfox_catalogue.current_rows import project_response
+    from oddsfox_catalogue.current_store import apply, initialize
+
+    with duckdb.connect(":memory:") as conn:
+        initialize(conn)
+        originals = [
+            make_event(str(i), "old event", markets=[make_market(str(i), "old market")])
+            for i in range(1, 10)
+        ] + [
+            make_event(
+                str(retained_event), "nested", markets=[make_market(str(retained_market), "nested")]
+            )
+        ]
+        apply(
+            conn,
+            project_response(
+                originals, "events", received_at="2026-10-14T00:00:00Z", response_id="seed"
+            ),
+        )
+        frontiers = {"events": frontier, "markets": frontier}
+        events, markets, controls, new_events, new_markets = benchmark.build_source(
+            conn, frontiers, 12
+        )
+        assert frontiers == {"events": frontier, "markets": frontier}
+        assert benchmark.retained_maxima(conn) == {
+            "events": retained_event,
+            "markets": retained_market,
+        }
+        assert int(new_events[0]) == max(retained_event, frontier) + 1
+        assert int(new_markets[0]) == max(retained_market, frontier) + 1
+        assert events[str(retained_event)]["title"] == "nested"
+        assert markets[str(retained_market)]["question"] == "nested"
+        assert str(retained_market) not in new_markets
+        assert str(retained_event) not in new_events
+        for lane, source in (("event", events), ("market", markets)):
+            assert int(controls[f"absent-{lane}"]) > max(map(int, source))
+            assert controls[f"open-{lane}"] in source
+            assert controls[f"closed-{lane}"] in source
+
+
+@pytest.mark.parametrize("frontier", [-1, True, "10", 10**20, 10**20 - 1])
+def test_source_rejects_invalid_or_exhausted_frontiers(frontier):
+    import duckdb
+
+    from oddsfox_catalogue.current_store import initialize
+
+    with duckdb.connect(":memory:") as conn:
+        initialize(conn)
+        with pytest.raises(ValueError, match="canonical"):
+            benchmark.build_source(conn, {"events": frontier, "markets": frontier}, 12)
+
+
 def test_cli_pins_canonical_limits_and_preserves_failure_output(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -260,3 +322,23 @@ def test_unchanged_highwater_requests_follow_certificate_passes():
         benchmark.verify_highwater_only(
             [*heads, {"path": "/markets?id=11", "status": 200}], certificate
         )
+
+
+def test_gap_discovery_counts_actual_passes_retries_and_includes_whole_refresh_time():
+    responses = [
+        {"path": path}
+        for path in (
+            "/markets?id=11&id=12&closed=false",
+            "/markets?id=11&id=12&closed=true",
+            "/markets?id=11&id=12&closed=true",
+            "/markets?id=31&closed=false",
+            "/events?id=11&id=21",
+            "/events?limit=1&order=id&ascending=false",
+        )
+    ]
+    report = benchmark.gap_discovery(
+        responses, {"events": 10, "markets": 10}, {"events": 20, "markets": 30}, 2.5
+    )
+    assert report["window_http_attempts"] == {"events": 1, "markets": 3}
+    assert report["included_in_refresh_elapsed_wall_s"] == 2.5
+    assert "not isolated" in report["timing_scope"]

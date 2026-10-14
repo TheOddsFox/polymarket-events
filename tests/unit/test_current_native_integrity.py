@@ -9,7 +9,7 @@ import pytest
 from oddsfox_catalogue import current_publish as publisher
 from oddsfox_catalogue import current_store as store
 from oddsfox_catalogue.current_config import CurrentSettings, validate_root
-from oddsfox_catalogue.current_contract import CurrentError, projection
+from oddsfox_catalogue.current_contract import SCHEMAS, CurrentError, projection
 from oddsfox_catalogue.current_rows import project_response
 from oddsfox_catalogue.fingerprints import semantic_fingerprint
 
@@ -212,6 +212,35 @@ def test_accepted_maps_swapped_between_owners_cannot_validate_or_publish(catalog
     assert publisher.verify_current(settings)["valid"]
 
 
+@pytest.mark.parametrize("mutation", ["truncate", "duplicate", "empty"])
+def test_accepted_map_cardinality_corruption_cannot_validate_or_publish(catalogue, mutation):
+    settings, conn = catalogue
+    publish_valid(settings, conn, "v1")
+    pointer = settings.published_dir / "current.json"
+    before = pointer.read_bytes()
+    outcomes = conn.execute("SELECT * FROM outcomes ORDER BY ALL").fetchall()
+    claims = conn.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall()
+    accepted = json.loads(conn.execute("SELECT accepted FROM _identity").fetchone()[0])
+    corrupted = {
+        "truncate": accepted[:1],
+        "duplicate": accepted + [accepted[0]],
+        "empty": [],
+    }[mutation]
+    conn.execute("UPDATE _identity SET accepted=?", [json.dumps(corrupted)])
+    assert conn.execute("SELECT json_array_length(accepted) FROM _identity").fetchone() == (
+        len(corrupted),
+    )
+    assert len(outcomes) == 2
+    assert conn.execute("SELECT * FROM outcomes ORDER BY ALL").fetchall() == outcomes
+    assert conn.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall() == claims
+    with pytest.raises(CurrentError):
+        store.validate_store(conn)
+    with pytest.raises(CurrentError):
+        publisher.publish(settings, conn)
+    assert pointer.read_bytes() == before
+    assert publisher.verify_current(settings)["valid"]
+
+
 @pytest.mark.parametrize("version,null_condition", [("v1", False), ("v2", False), ("v2", True)])
 @pytest.mark.parametrize("counterpart", [False, True])
 def test_valid_native_maps_keep_optional_unequal_aliases_and_v2_null_condition(
@@ -262,3 +291,184 @@ def test_uint256_max_plus_one_is_retained_as_unusable_without_assets(catalogue, 
     assert conn.execute("SELECT count(*) FROM outcomes").fetchone() == (0,)
     assert store.validate_store(conn)["valid"]
     assert publisher.publish(settings, conn)["valid"]
+
+
+@pytest.mark.parametrize("scenario", ["v1-counterpart", "v2-counterpart", "different-asset-kinds"])
+def test_native_uniqueness_respects_optional_counterparts_and_selected_namespaces(
+    catalogue, scenario
+):
+    settings, conn = catalogue
+    version = "v2" if scenario == "v2-counterpart" else "v1"
+    first = market(version)
+    second = {**market(version), "id": "3", "conditionId": "0x" + "b" * 64}
+    if scenario == "different-asset-kinds":
+        second.update(
+            version="v2", conditionId=None, clobTokenIds=["31", "32"], positionIds=["11", "12"]
+        )
+    else:
+        second["clobTokenIds" if version == "v1" else "positionIds"] = ["31", "32"]
+    store.apply(
+        conn,
+        project_response(
+            [first, second],
+            "markets",
+            received_at="2026-10-14T00:00:00Z",
+            response_id="valid-namespaces",
+            native_market_ids=["2", "3"],
+        ),
+    )
+    assert conn.execute("SELECT market_id,usable FROM markets ORDER BY market_id").fetchall() == [
+        ("2", True),
+        ("3", True),
+    ]
+    assert conn.execute("SELECT count(*) FROM outcomes").fetchone() == (4,)
+    if scenario == "different-asset-kinds":
+        assert conn.execute(
+            "SELECT asset_id,count(*),count(DISTINCT asset_kind) FROM outcomes GROUP BY asset_id ORDER BY asset_id"
+        ).fetchall() == [("11", 2, 2), ("12", 2, 2)]
+    else:
+        counterpart = "position_id" if version == "v1" else "clob_token_id"
+        expected = ["21", "22"] if version == "v1" else ["11", "12"]
+        assert conn.execute(
+            f"SELECT {counterpart},count(DISTINCT market_id) FROM outcomes GROUP BY {counterpart} ORDER BY {counterpart}"
+        ).fetchall() == [(value, 2) for value in expected]
+    assert store.validate_store(conn)["valid"]
+    release = publisher.publish(settings, conn)
+    assert publisher.verify_release(release["path"], settings=settings)["valid"]
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_duplicate_selected_asset_across_markets_in_one_namespace_still_fails(catalogue, version):
+    settings, conn = catalogue
+    selected = "clob_token_id" if version == "v1" else "position_id"
+    second = {**market(version), "id": "3", "conditionId": "0x" + "b" * 64}
+    second["clobTokenIds" if version == "v1" else "positionIds"] = ["31", "32"]
+    store.apply(
+        conn,
+        project_response(
+            [market(version), second],
+            "markets",
+            received_at="2026-10-14T00:00:00Z",
+            response_id="distinct-selected-assets",
+            native_market_ids=["2", "3"],
+        ),
+    )
+    assert store.validate_store(conn)["valid"]
+    publisher.publish(settings, conn)
+    pointer = settings.published_dir / "current.json"
+    before = pointer.read_bytes()
+    duplicate = "11" if version == "v1" else "21"
+    conn.execute(
+        f"UPDATE outcomes SET asset_id=?,{selected}=? WHERE market_id='3' AND outcome_index=1",
+        [duplicate, duplicate],
+    )
+    assert conn.execute(
+        "SELECT count(*) FROM outcomes WHERE asset_id=?", [duplicate]
+    ).fetchone() == (2,)
+    with pytest.raises(CurrentError):
+        publisher._integrity(conn, {table: table for table in SCHEMAS})
+    with pytest.raises(CurrentError):
+        store.validate_store(conn)
+    with pytest.raises(CurrentError):
+        publisher.publish(settings, conn)
+    assert pointer.read_bytes() == before
+    assert publisher.verify_current(settings)["valid"]
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_candidate_claim_cannot_substitute_for_missing_accepted_claim(catalogue, version):
+    settings, conn = catalogue
+    publish_valid(settings, conn, version)
+    pointer = settings.published_dir / "current.json"
+    before = pointer.read_bytes()
+    first = "11" if version == "v1" else "21"
+    outcomes = conn.execute("SELECT * FROM outcomes ORDER BY ALL").fetchall()
+    conn.execute(
+        "DELETE FROM _identity_claims WHERE market_id='2' AND role='accepted' AND asset_id=?",
+        [first],
+    )
+    assert conn.execute(
+        "SELECT role,count(*) FROM _identity_claims WHERE market_id='2' AND asset_id=? GROUP BY role",
+        [first],
+    ).fetchall() == [("candidate", 1)]
+    assert conn.execute("SELECT * FROM outcomes ORDER BY ALL").fetchall() == outcomes
+    publisher._integrity(conn, {table: table for table in SCHEMAS})
+    with pytest.raises(CurrentError):
+        store.validate_store(conn)
+    with pytest.raises(CurrentError):
+        publisher.publish(settings, conn)
+    assert pointer.read_bytes() == before
+    assert publisher.verify_current(settings)["valid"]
+
+
+@pytest.mark.parametrize("reservation", ["accepted", "candidate"])
+def test_unusable_owner_reservations_block_usable_owner_until_both_are_quarantined(
+    catalogue, reservation
+):
+    settings, conn = catalogue
+    hidden = {
+        **market("v1"),
+        "id": "3",
+        "conditionId": "0x" + "b" * 64,
+        "clobTokenIds": ["31", "32"],
+        "positionIds": ["41", "42"],
+    }
+    store.apply(
+        conn,
+        project_response(
+            [market("v1"), hidden],
+            "markets",
+            received_at="2026-10-14T00:00:00Z",
+            response_id="distinct-reservations",
+            native_market_ids=["2", "3"],
+        ),
+    )
+    assert store.validate_store(conn)["valid"]
+    publisher.publish(settings, conn)
+    pointer = settings.published_dir / "current.json"
+    before = pointer.read_bytes()
+    reserved = project_response(
+        {**hidden, "clobTokenIds": ["11", "12"]},
+        "markets",
+        received_at="2026-10-15T00:00:00Z",
+        response_id="hidden-reservation",
+    )
+    conn.execute(
+        f"UPDATE _identity SET {reservation}=?,invalidated_at='2026-10-15T00:00:00Z',invalidated_response='hidden-reservation' WHERE market_id='3'",
+        [json.dumps(reserved.outcomes)],
+    )
+    conn.execute(
+        "UPDATE _identity_claims SET asset_id=CASE asset_id WHEN '31' THEN '11' ELSE '12' END WHERE market_id='3' AND role=?",
+        [reservation],
+    )
+    conn.execute(
+        "UPDATE markets SET usable=false,identity_error='native_confirmation_required' WHERE market_id='3'"
+    )
+    conn.execute("DELETE FROM outcomes WHERE market_id='3'")
+    assert conn.execute("SELECT market_id,usable FROM markets ORDER BY market_id").fetchall() == [
+        ("2", True),
+        ("3", False),
+    ]
+    assert conn.execute(
+        "SELECT role,asset_id FROM _identity_claims WHERE market_id='3' AND asset_id IN ('11','12') ORDER BY asset_id"
+    ).fetchall() == [(reservation, "11"), (reservation, "12")]
+    publisher._integrity(conn, {table: table for table in SCHEMAS})
+    with pytest.raises(CurrentError):
+        store.validate_store(conn)
+    with pytest.raises(CurrentError):
+        publisher.publish(settings, conn)
+    assert pointer.read_bytes() == before
+    assert publisher.verify_current(settings)["valid"]
+    claims = conn.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall()
+    conn.execute("UPDATE markets SET usable=false,identity_error='asset_ownership_conflict'")
+    conn.execute(
+        "UPDATE _identity SET invalidated_at='2026-10-15T00:00:00Z',invalidated_response='quarantine'"
+    )
+    conn.execute("DELETE FROM outcomes")
+    store.set_state(conn, "generation", store.generation(conn) + 1)
+    assert conn.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall() == claims
+    assert store.validate_store(conn)["valid"]
+    release = publisher.publish(settings, conn)
+    assert release["counts"]["markets"] == 2
+    assert release["counts"]["outcomes"] == 0
+    assert publisher.verify_release(release["path"], settings=settings)["valid"]

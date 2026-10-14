@@ -115,11 +115,15 @@ def native_integrity_queries(events: str, markets: str, outcomes: str) -> list[s
         "AND o.asset_id=o.clob_token_id) OR (m.protocol='polymarket_v2' "
         "AND o.asset_kind='poly_v2_position' AND o.asset_id=o.position_id), false)",
         f"SELECT 1 FROM {outcomes} GROUP BY venue,market_id HAVING min(outcome_index)<>1 "
-        "OR max(outcome_index)<>count(*) OR count(DISTINCT asset_id)<>count(*) "
+        "OR max(outcome_index)<>count(*) "
         "OR count(clob_token_id) NOT IN (0,count(*)) "
-        "OR count(DISTINCT clob_token_id)<>count(clob_token_id) "
-        "OR count(position_id) NOT IN (0,count(*)) "
-        "OR count(DISTINCT position_id)<>count(position_id)",
+        "OR count(position_id) NOT IN (0,count(*))",
+        f"SELECT 1 FROM {outcomes} GROUP BY venue,asset_kind,asset_id HAVING count(*)>1",
+        # The selected alias equals asset_id, so global ownership already proves its uniqueness.
+        "SELECT 1 FROM (SELECT venue,market_id,CASE WHEN asset_kind='ctf_token' "
+        "THEN position_id ELSE clob_token_id END counterpart "
+        f"FROM {outcomes}) aliases "
+        "WHERE counterpart IS NOT NULL GROUP BY venue,market_id,counterpart HAVING count(*)>1",
         f"SELECT 1 FROM {markets} m WHERE m.usable AND NOT EXISTS "
         f"(SELECT 1 FROM {outcomes} o WHERE o.venue=m.venue AND o.market_id=m.market_id)",
     ]

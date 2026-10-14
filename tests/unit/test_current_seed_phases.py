@@ -132,7 +132,7 @@ def test_final_seal_failure_rolls_back_all_final_progress(seed, monkeypatch):
     assert step()["complete"]
 
 
-@pytest.mark.parametrize("field,value", [("version", 2), ("stage", "unknown"), ("stage", [])])
+@pytest.mark.parametrize("field,value", [("version", 3), ("stage", "unknown"), ("stage", [])])
 def test_invalid_pending_marker_rejected(seed, field, value):
     step, state, database, _ = seed
     step()

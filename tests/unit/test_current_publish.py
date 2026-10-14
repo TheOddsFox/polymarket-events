@@ -53,6 +53,28 @@ def test_roundtrip_noop_and_independent_current(store):
     assert json.loads(pointer.read_text())["previous_release_id"] == result["release_id"]
 
 
+def test_each_publication_validates_source_once_and_external_verify_remains_fresh(
+    store, monkeypatch
+):
+    settings, conn = store
+    original = publisher.validate_store
+    calls = []
+
+    def checked(connection):
+        calls.append(connection)
+        return original(connection)
+
+    monkeypatch.setattr(publisher, "validate_store", checked)
+    result = publisher.publish(settings, conn)
+    assert calls == [conn]
+    calls.clear()
+    assert publisher.publish(settings, conn)["noop"]
+    assert calls == [conn]
+    calls.clear()
+    assert publisher.verify_release(publisher.Path(result["path"]), connection=conn)["valid"]
+    assert calls == [conn]
+
+
 def test_physical_and_manifest_corruption(store):
     settings, conn = store
     release = publisher.publish(settings, conn)

@@ -43,11 +43,21 @@ them to import time. Original response IDs are unrecoverable: the recorded seed 
 adaptation orders `legacy-baseline:<observation_id>` before `legacy-event:<page_id>`.
 Membership comes from independently verified event pages, not the old bridge table.
 Event evidence supplies memberships only; it does not overwrite imported entity
-descriptions, native mappings, or entity receipts. Import commits private baseline,
+descriptions, native mappings, or entity receipts. If a latest complete membership
+references a market excluded by the legacy capture cutoff, import supplements that
+missing market from its latest verified event-source record. This exception adds only
+markets required by those memberships, preserves original receipt ages, and leaves
+discovery frontiers unchanged. Global native ownership checks include the supplements;
+a genuine collision makes every affected owner unavailable. The seed records the
+supplement count and SHA-256 of lexically sorted canonical IDs, each followed by a
+newline (the empty set hashes empty bytes).
+Import commits private baseline,
 membership, and validation phases, reopening DuckDB between phases to release index
 memory. Until validation commits, only status and an import with the same frozen
 source are allowed; publication and normal work remain blocked. Rerun the same import
 command after an interruption to resume the last committed phase.
+Private import protocol 2 includes this supplementation. A checkpoint from the stopped
+protocol 1 import requires a fresh root; preserve that failed root as evidence.
 A repeated completed import verifies its pinned seed identity. Import is offline and
 makes no source-completeness claim. Never delete the old runtime/root to make room.
 Rollback means returning consumers and scheduling to that preserved pair.

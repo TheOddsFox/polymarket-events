@@ -70,7 +70,6 @@ def _integrity(conn, sources):
     checks = native_integrity_queries(events, markets, outcomes) + [
         f"SELECT 1 FROM {links} l LEFT JOIN {events} e USING(venue,event_id) LEFT JOIN {markets} m USING(venue,market_id) WHERE e.event_id IS NULL OR m.market_id IS NULL",
         f"SELECT 1 FROM {outcomes} o LEFT JOIN {markets} m USING(venue,market_id) WHERE m.market_id IS NULL OR m.usable IS DISTINCT FROM true",
-        f"SELECT 1 FROM {outcomes} GROUP BY venue,asset_kind,asset_id HAVING count(DISTINCT market_id)>1",
         f"SELECT 1 FROM {outcomes} WHERE asset_kind IS NULL OR asset_id IS NULL",
     ]
     for query in checks:
@@ -213,7 +212,10 @@ def publish(settings, conn, *, deadline=None):
     _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
     conn.execute("BEGIN TRANSACTION")
     try:
-        validate_store(conn)
+        if conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone():
+            raise CurrentError(
+                "seed import incomplete; resume import-release with its frozen source"
+            )
         if current.exists():
             pointer = _pointer(settings)
             try:

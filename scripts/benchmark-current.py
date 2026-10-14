@@ -81,9 +81,32 @@ def market_payload(conn, row):
     }
 
 
+def retained_maxima(conn):
+    return {
+        lane: conn.execute(
+            f"SELECT coalesce(max(CAST({lane[:-1]}_id AS HUGEINT)), 0) "
+            f"FROM {lane} WHERE venue='polymarket'"
+        ).fetchone()[0]
+        for lane in ("events", "markets")
+    }
+
+
 def build_source(conn, frontiers, count):
     """Sample retained fields; create exact disjoint native IDs independently."""
     require(count >= 12, "delta must contain at least 12 markets")
+    require(
+        all(
+            type(frontiers.get(lane)) is int and 0 <= frontiers[lane] < 10**20
+            for lane in ("events", "markets")
+        ),
+        "seed frontiers must be canonical nonnegative integers of at most 20 digits",
+    )
+    maxima = retained_maxima(conn)
+    bases = {lane: max(frontiers[lane], maxima[lane]) for lane in frontiers}
+    require(
+        all(bases[lane] + count + math.ceil(count / 4) + 1 < 10**20 for lane in bases),
+        "synthetic entities and absent controls exceed canonical 20-digit IDs",
+    )
     samples = records(conn, "markets", "true ORDER BY CAST(market_id AS HUGEINT) LIMIT 1000")
     require(samples, "seed has no market field samples")
     selected = records(
@@ -114,7 +137,7 @@ def build_source(conn, frontiers, count):
     new_events = []
     for index in range(n_events):
         template = selected[index % len(selected)]
-        eid = str(frontiers["events"] + index + 1)
+        eid = str(bases["events"] + index + 1)
         event = {key: template[key] for key in ("title", "slug", "archived")}
         event.update(
             id=eid,
@@ -127,7 +150,7 @@ def build_source(conn, frontiers, count):
     new_markets = []
     for index in range(count):
         sample = samples[index % len(samples)]
-        mid = str(frontiers["markets"] + index + 1)
+        mid = str(bases["markets"] + index + 1)
         eid = selected[index]["event_id"] if index < 10 else new_events[index % n_events]
         version = sample["source_market_version"]
         version = version if version and version.lower() in {"v1", "v2"} else "v2"
@@ -196,7 +219,7 @@ def build_source(conn, frontiers, count):
             controls[f"{status}-{lane}"] = next(
                 key for key, row in source.items() if row["closed"] is flag
             )
-        controls[f"absent-{lane}"] = str(frontiers[lane + "s"] + count + n_events + 1)
+        controls[f"absent-{lane}"] = str(bases[lane + "s"] + count + n_events + 1)
     return events, markets, controls, new_events, new_markets
 
 
@@ -340,6 +363,23 @@ def verify_highwater_only(responses, certificate):
     require(actual == expected, "unchanged refresh highwater passes differ from certificate")
 
 
+def gap_discovery(responses, frontiers, retained, elapsed):
+    attempts = dict.fromkeys(frontiers, 0)
+    for response in responses:
+        parsed = urlsplit(response["path"])
+        lane = parsed.path.strip("/")
+        ids = parse_qs(parsed.query).get("id", [])
+        if lane in frontiers and any(
+            frontiers[lane] < int(entity_id) <= retained[lane] for entity_id in ids
+        ):
+            attempts[lane] += 1
+    return {
+        "window_http_attempts": attempts,
+        "included_in_refresh_elapsed_wall_s": elapsed,
+        "timing_scope": "whole refresh including gap windows; gap time is not isolated",
+    }
+
+
 def accounting_roots(paths):
     """Count overlapping directory trees once, with ancestors taking precedence."""
     roots = []
@@ -478,13 +518,7 @@ def run(args):
                 "seed exceeds 64 GiB retained ceiling",
             )
             frontiers = {key: value["frontier"] for key, value in discovery["lanes"].items()}
-            for lane in ("events", "markets"):
-                maximum = conn.execute(
-                    f"SELECT max(try_cast({lane[:-1]}_id AS BIGINT)) FROM {lane}"
-                ).fetchone()[0]
-                require(
-                    (maximum or 0) <= frontiers[lane], "seed frontier precedes existing entity IDs"
-                )
+            retained = retained_maxima(conn)
             started = time.monotonic()
             events, markets, controls, new_events, new_markets = build_source(
                 conn, frontiers, args.delta_markets
@@ -500,6 +534,10 @@ def run(args):
             report["seed"] = {
                 "release": verified,
                 "frontiers": frontiers,
+                "retained_maxima": retained,
+                "retained_ahead_of_frontier": {
+                    lane: max(0, retained[lane] - frontiers[lane]) for lane in frontiers
+                },
                 "manifest_sha256": digest(Path(verified["path"]) / "manifest.json"),
             }
             frozen_source = json.dumps([events, markets], sort_keys=True)
@@ -545,6 +583,10 @@ def run(args):
                 row["frozen_provider_policy"] = certificate["lanes"]
                 before = source.stats["http_attempts"]
                 row["refresh"] = cli(root, source.url, args.executable, "refresh")
+                row["refresh_http"] = source.stats["responses"][before:]
+                row["retained_gap_discovery"] = gap_discovery(
+                    row["refresh_http"], frontiers, retained, row["refresh"]["elapsed_wall_s"]
+                )
                 result = successful(row["refresh"])
                 require(
                     row["refresh"]["elapsed_wall_s"] < 300, "normal refresh exceeded 300 seconds"
@@ -553,7 +595,6 @@ def run(args):
                     not result.get("pending") and result.get("backlog") == 0,
                     "delta was not fully applied",
                 )
-                row["refresh_http"] = source.stats["responses"][before:]
                 require(
                     result["http_attempts"] == len(row["refresh_http"]),
                     "request accounting mismatch",

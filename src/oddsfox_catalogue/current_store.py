@@ -383,14 +383,16 @@ def validate_store(conn, *, allow_seeding=False):
         raise CurrentError("seed import incomplete; resume import-release with its frozen source")
     for query in native_integrity_queries("events", "markets", "outcomes") + [
         "SELECT 1 FROM event_markets GROUP BY venue,event_id,market_id HAVING count(*)>1",
-        "SELECT 1 FROM _identity_claims GROUP BY venue,market_id,role,asset_kind,asset_id HAVING count(*)>1",
+        "SELECT 1 FROM _identity_claims GROUP BY venue,market_id,asset_kind,asset_id "
+        "HAVING count(*) FILTER (WHERE role='candidate')>1 OR count(*) FILTER (WHERE role='accepted')>1",
         "SELECT 1 FROM markets m LEFT JOIN _identity i USING(venue,market_id) WHERE m.usable AND (i.accepted IS NULL OR i.invalidated_at IS NOT NULL)",
-        "SELECT 1 FROM markets m JOIN _identity i USING(venue,market_id) WHERE m.usable AND (SELECT count(*) FROM outcomes o WHERE o.venue=m.venue AND o.market_id=m.market_id) <> json_array_length(i.accepted)",
-        "SELECT 1 FROM outcomes o WHERE NOT EXISTS (SELECT 1 FROM _identity_claims c WHERE c.venue=o.venue AND c.market_id=o.market_id AND c.role='accepted' AND c.asset_kind=o.asset_kind AND c.asset_id=o.asset_id)",
-        "SELECT 1 FROM markets m JOIN _identity_claims a USING(venue,market_id) JOIN _identity_claims b ON a.venue=b.venue AND a.asset_kind=b.asset_kind AND a.asset_id=b.asset_id AND a.market_id<>b.market_id WHERE m.usable",
+        "SELECT 1 FROM outcomes o ANTI JOIN _identity_claims c ON c.venue=o.venue AND c.market_id=o.market_id AND c.role='accepted' AND c.asset_kind=o.asset_kind AND c.asset_id=o.asset_id",
+        "WITH disputed AS (SELECT venue,asset_kind,asset_id FROM _identity_claims "
+        "GROUP BY venue,asset_kind,asset_id HAVING min(market_id)<>max(market_id)) "
+        "SELECT 1 FROM _identity_claims a JOIN disputed USING(venue,asset_kind,asset_id) "
+        "JOIN markets m ON m.venue=a.venue AND m.market_id=a.market_id WHERE m.usable",
         "SELECT 1 FROM outcomes o LEFT JOIN markets m USING(venue,market_id) WHERE m.market_id IS NULL OR NOT m.usable",
         "SELECT 1 FROM event_markets e LEFT JOIN events p USING(venue,event_id) LEFT JOIN markets m USING(venue,market_id) WHERE p.event_id IS NULL OR m.market_id IS NULL",
-        "SELECT 1 FROM outcomes GROUP BY venue,asset_kind,asset_id HAVING count(DISTINCT market_id)>1",
     ]:
         if conn.execute(query + " LIMIT 1").fetchone():
             raise CurrentError("current store integrity violation")
@@ -400,18 +402,14 @@ def validate_store(conn, *, allow_seeding=False):
         + f"unnest(from_json(i.accepted, '{structure}')) AS mapping "
         + "FROM _identity i JOIN markets m USING(venue,market_id) WHERE m.usable) maps"
     )
-    if conn.execute(
-        "SELECT 1" + mapped + " WHERE mapping.venue IS DISTINCT FROM owner_venue "
-        "OR mapping.market_id IS DISTINCT FROM owner_market_id LIMIT 1"
-    ).fetchone():
-        raise CurrentError("accepted native mapping differs from its owner")
     accepted = (
-        "SELECT "
+        "SELECT owner_venue,owner_market_id, "
         + ", ".join(f'mapping."{name}" AS "{name}"' for name in columns("outcomes"))
         + mapped
     )
     if semantic_fingerprint(conn, accepted) != semantic_fingerprint(
-        conn, f"SELECT {projection('outcomes')} FROM outcomes"
+        conn,
+        f"SELECT venue AS owner_venue,market_id AS owner_market_id,{projection('outcomes')} FROM outcomes",
     ):
         raise CurrentError("current outcomes differ from accepted native mappings")
     return {"valid": True, "generation": generation(conn)}
