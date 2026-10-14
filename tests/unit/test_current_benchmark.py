@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import math
 from pathlib import Path
 
 import httpx
@@ -805,7 +806,8 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
         markets = {"1": market}
         fixture = benchmark.repair_fixture(conn, markets, [])
     with CurrentGammaServer(events, markets) as source:
-        clock = [benchmark.time.monotonic()]
+        # Integral anchors keep simulated durations exact across machine uptimes.
+        clock = [float(math.ceil(benchmark.time.monotonic()))]
         started = clock[0]
         monkeypatch.setattr(benchmark, "time", SimpleNamespace(monotonic=lambda: clock[0]))
         monkeypatch.setattr(current_runtime, "time", SimpleNamespace(monotonic=lambda: clock[0]))

@@ -23,6 +23,27 @@ That comparison also passed: 12,079 verified event pages produced exactly
 4,321,342 current links, with zero differences. The historical bridge differs by
 254 links. Legacy file identities and the current pointer remained unchanged.
 
+## Verification and consumer compatibility
+
+Both `scripts/verify-fast` and `scripts/verify` passed 1,203 tests, with one optional
+consumer-import test skipped. Lockfile, lint and formatting checks passed. The actual
+sibling market-data consumer separately passed all three metadata adapter tests.
+The final installed workflow passed in 25.48 seconds, with 19 loopback requests,
+44,166 downloaded bytes and complete accounting. Distribution checks found no dlt,
+dbt or Dagster dependencies or obsolete runtime resources.
+
+A separate installed test used the default resource limits and a genuine durable
+pending response. Verified backup and fresh restore preserved that response and the
+previous publication. Cached resume applied the captured content exactly once with
+zero provider requests, despite changed fixture content. This verifies the failure
+path on a small fixture; full-scale recovery and capacity remain separate gates.
+
+A bounded live provider probe supported unfiltered event batches and the two market
+lifecycle passes: 13 requests and 208,516 downloaded bytes. Native/bulk identity and
+membership parity passed for the known controls. The initial unfiltered market
+candidate failed omission parity and was rejected. These controls establish request
+compatibility, not exhaustive upstream coverage.
+
 ## Performance status
 
 Measurements use an Apple M4 Mac with 32 GiB RAM, 2 GB DuckDB memory and two SQL
@@ -55,9 +76,15 @@ fit the deadline.
 | Three key-only identity guards | Reject the tested replacement. Three alternating pairs had medians of 0.638 seconds for the existing query and 0.775 seconds for the replacement; one slow initial read does not establish a repeatable workflow benefit. |
 | Physical-only verification of older releases | Reject. Recomputed file and manifest hashes can conceal invalid relationships; retain actual semantic verification. |
 | Packaging directory pruning | Retain. An installed-fixture workflow fell from 249.39 to 18.47 seconds after Hatch stopped traversing excluded raw evidence. Wheel bytes and archive member inventories were identical; only the sdist build configuration changed. This is not a full-refresh measurement. |
+| ZSTD level-3 snapshots | Retain for catalogue.v3; metadata.v1 is unchanged. A full-outcome pair preserved exact schemas, content and native integrity while reducing bytes from 1,540,963,471 to 927,579,193. Export, hashes, semantic verification and public integrity totaled 156.40 seconds with SNAPPY and 139.55 with ZSTD. One pair does not establish repeatable refresh speed; the full workflow gate remains mandatory. Existing immutable releases keep their original encoding. |
 | Compressed backups | Use the explicitly versioned backup.v4 gzip database representation, with expanded and stored hashes, streaming admission and fresh reopened verification. Full-scale backup, restore and seven-backup capacity still require measured acceptance. |
 
 Recovery must remain offline and preserve applicable catalogue content and pending
 progress. Local verified backups do not establish the 24-hour disk-loss target
 until an independently stored verified copy exists. Keep legacy roots and their
 matching runtime intact throughout acceptance and rollback.
+
+Daily retention prioritizes the last successfully verified, durably recorded
+backup before selecting six other dates. Random UUID order does not determine
+which same-day recovery point survives. If the recorded local point cannot be
+verified, retention stops before deleting verified archives.

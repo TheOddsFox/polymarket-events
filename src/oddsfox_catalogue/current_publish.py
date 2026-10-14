@@ -183,7 +183,8 @@ def verify_current(settings, *, connection=None):
 
 def _export(conn, table, destination):
     conn.execute(
-        f"COPY (SELECT {projection(table)} FROM {table}) TO ? (FORMAT PARQUET)",
+        f"COPY (SELECT {projection(table)} FROM {table}) TO ? "
+        "(FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)",
         [str(destination)],
     )
 

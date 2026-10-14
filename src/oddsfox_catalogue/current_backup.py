@@ -525,12 +525,29 @@ def restore_backup(path, destination, *, deadline=None):
 
 
 def prune(settings, *, now=None, raw_only=False):
-    validate_root(settings.root)
+    root = validate_root(settings.root)
+    backups = None if raw_only else safe_path(settings.backups_dir)
     now = time.time() if now is None else now
     if hasattr(now, "timestamp"):
         now = now.timestamp()
     with connect_store(settings, read_only=True) as conn:
         pinned = _pinned(conn)
+        last_backup = None if raw_only else get_state(conn, "last_backup")
+    latest = None
+    if last_backup is not None:
+        if not isinstance(last_backup, dict) or not isinstance(last_backup.get("path"), str):
+            raise CurrentError("invalid last backup path")
+        recorded = Path(last_backup["path"])
+        if (
+            not recorded.is_absolute()
+            or ".." in recorded.parts
+            or str(recorded) != last_backup["path"]
+        ):
+            raise CurrentError("invalid last backup path")
+        if recorded.is_relative_to(root):
+            if recorded.parent != backups or not _BACKUP.fullmatch(recorded.name):
+                raise CurrentError("invalid local last backup path")
+            latest = recorded
     deleted = 0
     raw = safe_path(settings.raw_dir)
     candidates = []
@@ -584,7 +601,6 @@ def prune(settings, *, now=None, raw_only=False):
                 directory_bytes(child)
                 shutil.rmtree(child)
                 deleted += 1
-    backups = safe_path(settings.backups_dir)
     for directory in (published, backups):
         if directory.exists():
             for child in directory.iterdir():
@@ -607,14 +623,16 @@ def prune(settings, *, now=None, raw_only=False):
                 except (CurrentError, ValueError, OSError):
                     continue
                 verified.append(child)
-        days = set()
-        for child in sorted(verified, reverse=True):
-            day = child.name[:8]
-            if day not in days and len(days) < 7:
-                days.add(day)
-            else:
-                directory_bytes(child)
-                shutil.rmtree(child)
-                deleted += 1
+    if latest is not None and latest not in verified:
+        raise CurrentError("last backup could not be verified; preserve existing backups")
+    days = set()
+    for child in sorted(verified, key=lambda item: (item == latest, item.name), reverse=True):
+        day = child.name[:8]
+        if day not in days and len(days) < 7:
+            days.add(day)
+        else:
+            directory_bytes(child)
+            shutil.rmtree(child)
+            deleted += 1
     admit(settings)
     return {"deleted": deleted, "raw_bytes": total}

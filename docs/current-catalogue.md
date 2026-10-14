@@ -17,6 +17,9 @@ IDs are strings. Outcomes retain native asset identifiers, including CLOB token 
 and position IDs where available. An unusable market has an identity error; consumers
 must respect `usable` rather than inventing outcome identity. Event membership is
 independent from market identity. No odds or historical metrics are exported.
+New snapshots use Parquet ZSTD level 3. Readers must support that codec; older
+releases remain readable in their stored encoding and are never rewritten solely
+to change compression. metadata.v1 keeps its existing encoding.
 
 ## Fresh root and verified seed
 
