@@ -15,7 +15,7 @@ spec.loader.exec_module(module)
 def wheel(tmp_path: Path, extra: str | None = None) -> Path:
     path = tmp_path / "test.whl"
     with zipfile.ZipFile(path, "w") as archive:
-        for name in ("__init__.py", "cli.py", "dbt/dbt_project.yml", "dbt/profiles.yml"):
+        for name in ("__init__.py", "cli.py", "current_contract.py", "current_store.py"):
             archive.writestr("oddsfox_catalogue/" + name, "synthetic")
         if extra:
             archive.writestr(extra, "synthetic")

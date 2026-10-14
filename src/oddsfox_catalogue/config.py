@@ -131,21 +131,11 @@ class Settings:
 
     @property
     def dbt_project_dir(self) -> Path:
-        from oddsfox_catalogue.resources import dbt_project_dir
-
-        return (
-            self._abs(self.paths.dbt_project_dir)
-            if self.paths.dbt_project_dir
-            else dbt_project_dir()
-        )
+        raise ValueError("dbt is retired; use the preserved legacy runtime for historical roots")
 
     @property
     def dbt_profiles_dir(self) -> Path:
-        return (
-            self._abs(self.paths.dbt_profiles_dir)
-            if self.paths.dbt_profiles_dir
-            else self.dbt_project_dir
-        )
+        return self.dbt_project_dir
 
     @property
     def temporary_dir(self) -> Path:

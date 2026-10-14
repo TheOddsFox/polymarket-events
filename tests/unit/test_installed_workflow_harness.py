@@ -17,17 +17,17 @@ spec.loader.exec_module(harness)
 
 
 def test_resource_freeze_preserves_inventory_and_detects_tampering(tmp_path):
-    (tmp_path / "dbt_project.yml").write_text("project")
-    (tmp_path / "profiles.yml").write_text("profile")
+    (tmp_path / "__init__.py").write_text("project")
+    (tmp_path / "cli.py").write_text("profile")
     before = harness.resource_inventory(tmp_path)
     harness.freeze_resources(tmp_path)
     try:
         harness.assert_resources_frozen(tmp_path)
         assert harness.resource_inventory(tmp_path) == before
-        (tmp_path / "profiles.yml").chmod(0o600)
+        (tmp_path / "cli.py").chmod(0o600)
         with pytest.raises(ValueError, match="writable"):
             harness.assert_resources_frozen(tmp_path)
-        (tmp_path / "profiles.yml").write_text("tampered")
+        (tmp_path / "cli.py").write_text("tampered")
         assert harness.resource_inventory(tmp_path) != before
     finally:
         tmp_path.chmod(0o700)
@@ -36,8 +36,8 @@ def test_resource_freeze_preserves_inventory_and_detects_tampering(tmp_path):
 
 
 def test_resource_inventory_rejects_symlink(tmp_path):
-    (tmp_path / "dbt_project.yml").write_text("project")
-    (tmp_path / "profiles.yml").symlink_to(tmp_path / "dbt_project.yml")
+    (tmp_path / "__init__.py").write_text("project")
+    (tmp_path / "cli.py").symlink_to(tmp_path / "__init__.py")
     with pytest.raises(ValueError, match="regular"):
         harness.resource_inventory(tmp_path)
 

@@ -1,8 +1,4 @@
-"""`catalogue` command line entry point.
-
-Subcommands are registered as they are implemented. Each handler receives the
-parsed namespace and returns a process exit code.
-"""
+"""Current Polymarket event and market catalogue."""
 
 from __future__ import annotations
 
@@ -11,515 +7,229 @@ import json
 import logging
 import signal
 import sys
-from collections.abc import Callable, Sequence
 from dataclasses import asdict
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
-from oddsfox_catalogue import __version__
-from oddsfox_catalogue.backup import (
-    MAX_RETAINED_BYTES,
-    create_backup,
-    restore_backup,
-    verify_backup,
-)
-from oddsfox_catalogue.capture.ledger import Ledger
-from oddsfox_catalogue.capture.runner import (
-    abandon_batch,
-    rebuild_from_raw,
-    run_capture,
-)
-from oddsfox_catalogue.certification import read_build_validity
-from oddsfox_catalogue.config import load_settings, settings_as_dict
-from oddsfox_catalogue.gamma.http import GammaError
-from oddsfox_catalogue.ids import MODES, sha256_bytes
-from oddsfox_catalogue.load.runner import LoadBlocked
-from oddsfox_catalogue.metadata import MetadataError, export_metadata, refresh_metadata
-from oddsfox_catalogue.pipeline import (
-    capture_runtime,
-    dbt_stage,
-    load_stage,
-    publish_stage,
-    refresh,
-)
-from oddsfox_catalogue.publish import PublishBlocked, current_release, verify_release
-from oddsfox_catalogue.rebuild import rebuild_and_verify
-from oddsfox_catalogue.runlock import RunBusy, run_lock
-from oddsfox_catalogue.signals import SIGNALS, Terminated
-from oddsfox_catalogue.warehouse import BaselineMissing
-from oddsfox_catalogue.warehouse_version import WarehouseVersionError
-
-Handler = Callable[[argparse.Namespace], int]
+from . import __version__
+from .current_contract import CurrentError
+from .runlock import RunBusy, run_lock
+from .signals import SIGNALS, Terminated
 
 
-def _install_termination_handlers() -> Callable[[], None]:
-    """Route SIGHUP and SIGTERM to ``SIGNALS``. Returns a restore function."""
-
-    def handle(signum: int, _frame: object) -> None:
-        SIGNALS.receive(signum)
-
-    previous = {signum: signal.signal(signum, handle) for signum in (signal.SIGHUP, signal.SIGTERM)}
-
-    def restore() -> None:
-        for signum, previous_handler in previous.items():
-            signal.signal(signum, previous_handler)
-
-    return restore
-
-
-def configure_logging() -> None:
-    """Send INFO and above to stderr. Library calls stay quiet until the CLI starts.
-
-    httpx logs the full request URL at INFO, and a keyset URL contains the page cursor.
-    Keep that logger at WARNING so cursors stay out of the operator log.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+def configure_logging():
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def _cmd_version(_: argparse.Namespace) -> int:
-    print(__version__)
-    return 0
+def _install_termination_handlers():
+    def handle(signum, _frame):
+        SIGNALS.receive(signum)
+
+    previous = {s: signal.signal(s, handle) for s in (signal.SIGHUP, signal.SIGTERM)}
+
+    def restore():
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+    return restore
 
 
-def _cmd_config_show(_: argparse.Namespace) -> int:
-    settings = load_settings()
-    print(json.dumps(settings_as_dict(settings), indent=2, sort_keys=True))
-    return 0
-
-
-def _cmd_capture(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    with run_lock(settings.run_lock_path), capture_runtime(settings) as runtime:
-        summary = run_capture(
-            runtime,
-            args.mode,
-            market_ids=args.market_id,
-            event_ids=args.event_id,
-            resume=args.resume,
-        )
-    print(
-        json.dumps(
-            {
-                "batch_id": summary.batch_id,
-                "status": summary.status,
-                "resumed": summary.resumed,
-                "pages_written": summary.pages_written,
-                "pages_adopted": summary.pages_adopted,
-                "records": summary.records,
-                "scans": len(summary.scans),
-                "http_attempts": summary.http_attempts,
-                "downloaded_bytes": summary.downloaded_bytes,
-                "duration_s": summary.duration_s,
-            },
-            indent=2,
-        )
-    )
-    return 0 if summary.status == "captured" else 2
-
-
-def _cmd_ledger_rebuild(_: argparse.Namespace) -> int:
-    settings = load_settings()
-    with run_lock(settings.run_lock_path):
-        if settings.ledger_path.exists():
-            raise SystemExit(
-                f"refusing to rebuild over existing {settings.ledger_path}; move it aside first"
-            )
-        ledger = Ledger(settings.ledger_path)
-        try:
-            counts = rebuild_from_raw(settings, ledger)
-        finally:
-            ledger.close()
-    print(json.dumps(counts, indent=2))
-    return 0
-
-
-def _cmd_batch_abandon(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    with run_lock(settings.run_lock_path):
-        ledger = Ledger(settings.ledger_path)
-        try:
-            abandon_batch(ledger, args.batch_id, datetime.now(UTC), args.reason)
-        finally:
-            ledger.close()
-    print(f"abandoned {args.batch_id}")
-    return 0
-
-
-def _cmd_load(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    summary = load_stage(settings, batch_id=args.batch_id, record_key=args.record_key)
-    print(json.dumps(asdict(summary), indent=2, default=str))
-    return 0
-
-
-def _cmd_dbt(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    extra = list(args.dbt_args)
-    if extra[:1] == ["--"]:
-        extra = extra[1:]
-    result = dbt_stage(settings, extra)
-    sys.stdout.write(result.stdout)
-    sys.stderr.write(result.stderr)
-    return result.returncode
-
-
-def _cmd_publish(_: argparse.Namespace) -> int:
-    settings = load_settings()
-    release = publish_stage(settings)
-    print(json.dumps({"release_id": release.release_id, "path": str(release.path)}, indent=2))
-    return 0
-
-
-def _cmd_refresh(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    result = refresh(
-        settings, args.mode, market_ids=args.market_id, event_ids=args.event_id, resume=args.resume
-    )
-    print(json.dumps(result, indent=2, default=str))
-    return 0 if result.get("status") == "published" else 2
-
-
-def _cmd_replay(_: argparse.Namespace) -> int:
-    """Load pending pages, build dbt, and publish, without fetching from Gamma."""
-    settings = load_settings()
-    loaded = load_stage(settings)
-    built = dbt_stage(settings, ["build"])
-    if built.returncode != 0:
-        sys.stderr.write(built.stdout[-4000:])
-        return 2
-    release = publish_stage(settings)
-    print(
-        json.dumps(
-            {"loaded_pages": loaded.pages_loaded, "release_id": release.release_id}, indent=2
-        )
-    )
-    return 0
-
-
-def _cmd_validate(_: argparse.Namespace) -> int:
-    settings = load_settings()
-    result = dbt_stage(settings, ["test"])
-    sys.stdout.write(result.stdout)
-    return result.returncode
-
-
-def _cmd_current(_: argparse.Namespace) -> int:
-    settings = load_settings()
-    pointer = current_release(settings)
-    print(json.dumps(pointer, indent=2) if pointer else "no published release yet")
-    return 0
-
-
-def _cmd_verify(args: argparse.Namespace) -> int:
-    """Verify immutable outputs without requiring a valid current warehouse."""
-    settings = load_settings()
-    if args.release is None:
-        pointer = current_release(settings)
-        if pointer is None:
-            raise PublishBlocked("no published release to verify")
-        path = settings.published_dir / pointer["path"]
-        digest = pointer["manifest_sha256"]
-    else:
-        path, digest = args.release, None
-    manifest = verify_release(settings, path, manifest_sha256=digest)
-    print(
-        json.dumps(
-            {"verified": True, "release_id": manifest["release_id"], "path": str(path)}, indent=2
-        )
-    )
-    return 0
-
-
-def _cmd_backup_create(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    with run_lock(settings.run_lock_path):
-        dest = create_backup(settings, dest_root=args.dest)
-    problems = verify_backup(dest, max_bytes=settings.capture.max_retained_bytes)
-    print(
-        json.dumps({"backup": str(dest), "verified": not problems, "problems": problems}, indent=2)
-    )
-    return 0 if not problems else 4
-
-
-def _cmd_backup_verify(args: argparse.Namespace) -> int:
-    problems = verify_backup(args.path, max_bytes=args.max_retained_bytes)
-    print(json.dumps({"verified": not problems, "problems": problems}, indent=2))
-    return 0 if not problems else 4
-
-
-def _cmd_backup_restore(args: argparse.Namespace) -> int:
-    destination = restore_backup(args.path, args.destination, max_bytes=args.max_retained_bytes)
-    print(json.dumps({"restored": True, "destination": str(destination)}, indent=2))
-    return 0
-
-
-def _cmd_rebuild(args: argparse.Namespace) -> int:
-    """Rebuild from raw in a scratch area and compare fingerprints with the live warehouse."""
-    settings = load_settings()
-    with run_lock(settings.run_lock_path):
-        report = rebuild_and_verify(
-            settings, scratch=args.scratch, resume=args.resume, step=args.step
-        )
-    print(
-        json.dumps(
-            {
-                "matched": report.matched,
-                "pending": report.pending,
-                "rebuilt_to": str(report.rebuilt_to),
-                "tables": report.tables,
-                "mismatches": report.mismatches,
-            },
-            indent=2,
-            default=str,
-        )
-    )
-    return 0 if report.matched or report.pending else 4
-
-
-def _cmd_status(_: argparse.Namespace) -> int:
-    settings = load_settings()
-    if not settings.ledger_path.exists():
-        print("no ledger yet")
-        return 0
-    ledger = Ledger(settings.ledger_path)
-    try:
-        rows: list[dict[str, Any]] = [
-            {
-                "batch_id": b["batch_id"],
-                "mode": b["mode"],
-                "status": b["status"],
-                "plan_stage": b["plan_stage"],
-                "started_at": b["started_at"],
-                "error": b["error"],
-            }
-            for b in ledger.list_batches()
-        ]
-    finally:
-        ledger.close()
-    print(json.dumps({"batches": rows, "warehouse_build": read_build_validity(settings)}, indent=2))
-    return 0
-
-
-def _cmd_metadata(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    with run_lock(settings.run_lock_path):
-        function = refresh_metadata if args.metadata_command == "refresh" else export_metadata
-        options = {"max_output_bytes": args.max_output_bytes}
-        if args.metadata_command == "refresh":
-            options["max_body_bytes"] = args.max_response_bytes
-            options["max_requests"] = args.max_requests
-            options["max_download_bytes"] = args.max_download_bytes
-        manifest = function(settings, args.market_id, args.output, **options)
-    coverage = json.loads((args.output / "coverage.json").read_text())
-    counts = {
-        status: sum(row["status"] == status for row in coverage)
-        for status in ("found", "absent", "failed")
-    }
-    print(
-        json.dumps(
-            {
-                "source_release_id": manifest["source_release_id"],
-                "manifest_sha256": sha256_bytes((args.output / "manifest.json").read_bytes()),
-                "path": str(args.output),
-                "requested": len(coverage),
-                "http_attempts": manifest.get("http_attempts", 0),
-                "downloaded_bytes": manifest.get("downloaded_bytes", 0),
-                **counts,
-            },
-            indent=2,
-        )
-    )
-    return 2 if counts["failed"] else 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="catalogue", description=__doc__.splitlines()[0])
+def build_parser():
+    parser = argparse.ArgumentParser(prog="catalogue", description=__doc__)
+    parser.add_argument("--root", type=Path, help="explicit catalogue.v3 root")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("version", help="print the package version").set_defaults(handler=_cmd_version)
-
-    config = sub.add_parser("config", help="inspect configuration")
-    config_sub = config.add_subparsers(dest="config_command", required=True)
-    config_sub.add_parser("show", help="print effective settings").set_defaults(
-        handler=_cmd_config_show
-    )
-
-    capture = sub.add_parser("capture", help="capture raw Gamma pages for one mode")
-    capture.add_argument("--mode", choices=MODES, required=True)
-    capture.add_argument(
-        "--market-id", action="append", default=[], help="selected Gamma market ID; repeat for more"
-    )
-    capture.add_argument(
-        "--event-id", action="append", default=[], help="selected Gamma event ID; repeat for more"
-    )
-    capture.add_argument("--resume", help="explicit existing batch ID to verify and resume")
-    capture.set_defaults(handler=_cmd_capture)
-
-    ledger = sub.add_parser("ledger", help="ledger maintenance")
-    ledger_sub = ledger.add_subparsers(dest="ledger_command", required=True)
-    ledger_sub.add_parser(
-        "rebuild", help="rebuild the ledger from raw manifests (ledger must be absent)"
-    ).set_defaults(handler=_cmd_ledger_rebuild)
-
-    batch = sub.add_parser("batch", help="batch operations")
-    batch_sub = batch.add_subparsers(dest="batch_command", required=True)
-    abandon = batch_sub.add_parser("abandon", help="stop resuming a capturing batch")
-    abandon.add_argument("batch_id")
-    abandon.add_argument("--reason", default="abandoned by operator")
-    abandon.set_defaults(handler=_cmd_batch_abandon)
-
-    sub.add_parser("status", help="list batches and their states").set_defaults(handler=_cmd_status)
-
-    metadata = sub.add_parser("metadata", help="targeted immutable metadata handoffs")
-    metadata_sub = metadata.add_subparsers(dest="metadata_command", required=True)
+    sub.add_parser("version")
+    config = sub.add_parser("config")
+    config.add_subparsers(dest="config_command", required=True).add_parser("show")
+    for name in ("init", "refresh", "reconcile", "publish", "status", "verify", "current"):
+        sub.add_parser(name)
+    seed = sub.add_parser("import-release", help="verified v2 import into a fresh v3 root")
+    seed.add_argument("release_path", type=Path)
+    seed.add_argument("--manifest-sha256", required=True)
+    seed.add_argument("--raw-root", type=Path, required=True)
+    probe = sub.add_parser("probe", help="bounded native/bulk provider compatibility checks")
+    for entity in ("event", "market"):
+        for status in ("open", "closed", "absent"):
+            probe.add_argument(f"--{status}-{entity}-id", action="append", required=True)
+    backup = sub.add_parser("backup")
+    operations = backup.add_subparsers(dest="backup_command", required=True)
+    operations.add_parser("create")
+    operations.add_parser("verify").add_argument("backup", type=Path)
+    restore = operations.add_parser("restore")
+    restore.add_argument("backup", type=Path)
+    restore.add_argument("--destination", type=Path, required=True)
+    metadata = sub.add_parser("metadata", help="unchanged targeted metadata.v1 handoffs")
+    operations = metadata.add_subparsers(dest="metadata_command", required=True)
     for operation in ("refresh", "export"):
-        command = metadata_sub.add_parser(
-            operation,
-            help="fetch selected markets"
-            if operation == "refresh"
-            else "export from local evidence without network",
-        )
-        command.add_argument(
-            "--market-id",
-            action="append",
-            required=True,
-            help="explicit Gamma market ID; repeat for more",
-        )
-        command.add_argument(
-            "--output", type=Path, required=True, help="new immutable bundle directory"
-        )
+        command = operations.add_parser(operation)
+        command.add_argument("--market-id", action="append", required=True)
+        command.add_argument("--output", type=Path, required=True)
         command.add_argument("--max-output-bytes", type=int, default=128 * 1024**2)
         if operation == "refresh":
             command.add_argument("--max-response-bytes", type=int, default=8 * 1024**2)
             command.add_argument("--max-requests", type=int, default=500)
             command.add_argument("--max-download-bytes", type=int, default=128 * 1024**2)
-        command.set_defaults(handler=_cmd_metadata)
-
-    load = sub.add_parser("load", help="load captured pages into bronze (idempotent)")
-    load.add_argument("--batch-id", default=None, help="load only this batch")
-    load.add_argument(
-        "--record-key",
-        choices=("markets",),
-        help="load only native market pages of an explicit batch",
-    )
-    load.set_defaults(handler=_cmd_load)
-
-    dbt = sub.add_parser("dbt", help="run a dbt command against the warehouse")
-    dbt.add_argument("dbt_args", nargs=argparse.REMAINDER, help="arguments passed to dbt")
-    dbt.set_defaults(handler=_cmd_dbt)
-
-    sub.add_parser("publish", help="write a release if the dbt build passed").set_defaults(
-        handler=_cmd_publish
-    )
-    sub.add_parser("current", help="show the current published release").set_defaults(
-        handler=_cmd_current
-    )
-    verify = sub.add_parser(
-        "verify", help="verify an immutable release independently of the warehouse"
-    )
-    verify.add_argument(
-        "--release", type=Path, help="release directory; defaults to the current release"
-    )
-    verify.set_defaults(handler=_cmd_verify)
-
-    refresh_parser = sub.add_parser(
-        "refresh", help="capture, load, build, and publish in one stage order"
-    )
-    refresh_parser.add_argument("--mode", choices=MODES, required=True)
-    refresh_parser.add_argument(
-        "--market-id", action="append", default=[], help="selected Gamma market ID; repeat for more"
-    )
-    refresh_parser.add_argument(
-        "--event-id", action="append", default=[], help="selected Gamma event ID; repeat for more"
-    )
-    refresh_parser.add_argument("--resume", help="explicit existing batch ID to verify and resume")
-    refresh_parser.set_defaults(handler=_cmd_refresh)
-
-    sub.add_parser(
-        "replay", help="load, build, and publish from existing raw pages (no Gamma calls)"
-    ).set_defaults(handler=_cmd_replay)
-    sub.add_parser("validate", help="run dbt tests against the warehouse").set_defaults(
-        handler=_cmd_validate
-    )
-
-    backup = sub.add_parser("backup", help="point-in-time backups")
-    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
-    backup_create = backup_sub.add_parser("create", help="write a checksummed backup")
-    backup_create.add_argument("--dest", type=Path, default=None, help="parent directory")
-    backup_create.set_defaults(handler=_cmd_backup_create)
-    backup_verify = backup_sub.add_parser("verify", help="re-hash a backup and list problems")
-    backup_verify.add_argument("path", type=Path)
-    backup_verify.add_argument("--max-retained-bytes", type=int, default=MAX_RETAINED_BYTES)
-    backup_verify.set_defaults(handler=_cmd_backup_verify)
-    backup_restore = backup_sub.add_parser(
-        "restore", help="verify and restore into a fresh operator root"
-    )
-    backup_restore.add_argument("path", type=Path)
-    backup_restore.add_argument("--destination", type=Path, required=True)
-    backup_restore.add_argument("--max-retained-bytes", type=int, default=MAX_RETAINED_BYTES)
-    backup_restore.set_defaults(handler=_cmd_backup_restore)
-
-    rebuild = sub.add_parser(
-        "rebuild", help="rebuild from raw pages and compare with the live warehouse"
-    )
-    rebuild.add_argument(
-        "--verify", action="store_true", required=True, help="compare fingerprints (required)"
-    )
-    rebuild.add_argument("--scratch", type=Path, help="explicit fresh or resumable scratch root")
-    rebuild.add_argument("--resume", action="store_true", help="resume only bound explicit scratch")
-    rebuild.add_argument("--step", action="store_true", help="run one verified recovery phase")
-    rebuild.set_defaults(handler=_cmd_rebuild)
+    for name in ("capture", "load", "dbt", "ledger", "batch", "replay", "rebuild", "validate"):
+        old = sub.add_parser(name, help="retired; use the matching legacy runtime for old roots")
+        old.add_argument("legacy_args", nargs=argparse.REMAINDER)
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    configure_logging()
-    restore_signals = _install_termination_handlers()
+def _metadata(args):
+    from .config import load_settings
+    from .ids import sha256_bytes
+    from .metadata import GammaClient, export_metadata, refresh_metadata
+
+    settings = load_settings(root=args.root)
+    if (settings.root / "catalogue.json").exists():
+        raise CurrentError("metadata.v1 requires an isolated producer root")
+    if args.metadata_command == "refresh" and (
+        settings.warehouse_path.exists() or settings.ledger_path.exists()
+    ):
+        raise CurrentError("preserve the legacy root; select an isolated metadata producer root")
+    client = None
     try:
-        try:
-            parser = build_parser()
-            args = parser.parse_args(argv)
-            handler: Handler = args.handler
-            return handler(args)
-        except Terminated as exc:
-            # 128 plus the signal number, so a resume wrapper does not treat a kill as exit 1.
-            # This covers a signal during argument parsing as well as during a stage.
-            print(f"error: terminated by {exc}", file=sys.stderr)
-            return 128 + exc.signum
-        except (
-            RunBusy,
-            PublishBlocked,
-            BaselineMissing,
-            LoadBlocked,
-            MetadataError,
-            WarehouseVersionError,
-            GammaError,
-            ValueError,
-            OSError,
-        ) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            print(
-                json.dumps(
-                    {
-                        "status": "blocked",
-                        "message": str(exc),
-                        "batch_id": getattr(exc, "batch_id", None),
-                        "http_attempts": getattr(exc, "http_attempts", 0),
-                        "downloaded_bytes": getattr(exc, "downloaded_bytes", 0),
-                    }
-                ),
-                file=sys.stderr,
+        if args.metadata_command == "refresh":
+            with run_lock(settings.run_lock_path):
+                client = GammaClient(
+                    settings.gamma,
+                    max_body_bytes=args.max_response_bytes,
+                    max_requests=args.max_requests,
+                    max_download_bytes=args.max_download_bytes,
+                    max_duration_s=min(120, settings.capture.max_duration_s),
+                )
+                manifest = refresh_metadata(
+                    settings,
+                    args.market_id,
+                    args.output,
+                    client=client,
+                    max_output_bytes=args.max_output_bytes,
+                    max_body_bytes=args.max_response_bytes,
+                    max_requests=args.max_requests,
+                    max_download_bytes=args.max_download_bytes,
+                )
+        else:
+            manifest = export_metadata(
+                settings, args.market_id, args.output, max_output_bytes=args.max_output_bytes
             )
-            return 3
+        coverage = json.loads((args.output / "coverage.json").read_text())
+        counts = {s: sum(r["status"] == s for r in coverage) for s in ("found", "absent", "failed")}
+        print(
+            json.dumps(
+                {
+                    "source_release_id": manifest["source_release_id"],
+                    "manifest_sha256": sha256_bytes((args.output / "manifest.json").read_bytes()),
+                    "path": str(args.output),
+                    "requested": len(coverage),
+                    "http_attempts": client.stats.requests if client else 0,
+                    "downloaded_bytes": client.stats.downloaded_bytes if client else 0,
+                    **counts,
+                }
+            )
+        )
+        return 2 if counts["failed"] else 0
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "message": str(exc),
+                    "http_attempts": client.stats.requests if client else 0,
+                    "downloaded_bytes": client.stats.downloaded_bytes if client else 0,
+                }
+            )
+        )
+        return 3
     finally:
-        restore_signals()
+        if client is not None:
+            client.close()
+
+
+def _current(args):
+    from .current_config import load_current_settings, validate_root
+    from .current_runtime import supervise
+
+    settings = load_current_settings(args.root)
+    if args.command == "config":
+        print(json.dumps(asdict(settings), default=str, indent=2))
+        return 0
+    operation, options = args.command, {}
+    if operation == "backup":
+        operation = {"create": "backup", "verify": "verify-backup", "restore": "restore"}[
+            args.backup_command
+        ]
+        options = {
+            key: getattr(args, key) for key in ("backup", "destination") if hasattr(args, key)
+        }
+    if operation == "import-release":
+        options = {
+            key: getattr(args, key) for key in ("release_path", "manifest_sha256", "raw_root")
+        }
+    if operation == "probe":
+        options = {
+            f"{entity}_ids": {
+                s: getattr(args, f"{s}_{entity}_id") for s in ("open", "closed", "absent")
+            }
+            for entity in ("event", "market")
+        }
+    if operation in {"verify-backup", "restore"}:
+        success, result = supervise(settings, operation, options, duration=4 * 3600)
+    else:
+        validate_root(settings.root, initialize=operation in {"init", "import-release"})
+        duration = (
+            4 * 3600
+            if operation in {"import-release", "backup"}
+            else settings.limits.max_duration_s
+        )
+        with run_lock(settings.run_lock_path):
+            success, result = supervise(settings, operation, options, duration=duration)
+    print(json.dumps(result, default=str, indent=2))
+    return 0 if success else 3
+
+
+def main(argv=None):
+    configure_logging()
+    restore = _install_termination_handlers()
+    try:
+        args = build_parser().parse_args(argv)
+        if args.command == "version":
+            print(__version__)
+            return 0
+        if args.command == "metadata":
+            return _metadata(args)
+        if args.command in {
+            "capture",
+            "load",
+            "dbt",
+            "ledger",
+            "batch",
+            "replay",
+            "rebuild",
+            "validate",
+        }:
+            raise CurrentError(
+                "historical command retired: use its preserved runtime/root; "
+                "catalogue.v3 uses refresh, reconcile, import-release and verify"
+            )
+        return _current(args)
+    except Terminated as exc:
+        print(f"terminated by {exc}", file=sys.stderr)
+        return 128 + exc.signum
+    except (RunBusy, ValueError, OSError) as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "busy" if isinstance(exc, RunBusy) else "blocked",
+                    "message": str(exc),
+                    "http_attempts": 0,
+                    "downloaded_bytes": 0,
+                }
+            )
+        )
+        return 3
+    finally:
+        restore()
 
 
 if __name__ == "__main__":

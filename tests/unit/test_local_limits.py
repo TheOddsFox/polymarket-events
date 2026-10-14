@@ -5,12 +5,10 @@ from pathlib import Path
 import pytest
 
 from oddsfox_catalogue.config import Settings
-from oddsfox_catalogue.dbt_runner import dbt_environment
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
 from oddsfox_catalogue.limits import (
     directory_bytes,
     enforce_storage_limits,
-    remaining_temp_bytes,
     retained_bytes,
     temporary_bytes,
 )
@@ -285,16 +283,3 @@ def test_external_dlt_working_path_counts_in_both_allowances(
     assert temporary_bytes(settings) == retained_bytes(settings) == 3
     with pytest.raises(RequestBudgetExceeded, match="retained"):
         enforce_storage_limits(settings)
-
-
-def test_dbt_spill_allowance_subtracts_existing_working_files(tmp_path: Path) -> None:
-    settings = Settings(tmp_path)
-    settings = replace(settings, capture=replace(settings.capture, max_temp_bytes=10))
-    settings.dlt_pipelines_dir.mkdir(parents=True)
-    package = settings.dlt_pipelines_dir / "package.jsonl"
-    package.write_bytes(b"12345678")
-    assert remaining_temp_bytes(settings) == 2
-    assert dbt_environment(settings)["CATALOGUE_DUCKDB_MAX_TEMP_BYTES"] == "2"
-    package.write_bytes(b"1234567890")
-    with pytest.raises(RequestBudgetExceeded, match="temporary"):
-        dbt_environment(settings)

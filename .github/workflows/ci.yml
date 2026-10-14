@@ -46,9 +46,6 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
 
-      - name: dbt parse
-        run: uv run catalogue dbt -- parse
-
       - name: Complete offline test suite
         run: uv run --locked pytest -q
 

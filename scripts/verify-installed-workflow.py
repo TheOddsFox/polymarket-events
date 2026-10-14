@@ -20,9 +20,7 @@ from urllib.parse import urlsplit
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 
-from fakes.fake_gamma import FakeGamma  # noqa: E402
-from fakes.gamma_server import GammaServer  # noqa: E402
-from fakes.world import demo_world  # noqa: E402
+from fakes.current_gamma import CurrentGammaServer  # noqa: E402
 from oddsfox_catalogue.signals import SIGNALS, Terminated  # noqa: E402
 
 
@@ -30,14 +28,14 @@ def resource_inventory(root: Path) -> dict[str, dict[str, object]]:
     inventory = {}
     for path in sorted(root.rglob("*")):
         if path.is_symlink() or not (path.is_dir() or path.is_file()):
-            raise ValueError("installed dbt resource is not a regular file or directory")
+            raise ValueError("installed package resource is not a regular file or directory")
         if path.is_file():
             inventory[path.relative_to(root).as_posix()] = {
                 "bytes": path.stat().st_size,
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
-    if not inventory or "dbt_project.yml" not in inventory or "profiles.yml" not in inventory:
-        raise ValueError("installed dbt project is incomplete")
+    if not inventory or "__init__.py" not in inventory or "cli.py" not in inventory:
+        raise ValueError("installed package is incomplete")
     return inventory
 
 
@@ -49,7 +47,7 @@ def freeze_resources(root: Path) -> None:
 
 def assert_resources_frozen(root: Path) -> None:
     if any(stat.S_IMODE(path.stat().st_mode) & 0o222 for path in (root, *root.rglob("*"))):
-        raise ValueError("installed dbt resources became writable")
+        raise ValueError("installed package resources became writable")
 
 
 def assert_accounting(report: dict, measured: dict, allowed_paths: set[str]) -> None:
@@ -133,11 +131,15 @@ def verify(output: Path) -> dict:
         for key, value in os.environ.items()
         if not key.startswith(("CATALOGUE_", "PYTHON")) and key != "VIRTUAL_ENV"
     }
-    env.update(UV_LINK_MODE="copy", UV_OFFLINE="1", PYTHONNOUSERSITE="1", PYTHONPATH="")
-    dist = output / "dist"
-    runtime = output / "runtime"
+    env.update(
+        UV_LINK_MODE="copy",
+        UV_OFFLINE="1",
+        PYTHONNOUSERSITE="1",
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONPATH="",
+    )
+    dist, runtime, venv = output / "dist", output / "runtime", output / "venv"
     runtime.mkdir()
-    venv = output / "venv"
     python = venv / "bin/python"
     requirements = output / "requirements.txt"
     run_command(
@@ -147,8 +149,8 @@ def verify(output: Path) -> dict:
         output / "build.log",
     )
     archives = sorted((*dist.glob("*.whl"), *dist.glob("*.tar.gz")))
-    if len(archives) != 2 or sum(path.suffix == ".whl" for path in archives) != 1:
-        raise ValueError("build did not produce exactly one wheel and one sdist")
+    if len(archives) != 2:
+        raise ValueError("build must produce one wheel and one sdist")
     run_command(
         [sys.executable, str(REPO / "scripts/verify-distribution.py"), *map(str, archives)],
         REPO,
@@ -200,141 +202,117 @@ def verify(output: Path) -> dict:
         output / "install-wheel.log",
     )
     run_command(
-        ["uv", "pip", "check", "--python", str(python)],
-        runtime,
-        env,
-        output / "installed-dependencies.log",
+        ["uv", "pip", "check", "--python", str(python)], runtime, env, output / "pip-check.log"
     )
-    probe = """
-import json, sys
-from pathlib import Path
-import oddsfox_catalogue.cli as cli
-import oddsfox_catalogue.smoke as smoke
-from oddsfox_catalogue.resources import dbt_project_dir
-Path(sys.argv[1]).write_text(json.dumps({'cli': cli.__file__, 'smoke': smoke.__file__, 'dbt': str(dbt_project_dir()), 'sys_path': sys.path}))
-"""
     run_command(
-        [str(python), "-I", "-c", probe, str(output / "installed-paths.json")],
+        [
+            str(python),
+            "-c",
+            "import importlib.util as u; "
+            "assert all(u.find_spec(m) is None for m in ['dlt','dbt','dagster']); "
+            "import oddsfox_catalogue; print(oddsfox_catalogue.__file__)",
+        ],
         runtime,
         env,
-        output / "installed-probe.log",
+        output / "installed-origin.log",
     )
-    installed = json.loads((output / "installed-paths.json").read_text())
-    if any(not Path(installed[key]).is_relative_to(venv) for key in ("cli", "smoke", "dbt")):
-        raise ValueError("runtime imports did not originate from the installed wheel")
-    if any(Path(path).is_relative_to(REPO) for path in installed["sys_path"] if path):
-        raise ValueError("runtime import path exposes the source checkout")
-    resources = Path(installed["dbt"])
-    before = resource_inventory(resources)
-    freeze_resources(resources)
-    assert_resources_frozen(resources)
-    run_command([str(venv / "bin/catalogue"), "--help"], runtime, env, output / "installed-cli.log")
-    workflows = {}
-    for workflow in ("catalogue", "metadata"):
-        proof = output / workflow
-        with GammaServer(FakeGamma(demo_world())) as source:
-            proof_env = dict(
-                env, CATALOGUE_GAMMA_BASE_URL=source.url, CATALOGUE_GAMMA_ALLOW_LOOPBACK="1"
-            )
-            argv = [
-                str(python),
-                "-I",
-                "-m",
-                "oddsfox_catalogue.smoke",
-                "--workflow",
-                workflow,
-                "--output",
-                str(proof),
-            ]
-            market_ids = ("5001", "5002", "6001") if workflow == "catalogue" else ("5001",)
-            for market_id in market_ids:
-                argv.extend(("--market-id", market_id))
-            run_command(argv, runtime, proof_env, output / f"{workflow}-smoke.log", timeout=1830)
-            report = json.loads((proof / "report.json").read_text())
-            if workflow == "catalogue":
-                step_env = dict(proof_env, CATALOGUE_ROOT=report["catalogue_root"])
-                scratch = proof / "stepped-rebuild"
-                for number in range(5):
-                    result_path = proof / f"rebuild-step-{number}.json"
-                    step_args = ["rebuild", "--verify", "--scratch", str(scratch), "--step"]
-                    if number:
-                        step_args.append("--resume")
-                    run_command(
-                        [
-                            str(python),
-                            "-I",
-                            "-c",
-                            "import contextlib,io,pathlib,sys; "
-                            "from oddsfox_catalogue.cli import main; "
-                            "captured=io.StringIO(); "
-                            "\nwith contextlib.redirect_stdout(captured): code=main(sys.argv[2:])"
-                            "\npathlib.Path(sys.argv[1]).write_text(captured.getvalue())"
-                            "\nraise SystemExit(code)",
-                            str(result_path),
-                            *step_args,
-                        ],
-                        runtime,
-                        step_env,
-                        output / f"rebuild-step-{number}.log",
-                        timeout=1830,
-                    )
-                    result = json.loads(result_path.read_text())
-                    if (
-                        result["pending"] is not (number < 4)
-                        or result["matched"] is not (number == 4)
-                        or result["mismatches"]
-                    ):
-                        raise ValueError("installed stepped rebuild claimed incorrect completion")
-                    if number == 4 and len(result["tables"]) != 68:
-                        raise ValueError("installed stepped rebuild omitted semantic comparisons")
-            measured = source.accounting()
-        allowed = {f"/markets/{market_id}" for market_id in market_ids}
-        if workflow == "catalogue":
-            allowed.update(("/events/101", "/events/202"))
-        assert_accounting(report, measured, allowed)
-        if workflow == "catalogue":
-            required = {
-                "raw_rebuild",
-                "backup_create",
-                "backup_verify",
-                "backup_restore",
-                "verify_restore",
-                "injected_publication",
-                "verify_after_failure",
-                "offline_replay",
-            }
-            if not required <= {step["name"] for step in report["steps"]}:
-                raise ValueError("installed catalogue proof omitted a required recovery step")
-            if report.get("semantic_comparisons") != {
-                "offline_replay": True,
-                "raw_rebuild": True,
-                "restore": True,
-            } or report.get("compared_relations") != {
-                "warehouse": 29,
-                "published": 7,
-                "warehouse_schemas": 30,
-            }:
-                raise ValueError("installed catalogue proof omitted complete semantic comparisons")
-        workflows[workflow] = {"report": str(proof / "report.json"), "fixture": measured}
-    after = resource_inventory(resources)
-    assert_resources_frozen(resources)
-    if before != after:
-        raise ValueError("installed workflow changed the packaged dbt resources")
-    return {
+    origin = Path((output / "installed-origin.log").read_text().strip())
+    if origin.is_relative_to(REPO) or not origin.is_relative_to(venv):
+        raise ValueError("package was imported from checkout instead of installed wheel")
+    package = origin.parent
+    before = resource_inventory(package)
+    freeze_resources(package)
+    root, restored = runtime / "catalogue", runtime / "restored"
+    steps = []
+    executable = venv / "bin/catalogue"
+
+    def call(name, arguments, *, source=None, selected_root=root):
+        child_env = dict(env)
+        child_env.update(
+            CATALOGUE_GAMMA_BASE_URL=source or "http://127.0.0.1:9",
+            CATALOGUE_GAMMA_ALLOW_LOOPBACK="1",
+            CATALOGUE_GAMMA_MAX_RETRIES="0",
+        )
+        log = output / (name + ".json")
+        run_command(
+            [str(executable), "--root", str(selected_root), *map(str, arguments)],
+            runtime,
+            child_env,
+            log,
+            timeout=310,
+        )
+        result = json.loads(log.read_text())
+        steps.append({"name": name, "result": result})
+        return result
+
+    call("init", ["init"])
+    with CurrentGammaServer() as fixture:
+        controls = [
+            "probe",
+            "--open-event-id",
+            "1",
+            "--closed-event-id",
+            "2",
+            "--absent-event-id",
+            "999",
+            "--open-market-id",
+            "11",
+            "--closed-market-id",
+            "21",
+            "--absent-market-id",
+            "999",
+        ]
+        call("probe", controls, source=fixture.url)
+        refresh = call("refresh", ["refresh"], source=fixture.url)
+        call("verify", ["verify"])
+        call("reconcile", ["reconcile"], source=fixture.url)
+        bundle = runtime / "metadata-bundle"
+        call(
+            "metadata_refresh",
+            ["metadata", "refresh", "--market-id", "11", "--market-id", "12", "--output", bundle],
+            source=fixture.url,
+            selected_root=runtime / "metadata-producer",
+        )
+        measured = json.loads(json.dumps(fixture.stats))
+    baseline = call("published", ["current"])
+    backup = call("backup", ["backup", "create"])
+    call("verify_backup", ["backup", "verify", backup["path"]])
+    call("restore", ["backup", "restore", backup["path"], "--destination", restored])
+    call("restored_verify", ["verify"], selected_root=restored)
+    # Rebuild from the restored database rather than trusting copied Parquet bytes.
+    import shutil
+
+    shutil.rmtree(restored / "published")
+    rebuilt = call("restored_rebuild", ["publish"], selected_root=restored)
+    for table, descriptor in baseline["relations"].items():
+        for field in ("rows", "schema", "semantic_sha256"):
+            if descriptor[field] != rebuilt["relations"][table][field]:
+                raise ValueError("offline restored rebuild differs from published current state")
+    attempts = sum(step["result"].get("http_attempts", 0) for step in steps)
+    downloaded = sum(step["result"].get("downloaded_bytes", 0) for step in steps)
+    if attempts != measured["http_attempts"] or downloaded != measured["downloaded_bytes"]:
+        raise ValueError("installed request accounting differs from HTTP fixture")
+    if refresh["publication"]["counts"] != {
+        "events": 2,
+        "markets": 3,
+        "event_markets": 3,
+        "outcomes": 6,
+    }:
+        raise ValueError("installed current catalogue contents differ")
+    if resource_inventory(package) != before:
+        raise ValueError("installed package resources changed during workflow")
+    assert_resources_frozen(package)
+    report = {
         "status": "passed",
-        "installed": installed,
-        "resources": before,
-        "workflows": workflows,
-        "distributions": [
-            {
-                "file": path.name,
-                "bytes": path.stat().st_size,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-            for path in archives
-        ],
-        "distribution_audit": json.loads((output / "distribution-audit.json").read_text()),
+        "workflow": "catalogue.v3",
+        "accounting_complete": True,
+        "http_attempts": attempts,
+        "downloaded_bytes": downloaded,
+        "steps": steps,
+        "fixture": measured,
     }
+    (output / "report.json").write_text(json.dumps(report, indent=2))
+    return report
 
 
 def main() -> int:

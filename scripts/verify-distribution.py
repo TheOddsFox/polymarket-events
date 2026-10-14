@@ -14,24 +14,11 @@ from pathlib import Path, PurePosixPath
 
 def allowed_source(path: str) -> bool:
     name = PurePosixPath(path)
-    if name.suffix == ".py" and name.parent.as_posix() in {
-        "oddsfox_catalogue",
-        "oddsfox_catalogue/capture",
-        "oddsfox_catalogue/gamma",
-        "oddsfox_catalogue/load",
-        "oddsfox_catalogue/orchestration",
-    }:
-        return True
-    parts = name.parts
-    if parts[:2] != ("oddsfox_catalogue", "dbt"):
-        return False
-    if len(parts) == 3:
-        return parts[2] in {"dbt_project.yml", "profiles.yml"}
     return (
-        parts[2] == "models"
-        and name.suffix in {".sql", ".yml"}
-        or parts[2] in {"macros", "tests"}
-        and name.suffix == ".sql"
+        name.suffix == ".py"
+        and name.parent.as_posix()
+        in {"oddsfox_catalogue", "oddsfox_catalogue/capture", "oddsfox_catalogue/gamma"}
+        and not any(part in {"load", "orchestration", "dbt"} for part in name.parts)
     )
 
 
@@ -117,7 +104,7 @@ def audit(path: Path) -> dict[str, object]:
             raise ValueError("distribution exceeds unpacked byte allowance")
     required = {
         f"{prefix}{'src/' if prefix else ''}oddsfox_catalogue/{name}"
-        for name in ("__init__.py", "cli.py", "dbt/dbt_project.yml", "dbt/profiles.yml")
+        for name in ("__init__.py", "cli.py", "current_contract.py", "current_store.py")
     }
     if not required <= seen:
         raise ValueError("distribution lacks required installed resources")

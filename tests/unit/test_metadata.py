@@ -7,8 +7,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from oddsfox_catalogue.backup import create_backup, verify_backup
-from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.writer import write_page
 from oddsfox_catalogue.cli import main
 from oddsfox_catalogue.config import GammaSettings, Settings
@@ -211,9 +209,9 @@ def test_refresh_only_selected_ids_accounts_failures_and_does_not_load_or_publis
     assert called == ["/markets/123", "/markets/124", "/markets/125"]
     assert [row["status"] for row in relations(output)["coverage"]] == ["found", "absent", "failed"]
     assert [row["market_id"] for row in relations(output)["markets"]] == ["123"]
-    with Ledger(settings.ledger_path) as ledger:
-        assert ledger.list_batches() == []
-        assert len(ledger._all("SELECT * FROM metadata_requests")) == 3
+    assert not settings.ledger_path.exists()
+    markers = list((settings.data_dir / "metadata" / "raw").glob("**/_request.json"))
+    assert len(markers) == 3
     assert not settings.warehouse_path.exists()
     assert not (settings.published_dir / "current.json").exists()
     offline = tmp_path / "offline"
@@ -236,16 +234,24 @@ def test_absent_or_failed_refresh_never_refills_stale_market(tmp_path):
         assert relations(tmp_path / name)["coverage"][0]["status"] == "absent"
 
 
-def test_backup_retains_targeted_capture_evidence(tmp_path):
+def test_targeted_capture_evidence_is_portable_without_historical_runtime(tmp_path):
+    import shutil
+
     settings = Settings(tmp_path)
     with mock_client(lambda _: httpx.Response(200, json=market())) as client:
         refresh_metadata(
             settings, ["123"], settings.data_dir / "metadata" / "bundles" / "run", client=client
         )
-    backup = create_backup(settings, now=NOW)
-    assert list((backup / "metadata" / "raw").glob("**/*.json.gz"))
-    assert (backup / "metadata" / "bundles" / "run" / "manifest.json").exists()
-    assert verify_backup(backup) == []
+    restored_root = tmp_path / "restored"
+    shutil.copytree(settings.data_dir, restored_root / "data")
+    restored = Settings(restored_root)
+    assert list((restored.data_dir / "metadata" / "raw").glob("**/*.json.gz"))
+    assert (restored.data_dir / "metadata" / "bundles" / "run" / "manifest.json").exists()
+    output = tmp_path / "recovered-bundle"
+    export_metadata(restored, ["123"], output)
+    original_offline = tmp_path / "original-offline"
+    export_metadata(settings, ["123"], original_offline)
+    assert relations(output) == relations(original_offline)
 
 
 def test_newer_direct_catalogue_observation_supersedes_old_targeted_absence(tmp_path):

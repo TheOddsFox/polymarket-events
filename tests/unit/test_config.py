@@ -5,8 +5,8 @@ import pytest
 from oddsfox_catalogue.config import load_settings, settings_as_dict
 
 
-def test_defaults_match_committed_file() -> None:
-    root = Path(__file__).resolve().parents[2]
+def test_metadata_adapter_defaults_are_preserved(tmp_path) -> None:
+    root = tmp_path
     settings = load_settings(root=root, env={})
     assert settings.gamma.base_url == "https://gamma-api.polymarket.com"
     assert settings.gamma.requests_per_second == 2.0
@@ -89,13 +89,13 @@ def test_relative_paths_resolve_under_root(tmp_path: Path) -> None:
     assert settings.run_lock_path == tmp_path / ".state" / "catalogue.lock"
 
 
-def test_settings_serialise() -> None:
-    settings = load_settings(root=Path(__file__).resolve().parents[2], env={})
+def test_settings_serialise(tmp_path) -> None:
+    settings = load_settings(root=tmp_path, env={})
     data = settings_as_dict(settings)
     assert data["gamma"]["page_limit"] == 100
 
 
-def test_finite_invocation_defaults_and_installed_resources(tmp_path: Path) -> None:
+def test_metadata_adapter_finite_invocation_defaults(tmp_path: Path) -> None:
     settings = load_settings(root=tmp_path, env={})
     assert settings.capture.max_requests == 25_000
     assert settings.capture.max_download_bytes == 4 * 1024**3
@@ -103,9 +103,6 @@ def test_finite_invocation_defaults_and_installed_resources(tmp_path: Path) -> N
     assert settings.capture.max_response_bytes == 16 * 1024**2
     assert settings.capture.max_retained_bytes == 64 * 1024**3
     assert settings.capture.max_temp_bytes == 8 * 1024**3
-    assert settings.dbt_project_dir.joinpath("dbt_project.yml").is_file()
-    assert settings.dbt_profiles_dir == settings.dbt_project_dir
-    assert not settings.dbt_project_dir.is_relative_to(tmp_path)
     assert settings.temporary_dir == tmp_path / ".state" / "tmp"
 
 

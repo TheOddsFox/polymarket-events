@@ -9,9 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.cli import configure_logging, main
-from oddsfox_catalogue.config import load_settings
 from oddsfox_catalogue.runlock import RunBusy, run_lock
 
 
@@ -39,12 +37,13 @@ def test_config_show_reads_root_from_environment(
     assert shown["root"] == str(tmp_path.resolve())
 
 
-def test_status_without_ledger_is_harmless(
+def test_status_without_current_store_does_not_create_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
-    assert main(["status"]) == 0
-    assert "no ledger yet" in capsys.readouterr().out
+    assert main(["status"]) == 3
+    assert "not initialized" in capsys.readouterr().out
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_run_lock_is_exclusive(tmp_path: Path) -> None:
@@ -82,37 +81,6 @@ def test_nested_owner_lock_preserves_process_exclusion_after_inner_error(tmp_pat
 def test_capture_rejects_unknown_mode() -> None:
     with pytest.raises(SystemExit):
         main(["capture", "--mode", "hourly"])
-
-
-@pytest.mark.parametrize(("signum", "exit_code"), [(signal.SIGTERM, 143), (signal.SIGHUP, 129)])
-def test_a_stop_signal_during_capture_records_failed_stage_and_exits_128_plus_signal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int, exit_code: int
-) -> None:
-    monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
-    monkeypatch.setenv("CATALOGUE_GAMMA_BASE_URL", "http://127.0.0.1:9")
-    monkeypatch.setenv("CATALOGUE_GAMMA_ALLOW_LOOPBACK", "1")
-    # Four workers: the signal has to drain the pool, not only a serial scan.
-    monkeypatch.setenv("CATALOGUE_CAPTURE_WORKERS", "4")
-
-    def explode(*_args: object, **_kwargs: object) -> None:
-        os.kill(os.getpid(), signum)
-
-    # Planning reads the high-water mark before any scan. Keep that off the network.
-    monkeypatch.setattr("oddsfox_catalogue.gamma.scans._high_water", lambda *_a, **_k: 1)
-    monkeypatch.setattr("oddsfox_catalogue.capture.runner._run_scan", explode)
-
-    assert main(["refresh", "--mode", "bootstrap"]) == exit_code
-
-    settings = load_settings()
-    ledger = Ledger(settings.ledger_path)
-    try:
-        runs = ledger.stage_runs()
-    finally:
-        ledger.close()
-    assert len(runs) == 1
-    assert runs[0]["stage"] == "capture:bootstrap"
-    assert runs[0]["status"] == "failed"
-    assert runs[0]["error"] == f"Terminated: {signal.Signals(signum).name}"
 
 
 def test_sigterm_during_argument_parsing_exits_143(

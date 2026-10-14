@@ -175,6 +175,15 @@ class FaultConnection:
                 raise failure("injected fetch failure")
         return self.connection.fetchone()
 
+    def fetchmany(self, size):
+        rows = []
+        for _ in range(size):
+            row = self.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+        return rows
+
 
 @pytest.mark.parametrize(
     "failure", ["source-bind", "source-execute", "ordered-execute", "fetch", "interrupt"]

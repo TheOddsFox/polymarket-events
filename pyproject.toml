@@ -6,12 +6,8 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "dlt[duckdb,parquet]>=1.10",
-    "dbt-core>=1.10",
-    "dbt-duckdb>=1.9",
-    "dagster>=1.10",
-    "dagster-dbt>=0.26",
-    "dagster-webserver>=1.10",
+    "duckdb>=1.4,<2",
+    "pytz>=2025.2",
     "httpx>=0.27",
     "filelock>=3.15",
 ]
@@ -40,12 +36,6 @@ exclude = [
 ]
 include = [
     "src/oddsfox_catalogue/**/*.py",
-    "src/oddsfox_catalogue/dbt/dbt_project.yml",
-    "src/oddsfox_catalogue/dbt/profiles.yml",
-    "src/oddsfox_catalogue/dbt/models/**/*.sql",
-    "src/oddsfox_catalogue/dbt/models/**/*.yml",
-    "src/oddsfox_catalogue/dbt/macros/**/*.sql",
-    "src/oddsfox_catalogue/dbt/tests/**/*.sql",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -54,12 +44,6 @@ sources = ["src"]
 [tool.hatch.build.targets.sdist]
 include = [
     "src/oddsfox_catalogue/**/*.py",
-    "src/oddsfox_catalogue/dbt/dbt_project.yml",
-    "src/oddsfox_catalogue/dbt/profiles.yml",
-    "src/oddsfox_catalogue/dbt/models/**/*.sql",
-    "src/oddsfox_catalogue/dbt/models/**/*.yml",
-    "src/oddsfox_catalogue/dbt/macros/**/*.sql",
-    "src/oddsfox_catalogue/dbt/tests/**/*.sql",
     "pyproject.toml", "uv.lock", "README.md", "LICENSE",
     "config/catalogue.toml", "docs/**/*.md",
 ]

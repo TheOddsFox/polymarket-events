@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from oddsfox_catalogue.capture.ledger import Ledger
 from oddsfox_catalogue.capture.writer import (
     atomic_write_bytes,
     read_body,
@@ -400,66 +399,62 @@ def refresh_metadata(
     observations: list[Observation] = []
     coverage: list[dict[str, Any]] = []
     try:
-        with Ledger(settings.ledger_path) as ledger:
-            for market_id in market_ids:
-                received = iso_utc(client.now())
-                record = {
+        for market_id in market_ids:
+            received = iso_utc(client.now())
+            record = {
+                "capture_id": capture_id,
+                "market_id": market_id,
+                "received_at": received,
+                "status": "failed",
+                "manifest_path": None,
+                "error": None,
+            }
+            try:
+                response = client.get(f"/markets/{market_id}", max_retries=4, backoff_cap_s=30)
+                received = iso_utc(response.received_at)
+                fields = {
+                    "page_id": f"metadata.{capture_id}.{market_id}",
                     "capture_id": capture_id,
                     "market_id": market_id,
-                    "received_at": received,
-                    "status": "failed",
-                    "manifest_path": None,
-                    "error": None,
+                    "endpoint": response.endpoint,
+                    "record_key": "markets",
+                    "observed_at": received,
+                    "http_status": response.status,
+                    "retries": response.retries,
+                    "latency_s": response.latency_s,
                 }
-                try:
-                    response = client.get(f"/markets/{market_id}", max_retries=4, backoff_cap_s=30)
-                    received = iso_utc(response.received_at)
-                    fields = {
-                        "page_id": f"metadata.{capture_id}.{market_id}",
-                        "capture_id": capture_id,
-                        "market_id": market_id,
-                        "endpoint": response.endpoint,
-                        "record_key": "markets",
-                        "observed_at": received,
-                        "http_status": response.status,
-                        "retries": response.retries,
-                        "latency_s": response.latency_s,
-                    }
-                    page = write_page(directory / market_id, 1, response.body, fields)
-                    record["manifest_path"] = str(page.manifest_path.relative_to(settings.data_dir))
-                    record["received_at"] = received
-                    if response.status == 404:
-                        record["status"] = "absent"
-                    elif response.status == 200:
-                        payload = _read_json(response.body)
-                        records = _records(payload, "markets")
-                        if (
-                            len(records) != 1
-                            or not isinstance(records[0], dict)
-                            or str(records[0].get("id")) != market_id
-                        ):
-                            raise MetadataError("single market response has mismatched identity")
-                        manifest = {**fields, "body_sha256": page.body_sha256}
-                        observations.extend(
-                            _observations(manifest, payload, "markets", {market_id})
-                        )
-                        record["status"] = "found"
-                    else:
-                        raise MetadataError("unexpected single market HTTP status")
-                except (GammaError, ValueError, UnicodeError) as exc:
-                    record["error"] = type(exc).__name__
-                write_marker(directory / market_id / "_request.json", record)
-                ledger.record_metadata_request(record)
-                coverage.append(
-                    {
-                        "market_id": market_id,
-                        "requested": True,
-                        "status": record["status"],
-                        "error": record["error"],
-                        "capture_id": capture_id,
-                        "received_at": record["received_at"],
-                    }
-                )
+                page = write_page(directory / market_id, 1, response.body, fields)
+                record["manifest_path"] = str(page.manifest_path.relative_to(settings.data_dir))
+                record["received_at"] = received
+                if response.status == 404:
+                    record["status"] = "absent"
+                elif response.status == 200:
+                    payload = _read_json(response.body)
+                    records = _records(payload, "markets")
+                    if (
+                        len(records) != 1
+                        or not isinstance(records[0], dict)
+                        or str(records[0].get("id")) != market_id
+                    ):
+                        raise MetadataError("single market response has mismatched identity")
+                    manifest = {**fields, "body_sha256": page.body_sha256}
+                    observations.extend(_observations(manifest, payload, "markets", {market_id}))
+                    record["status"] = "found"
+                else:
+                    raise MetadataError("unexpected single market HTTP status")
+            except (GammaError, ValueError, UnicodeError) as exc:
+                record["error"] = type(exc).__name__
+            write_marker(directory / market_id / "_request.json", record)
+            coverage.append(
+                {
+                    "market_id": market_id,
+                    "requested": True,
+                    "status": record["status"],
+                    "error": record["error"],
+                    "capture_id": capture_id,
+                    "received_at": record["received_at"],
+                }
+            )
         manifest = _write_bundle(
             output,
             _relations(market_ids, observations, coverage),

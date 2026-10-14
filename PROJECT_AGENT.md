@@ -1,30 +1,23 @@
 # Project agent notes
 
-Public OddsFox repository for a local, single-host batch pipeline that catalogues Polymarket events and their markets (metadata and outcome definitions). Trades, order books, and price history are out of scope.
+Public local, single-host catalogue of unique Polymarket events, markets, event-owned memberships and exact native outcome identifiers. Odds, financial metrics and observation history belong outside this runtime.
 
-Stack: Python 3.12, uv, dlt, dbt, DuckDB, and Dagster. Use the `oddsfox-polymarket-events-engineering` workspace from `.pad.toml`. Follow `AGENTS.md`, `README.md`, and the local `pad-engineering` skill.
+Use AGENTS.md and the local pad-engineering skill. Git owns code, CI verification, and Pad scope/evidence. Keep Work/Plans and all operator data outside Git.
 
-## Pipeline
+## Runtime
 
-Gamma API capture writes immutable JSON.gz pages and manifests under `data/raw`. Load writes them into bronze with dlt. Shared normalization supplies both metadata.v1 and the replacement catalogue.v2 warehouse. dbt builds staging, core current, observation history, and marts. Publish writes `data/published/releases/<id>/*.parquet`, coverage and `current.json`. Legacy warehouse roots are incompatible; use a fresh root without modifying old state.
+Python3.12, DuckDB, HTTPX and filelock. catalogue.v3 is a breaking replacement for catalogue.v2; metadata.v1 stays compatible. Current roots have a catalogue_store.v2 stamp and must never reuse, nest beneath, migrate or mutate legacy roots. Preserve a matching baseline runtime for rollback. No dlt/dbt/Dagster runtime or scheduler activation.
 
-Operator targets: `make bootstrap` (first run), `make refresh` (daily), `make reconcile` (weekly), `make replay` (no Gamma calls), `make validate`, `make publish`, `make current`, `make status`, `make verify`, `make backup`, `make verify-backup BACKUP=...`, `make restore-backup BACKUP=... DESTINATION=...`, and `make rebuild`.
+Complete event membership arrays replace links, including empty arrays. Missing/incomplete arrays preserve prior links and remain unresolved. List omissions never establish absence or source completeness. Retain closed/unlinked entities. Native IDs are exact decimal strings; unsafe/conflicting ownership is unavailable until native confirmation.
+
+Response application and progress commit atomically. Verified immutable Parquet releases use an atomic current pointer; current and previous releases survive failures. Bounded evidence and verified daily backups replace permanent raw replay. Default ceilings: 300s normal refresh including publication,10requests/s,1HTTPworker,25krequests,4GiBdownload,16MiBresponse,2GBSQLmemory,2threads,64GiBretained,8GiBtemporary,32GiBfree reserve. Do not raise limits to pass.
 
 ## Verification
 
-- Fast: `git diff --check`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest -q`
-- Completion: both diff checks, `uv lock --check`, `uv sync --locked`, the same Ruff checks, `uv run catalogue dbt -- parse`, and `uv run pytest -q` (one process; CI matches this)
+Development: scripts/verify-fast. Completion: scripts/verify. Both run diff/Ruff/pytest; completion checks/syncs the lockfile. CI additionally audits distributions and runs scripts/verify-installed-workflow.py with real loopback fixtures and an isolated installed wheel. Tests must never contact live Gamma. CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9 and CATALOGUE_GAMMA_ALLOW_LOOPBACK=1 are the default offline test environment.
 
-These commands are wrapped by `scripts/verify-fast` and `scripts/verify`. Hosted CI runs the complete test suite, distribution audits and the installed catalogue workflow against synthetic loopback fixtures. Runtime checks use an independent environment outside the checkout with read-only packaged dbt resources. CI never contacts live Gamma or Pad.
+Test current projections, atomic progress, membership ordering, exact native identity, corruption detection, publication, resource boundaries, process deadlines, verified backup and fresh-root offline recovery. Retained legacy raw/metadata parsing tests remain applicable; obsolete historical stage tests retire with their APIs. Performance and freshness are acceptance gates, never assumptions.
 
-## Tests
+## Git and privacy
 
-New capture, load, dbt, publish, or ops behavior gets a test under `tests/`. Use `tests/unit` for pure logic and `tests/integration` for stage behavior. Use the sanitized payloads in `tests/fixtures/gamma/synthetic` and the fakes in `tests/fakes/`. Cover the happy path and the key failure path, such as a quarantined market, a dropped open event, or an unresolved reference. Tests must never call the live Gamma API. Set `CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9`, as CI does.
-
-## Git
-
-Commit, push, or open a pull request only when the user asks in that turn. Commit subjects are imperative sentences in the style of existing history, such as `Add ...` or `Remove ...`, with no `feat:` or `fix:` prefix. Never force-push, and never push `main` unless the user explicitly asks. The remote is `git@github.com:TheOddsFox/polymarket-events.git`. Change `uv.lock` only together with a dependency change, and confirm `uv lock --check` passes.
-
-## Invariants
-
-Public repository. Never commit `data/`, `.state/`, `dbt/.user.yml`, or any Pad item body, comment, bootstrap JSON, credential, or backup. Keep private OddsFox trading work out of this workspace and this repository.
+Commit, push and open a PR only when requested in the current turn. Use codex/ branches, never force-push or push main without explicit instruction. Keep Pad records, credentials, raw data, warehouse files, backups and private trading work out of this public repository. Change uv.lock with dependency changes and run uv lock --check.

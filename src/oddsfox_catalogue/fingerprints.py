@@ -24,9 +24,9 @@ def semantic_fingerprint(connection, query, parameters=None):
     try:
         cursor = connection.execute(f"SELECT row FROM {hashes_table} ORDER BY row")
         count = 0
-        while result := cursor.fetchone():
-            digest.update(result[0].encode() + b"\n")
-            count += 1
+        while rows := cursor.fetchmany(8192):
+            digest.update(b"".join(row[0].encode() + b"\n" for row in rows))
+            count += len(rows)
         return {
             "rows": count,
             "schema": schema,

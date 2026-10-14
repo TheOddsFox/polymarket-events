@@ -5,13 +5,12 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
-from pathlib import Path
 
 import httpx
 import pytest
 
 from fakes.harness import FakeClock
-from oddsfox_catalogue.config import GammaSettings, load_settings
+from oddsfox_catalogue.config import GammaSettings
 from oddsfox_catalogue.gamma.http import (
     CaptureStopped,
     CursorExpired,
@@ -25,7 +24,6 @@ from oddsfox_catalogue.gamma.http import (
 )
 
 NOW = datetime(2026, 10, 8, 6, 0, tzinfo=UTC)
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _client(
@@ -304,8 +302,8 @@ def test_requests_carry_gamma_params_and_user_agent() -> None:
 
 
 def _committed_client(handler) -> tuple[GammaClient, FakeClock]:
-    """A client built exactly as production builds it: committed TOML defaults, no env overrides."""
-    settings = load_settings(root=REPO_ROOT, env={}).gamma
+    """Preserved metadata adapter defaults, independent of the new catalogue profile."""
+    settings = GammaSettings()
     clock = FakeClock()
     client = GammaClient(
         settings,
