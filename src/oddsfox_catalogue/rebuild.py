@@ -53,6 +53,7 @@ from oddsfox_catalogue.semantics import (
     semantic_query,
     warehouse_snapshot,
 )
+from oddsfox_catalogue.timing import phase_timing
 from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT
 
 VERIFIED_TABLES = SEMANTIC_RELATIONS
@@ -214,6 +215,7 @@ def _source_binding(settings, *, query_settings=None):
     }
 
 
+@phase_timing("recovery.source_seal")
 def _source_seal(settings, *, query_settings=None):
     """Exact evidence bytes plus a consistent SQLite snapshot, not a lock-based cache."""
     query_settings = query_settings or settings
@@ -412,6 +414,7 @@ def _validated_rebuild_source(settings, scratch, *, query_settings=None):
     return value["binding"], record["phase"], reference
 
 
+@phase_timing("recovery.rebuild_and_verify")
 def rebuild_and_verify(
     settings: Settings, *, scratch: Path | None = None, resume: bool = False, step: bool = False
 ) -> RebuildReport:

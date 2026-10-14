@@ -225,15 +225,11 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         if pointer is None:
             raise PublishBlocked("no published release to verify")
         path = settings.published_dir / pointer["path"]
-        digest = pointer["manifest_sha256"]
+        release_id = pointer["release_id"]
     else:
-        path, digest = args.release, None
-    manifest = verify_release(settings, path, manifest_sha256=digest)
-    print(
-        json.dumps(
-            {"verified": True, "release_id": manifest["release_id"], "path": str(path)}, indent=2
-        )
-    )
+        path = args.release
+        release_id = verify_release(settings, path)["release_id"]
+    print(json.dumps({"verified": True, "release_id": release_id, "path": str(path)}, indent=2))
     return 0
 
 

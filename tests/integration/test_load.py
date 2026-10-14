@@ -33,12 +33,7 @@ from oddsfox_catalogue.load.source import (
     market_columns,
     market_resource,
 )
-from oddsfox_catalogue.load.storage import (
-    EVENT_FIELDS,
-    MARKET_FIELDS,
-    ensure_observation_views,
-    stored_rows,
-)
+from oddsfox_catalogue.load.storage import ensure_observation_views
 from oddsfox_catalogue.normalization import normalize_event, normalize_market
 
 TESTS_DIR = Path(__file__).resolve().parents[1]
@@ -1016,11 +1011,7 @@ def test_byte_heavy_selected_load_stays_inside_documented_reservation(tmp_path: 
         )
         encoded = sum(
             _encoded_row_bytes(row)
-            for relation in (
-                stored_rows(rows.events, EVENT_FIELDS),
-                stored_rows(rows.markets, MARKET_FIELDS),
-                rows.quarantine,
-            )
+            for relation in (rows.events, rows.markets, rows.quarantine)
             for row in relation
         )
         assert sum(sizes) == encoded

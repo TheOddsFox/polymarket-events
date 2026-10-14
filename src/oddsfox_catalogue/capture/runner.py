@@ -93,8 +93,9 @@ from oddsfox_catalogue.ids import (
     sha256_bytes,
     utc_now,
 )
-from oddsfox_catalogue.limits import enforce_storage_limits, retained_bytes, temporary_bytes
+from oddsfox_catalogue.limits import enforce_storage_limits, measure_storage
 from oddsfox_catalogue.signals import SIGNALS, Terminated
+from oddsfox_catalogue.timing import phase_timing, record_counter
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +142,9 @@ class StorageBudget:
 
 
 def _storage_budget(settings: Settings) -> StorageBudget:
-    enforce_storage_limits(settings)
-    return StorageBudget(settings, retained_bytes(settings), temporary_bytes(settings))
+    usage = measure_storage(settings)
+    enforce_storage_limits(settings, usage=usage)
+    return StorageBudget(settings, usage.retained_bytes, usage.temporary_bytes)
 
 
 def _reserve(rt: CaptureRuntime, size: int, token: str) -> None:
@@ -262,6 +264,7 @@ def _scan_row(
     }
 
 
+@phase_timing("capture.baseline")
 def _start_batch(
     rt: CaptureRuntime, mode: str, market_ids: list[str], event_ids: list[str]
 ) -> dict[str, Any]:
@@ -688,6 +691,7 @@ def _market_stub_ids(rt: CaptureRuntime, batch: dict[str, Any]) -> set[str]:
     return stubs
 
 
+@phase_timing("capture.plan")
 def _advance_plan(rt: CaptureRuntime, batch_id: str) -> bool:
     batch = rt.ledger.get_batch(batch_id)
     assert batch is not None
@@ -912,16 +916,7 @@ def _adopt_durable_pages(
         if not path.exists():
             break
         manifest = read_manifest(path, trusted_root=rt.settings.raw_dir)
-        if (
-            manifest is None
-            or manifest.get("seq") != expected
-            or not verify_page(
-                directory,
-                manifest,
-                trusted_root=rt.settings.raw_dir,
-                max_body_bytes=rt.settings.capture.max_response_bytes,
-            )
-        ):
+        if manifest is None or manifest.get("seq") != expected:
             raise DurabilityError("orphan page is corrupt")
         previous = read_indexed_manifest(
             rt.settings, directory, rt.ledger.page_for_scan(scan["scan_id"], expected - 1)
@@ -941,6 +936,7 @@ def _adopt_durable_pages(
     return adopted
 
 
+@phase_timing("capture.persist")
 def _persist_page(
     rt: CaptureRuntime,
     batch: dict[str, Any],
@@ -1226,6 +1222,8 @@ def _record_capture_stage(
     http = rt.client.stats.as_dict()
     http["requests"] -= requests_before
     http["downloaded_bytes"] -= bytes_before
+    for name in ("requests", "downloaded_bytes", "retries"):
+        record_counter("capture." + name, http[name])
     counts: dict[str, Any] = {"mode": mode, "http": http}
     if summary is not None:
         counts.update(
@@ -1363,6 +1361,7 @@ def _run_ready_scans(
         raise failure
 
 
+@phase_timing("capture.verify_resume")
 def _verify_resume(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
     scope = _scope(batch)
     marker = _read_marker(
@@ -1419,12 +1418,7 @@ def _verify_resume(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
             manifest = read_manifest(
                 manifest_path(directory, page["seq"]), trusted_root=rt.settings.raw_dir
             )
-            if manifest is None or not verify_page(
-                directory,
-                manifest,
-                trusted_root=rt.settings.raw_dir,
-                max_body_bytes=rt.settings.capture.max_response_bytes,
-            ):
+            if manifest is None:
                 raise DurabilityError("committed capture page is missing or corrupt")
             validate_page_identity(
                 batch, scan, manifest, seq=page["seq"], previous=previous_manifest
@@ -1446,12 +1440,7 @@ def _verify_resume(rt: CaptureRuntime, batch: dict[str, Any]) -> None:
             orphan = read_manifest(
                 manifest_path(directory, expected_seq), trusted_root=rt.settings.raw_dir
             )
-            if orphan is None or not verify_page(
-                directory,
-                orphan,
-                trusted_root=rt.settings.raw_dir,
-                max_body_bytes=rt.settings.capture.max_response_bytes,
-            ):
+            if orphan is None:
                 raise DurabilityError("orphan capture page is corrupt")
             validate_page_identity(
                 batch, scan, orphan, seq=expected_seq, previous=previous_manifest

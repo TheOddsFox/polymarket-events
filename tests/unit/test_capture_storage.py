@@ -41,3 +41,24 @@ def test_existing_dlt_work_blocks_capture_marker_before_any_http(tmp_path):
     finally:
         runtime.client.close()
         runtime.ledger.close()
+
+
+def test_capture_storage_admission_reuses_one_fresh_measurement(tmp_path, monkeypatch):
+    from oddsfox_catalogue.capture import runner
+    from oddsfox_catalogue.limits import StorageUsage
+
+    usage = StorageUsage(123, 45)
+    calls = []
+    monkeypatch.setattr(runner, "measure_storage", lambda settings: calls.append(settings) or usage)
+    original = runner.enforce_storage_limits
+
+    def enforce(settings, *, usage):
+        assert usage is expected
+        return original(settings, usage=usage)
+
+    expected = usage
+    monkeypatch.setattr(runner, "enforce_storage_limits", enforce)
+    settings = Settings(tmp_path)
+    budget = runner._storage_budget(settings)
+    assert calls == [settings]
+    assert (budget.allocated, budget.existing_temporary) == (123, 45)

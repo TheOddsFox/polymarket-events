@@ -4,9 +4,12 @@ import hashlib
 import json
 from uuid import uuid4
 
+from oddsfox_catalogue.timing import phase_timing, record_counter
+
 SEMANTIC_DIGEST_REVISION = "sha256-row-multiset-v1"
 
 
+@phase_timing("fingerprint.semantic")
 def semantic_fingerprint(connection, query, parameters=None):
     connection.execute("SET TimeZone = 'UTC'")
     parameters = parameters or []
@@ -27,6 +30,7 @@ def semantic_fingerprint(connection, query, parameters=None):
         while result := cursor.fetchone():
             digest.update(result[0].encode() + b"\n")
             count += 1
+        record_counter("fingerprint.rows", count)
         return {
             "rows": count,
             "schema": schema,

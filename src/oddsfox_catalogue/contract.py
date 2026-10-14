@@ -45,9 +45,10 @@ PROJECTIONS = {
 }
 
 
-def projection_queries():
+def projection_queries(*, ordered: bool = True):
     queries = {
-        name: f"SELECT {', '.join(columns.split())} FROM {relation} ORDER BY {order}"
+        name: f"SELECT {', '.join(columns.split())} FROM {relation}"
+        + (f" ORDER BY {order}" if ordered else "")
         for name, (relation, columns, order) in PROJECTIONS.items()
     }
     queries["quarantine"] = """

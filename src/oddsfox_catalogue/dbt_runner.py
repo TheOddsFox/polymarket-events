@@ -20,6 +20,7 @@ import duckdb
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.limits import remaining_temp_bytes
 from oddsfox_catalogue.resources import dbt_project_dir
+from oddsfox_catalogue.timing import phase_timing
 from oddsfox_catalogue.warehouse_version import ensure_warehouse_contract
 
 DBT_DIR = dbt_project_dir()
@@ -75,6 +76,7 @@ def assert_warehouse_released(warehouse: Path) -> None:
     connection.close()
 
 
+@phase_timing("dbt.run_dbt_at")
 def run_dbt_at(
     args: Sequence[str],
     *,

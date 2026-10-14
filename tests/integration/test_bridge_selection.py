@@ -111,7 +111,9 @@ def _render(path, *, old_bridge=False):
     return (
         Environment(undefined=StrictUndefined)
         .from_string(path.read_text())
-        .render(ref=ref, config=lambda **kwargs: "")
+        .render(
+            ref=ref, config=lambda **kwargs: "", registered_batches_predicate=lambda column: "true"
+        )
     )
 
 
@@ -143,7 +145,10 @@ def selected_views(request):
         )
         for directory, model in (
             ("staging", "stg_gamma__market_event_refs"),
+            ("core", "int_market_selection_state"),
             ("core", "int_market_selected"),
+            ("core", "int_market_asset_nominations"),
+            ("core", "int_market_asset_conflicts"),
             ("core", "int_market_outcomes"),
             ("core", "markets_current"),
             ("core", "quarantine_market_outcomes"),

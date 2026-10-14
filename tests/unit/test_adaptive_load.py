@@ -10,6 +10,7 @@ import pytest
 
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
+from oddsfox_catalogue.limits import StorageUsage
 from oddsfox_catalogue.load import runner
 from oddsfox_catalogue.load.rows import RowSet
 
@@ -126,15 +127,19 @@ def test_only_estimated_allowance_failures_are_adaptive(monkeypatch, tmp_path, a
     with pytest.raises(runner.LoadReservationExceeded) as estimated:
         runner._preflight_load_bytes(runtime, 1)
     assert type(estimated.value) is runner.LoadReservationExceeded
-    monkeypatch.setattr(
-        runner, "retained_bytes", lambda settings: limit + 1 if allowance == "retained" else 0
-    )
-    monkeypatch.setattr(
-        runner, "temporary_bytes", lambda settings: limit + 1 if allowance == "temporary" else 0
-    )
+    usage = StorageUsage(limit + 1, 0) if allowance == "retained" else StorageUsage(0, limit + 1)
+    measured = []
+
+    def measure(selected):
+        assert selected is settings
+        measured.append(usage)
+        return usage
+
+    monkeypatch.setattr(runner, "measure_storage", measure)
     with pytest.raises(RequestBudgetExceeded) as actual:
         runner._reset_load_budget(runtime)
     assert type(actual.value) is RequestBudgetExceeded
+    assert measured == [usage]
 
 
 @pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])

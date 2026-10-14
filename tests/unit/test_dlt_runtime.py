@@ -529,22 +529,38 @@ def test_external_dlt_pools_preserve_owner_and_refresh_real_connection_limits(
 def test_borrowed_semantic_queries_account_storage_and_close_only_fresh_cursor(
     tmp_path, monkeypatch, failure
 ):
-    from oddsfox_catalogue import semantics
+    from oddsfox_catalogue import limits, semantics
     from oddsfox_catalogue.limits import remaining_temp_bytes
 
     settings = Settings(tmp_path)
     settings = replace(settings, capture=replace(settings.capture, max_temp_bytes=16 * 1024**2))
     settings.warehouse_path.parent.mkdir(parents=True, exist_ok=True)
     owner = spill_pinned_owner(settings)
-    accounted, cursors = [], []
+    measured, accounted, caps, cursors = [], [], [], []
+    actual_measure = semantics.measure_storage
     actual_enforce = semantics.enforce_storage_limits
+    actual_remaining = semantics.remaining_temp_bytes
 
-    def enforce(selected):
+    def measure(selected):
         assert selected is settings
-        accounted.append(True)
-        actual_enforce(selected)
+        usage = actual_measure(selected)
+        measured.append(usage)
+        return usage
 
+    def enforce(selected, *, usage=None):
+        assert selected is settings
+        accounted.append(usage)
+        actual_enforce(selected, usage=usage)
+
+    def remaining(selected, *, usage):
+        assert selected is settings
+        caps.append(usage)
+        return actual_remaining(selected, usage=usage)
+
+    monkeypatch.setattr(semantics, "measure_storage", measure)
+    monkeypatch.setattr(limits, "measure_storage", measure)
     monkeypatch.setattr(semantics, "enforce_storage_limits", enforce)
+    monkeypatch.setattr(semantics, "remaining_temp_bytes", remaining)
     try:
         with semantics.bounded_connection(settings, connection=owner) as first:
             assert first is not owner
@@ -563,6 +579,7 @@ def test_borrowed_semantic_queries_account_storage_and_close_only_fresh_cursor(
                 ).fetchone()
                 assert value != first_setting and timezone == "UTC"
                 assert expected < settings.capture.max_temp_bytes
+                (settings.temporary_dir / "spill-during-query").write_bytes(b"x" * (512 * 1024))
                 if failure is not None:
                     raise failure("synthetic query interruption")
 
@@ -571,7 +588,13 @@ def test_borrowed_semantic_queries_account_storage_and_close_only_fresh_cursor(
         else:
             with pytest.raises(failure, match="synthetic query interruption"):
                 query()
-        assert accounted == [True] * 4
+        assert len(measured) == len(accounted) == 4
+        assert accounted[0] is caps[0] is measured[0]
+        assert accounted[2] is caps[1] is measured[2]
+        assert accounted[1] is accounted[3] is None
+        assert len(caps) == 2
+        assert measured[2].temporary_bytes == measured[1].temporary_bytes + 1024**2
+        assert measured[3].temporary_bytes == measured[2].temporary_bytes + 512 * 1024
         for cursor in [first, *cursors]:
             with pytest.raises(duckdb.ConnectionException, match="already closed"):
                 cursor.execute("SELECT 1")

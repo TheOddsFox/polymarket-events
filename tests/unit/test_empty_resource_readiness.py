@@ -21,6 +21,7 @@ from oddsfox_catalogue.load.source import (
     market_resource,
     quarantine_resource,
 )
+from oddsfox_catalogue.load.storage import EVENT_FIELDS, MARKET_FIELDS, stored_rows
 from oddsfox_catalogue.semantics import bounded_connection
 from oddsfox_catalogue.warehouse_version import ensure_warehouse_contract
 
@@ -253,6 +254,8 @@ def test_nonempty_resources_always_run_even_when_the_targets_are_ready(native, m
         "_empty_table_ready",
         lambda *args: pytest.fail("nonempty data consulted an empty-resource shortcut"),
     )
+    rows.events = list(stored_rows(rows.events, EVENT_FIELDS))
+    rows.markets = list(stored_rows(rows.markets, MARKET_FIELDS))
     resources = runner._chunk_resources(native, rows)
     for table in ("event_observations", "market_observations", "quarantined_records"):
         resource = next(resources)
