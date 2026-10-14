@@ -21,7 +21,14 @@ from oddsfox_catalogue.capture.writer import (
 )
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.gamma.http import GammaClient, GammaError
-from oddsfox_catalogue.ids import canonical_json, iso_utc, observation_id, sha256_bytes, utc_now
+from oddsfox_catalogue.ids import (
+    canonical_json,
+    ensure_utc,
+    iso_utc,
+    observation_id,
+    sha256_bytes,
+    utc_now,
+)
 from oddsfox_catalogue.normalization import (
     NormalizationError as MetadataError,
 )
@@ -400,7 +407,8 @@ def refresh_metadata(
     coverage: list[dict[str, Any]] = []
     try:
         for market_id in market_ids:
-            received = iso_utc(client.now())
+            # Preserve receipt ordering against raw evidence with microsecond timestamps.
+            received = _timestamp(ensure_utc(client.now()).isoformat())
             record = {
                 "capture_id": capture_id,
                 "market_id": market_id,
@@ -411,7 +419,7 @@ def refresh_metadata(
             }
             try:
                 response = client.get(f"/markets/{market_id}", max_retries=4, backoff_cap_s=30)
-                received = iso_utc(response.received_at)
+                received = _timestamp(ensure_utc(response.received_at).isoformat())
                 fields = {
                     "page_id": f"metadata.{capture_id}.{market_id}",
                     "capture_id": capture_id,

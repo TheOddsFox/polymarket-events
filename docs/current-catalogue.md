@@ -212,6 +212,10 @@ its configured raw-evidence and lock paths too, including resolved symlink targe
 before creating directories or making requests. Offline export from legacy evidence
 remains supported.
 
+New targeted request and response receipts retain sub-millisecond precision so
+offline export preserves their order against older raw observations. Existing
+millisecond receipts remain readable as recorded; lost precision cannot be recovered.
+
 ## Verification and deployment evidence
 
 The [acceptance record](current-catalogue-acceptance.md) distinguishes measured

@@ -523,3 +523,84 @@ def test_receipt_authority_compares_instants_across_timezone_offsets(tmp_path):
     )
     export_metadata(settings, ["123"], tmp_path / "bundle")
     assert relations(tmp_path / "bundle")["markets"][0]["question"] == "Later"
+
+
+@pytest.mark.parametrize("mode", ["found", "absent", "mismatched", "budget"])
+@pytest.mark.parametrize("later_raw", [False, True])
+def test_submillisecond_receipt_authority_and_offline_replay(tmp_path, mode, later_raw):
+    settings = Settings(tmp_path)
+    raw_page(
+        settings,
+        [market(question="Stale")],
+        name="stale",
+        stamp="2026-10-10T00:00:00.000100Z",
+    )
+    receipt = datetime.fromisoformat("2026-10-10T00:00:00.000900+00:00")
+    requested = []
+
+    def handle(request):
+        requested.append(request.url.path)
+        if mode == "absent":
+            return httpx.Response(404, json={})
+        if mode == "mismatched":
+            return httpx.Response(200, json=market("999", question="Wrong"))
+        return httpx.Response(
+            200,
+            json=market("123", question="Fresh", clobTokenIds='["300", "400"]'),
+        )
+
+    client = GammaClient(
+        GammaSettings(max_retries=0),
+        transport=httpx.MockTransport(handle),
+        now=lambda: receipt,
+        max_requests=0 if mode == "budget" else 25_000,
+    )
+    with client:
+        result = refresh_metadata(settings, ["123"], tmp_path / "refresh", client=client)
+
+    expected_status = {
+        "found": "found",
+        "absent": "absent",
+        "mismatched": "failed",
+        "budget": "failed",
+    }[mode]
+    refresh_relations = relations(tmp_path / "refresh")
+    assert refresh_relations["coverage"][0]["status"] == expected_status
+    if mode == "found":
+        assert refresh_relations["markets"][0]["question"] == "Fresh"
+        assert [row["asset_id"] for row in refresh_relations["outcomes"]] == ["300", "400"]
+    else:
+        assert refresh_relations["markets"] == []
+    assert result["http_attempts"] == (0 if mode == "budget" else 1)
+    assert requested == ([] if mode == "budget" else ["/markets/123"])
+
+    marker_path = next((settings.data_dir / "metadata" / "raw").glob("**/_request.json"))
+    marker = json.loads(marker_path.read_text())
+
+    offline = tmp_path / "offline"
+    if later_raw:
+        raw_page(
+            settings,
+            [market(question="Newest", clobTokenIds='["500", "600"]')],
+            name="newer",
+            stamp="2026-10-10T00:00:00.000950Z",
+        )
+    export_metadata(settings, ["123"], offline)
+    offline_relations = relations(offline)
+    if later_raw:
+        assert offline_relations["coverage"][0]["status"] == "found"
+        assert offline_relations["markets"][0]["question"] == "Newest"
+        assert [row["asset_id"] for row in offline_relations["outcomes"]] == ["500", "600"]
+    else:
+        if mode != "found":
+            assert offline_relations["coverage"][0]["status"] == expected_status
+            assert offline_relations["markets"] == []
+        else:
+            assert offline_relations["coverage"][0]["status"] == "found"
+            assert offline_relations["markets"][0]["question"] == "Fresh"
+            assert [row["asset_id"] for row in offline_relations["outcomes"]] == ["300", "400"]
+
+    assert marker["received_at"] == "2026-10-10T00:00:00.000900Z"
+    if mode != "budget":
+        page_manifest = marker_path.parent / Path(marker["manifest_path"]).name
+        assert json.loads(page_manifest.read_text())["observed_at"] == "2026-10-10T00:00:00.000900Z"
