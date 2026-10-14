@@ -25,8 +25,6 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-import duckdb
-
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 from fakes.current_gamma import CurrentGammaServer  # noqa: E402
@@ -495,9 +493,7 @@ def run(args):
                     for child in path.rglob("*"):
                         safe_path(child)
         require(not (seed / "catalogue.duckdb.wal").exists(), "seed must be checkpointed and idle")
-        with duckdb.connect(str(settings.store_path), read_only=True) as conn:
-            conn.execute("SET memory_limit='2GB'")
-            conn.execute("SET threads=2")
+        with connect_store(settings, read_only=True) as conn:
             validate_store(conn)
             verified = verify_current(settings, connection=conn)
             discovery = get_state(conn, "discovery")

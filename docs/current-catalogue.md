@@ -61,6 +61,16 @@ protocol 1 import requires a fresh root; preserve that failed root as evidence.
 A repeated completed import verifies its pinned seed identity. Import is offline and
 makes no source-completeness claim. Never delete the old runtime/root to make room.
 Rollback means returning consumers and scheduling to that preserved pair.
+Select the old root explicitly with the preserved executable, and retain the original
+`CATALOGUE_CONFIG` if one was used:
+
+```sh
+CATALOGUE_ROOT=/archive/legacy-root /archive/rollback/catalogue config show
+```
+
+Check the resolved raw, warehouse and publication paths before redirecting consumers.
+The preserved environment must import the preserved source snapshot independently of
+the new checkout; verify this before cutover.
 
 ## Provider gate and bounded operations
 

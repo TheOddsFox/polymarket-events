@@ -302,7 +302,6 @@ def _finish_memberships(conn, *, supplement=False):
                 PARTITION BY event_id ORDER BY receipt DESC,response DESC)=1""")
     if supplement:
         _finish_supplements(conn)
-        _identity_checks(conn)
     # Unknown parents remain evidence and fail closed, including empty/unknown arrays.
     if conn.execute("""SELECT 1 FROM seed_latest l LEFT JOIN events e
         ON e.venue='polymarket' AND e.event_id=l.event_id WHERE e.event_id IS NULL LIMIT 1""").fetchone():
@@ -494,6 +493,7 @@ def import_release(settings, conn, release_path, *, manifest_sha256, raw_root, d
             _finish_memberships(conn, supplement=True)
             next_stage = "verify"
         else:
+            _identity_checks(conn)
             result = store.validate_store(conn, allow_seeding=True)
             coverage, _ = _read_json(release / "coverage.json", release, JSON_LIMIT)
             frontiers = {

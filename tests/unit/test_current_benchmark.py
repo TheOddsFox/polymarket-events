@@ -342,3 +342,60 @@ def test_gap_discovery_counts_actual_passes_retries_and_includes_whole_refresh_t
     assert report["window_http_attempts"] == {"events": 1, "markets": 3}
     assert report["included_in_refresh_elapsed_wall_s"] == 2.5
     assert "not isolated" in report["timing_scope"]
+
+
+@pytest.mark.parametrize("temporary_full", [False, True])
+def test_preflight_uses_bounded_readonly_connection_before_validation(
+    tmp_path, monkeypatch, temporary_full
+):
+    import duckdb
+
+    from oddsfox_catalogue import current_config
+
+    seed = current_config.validate_root(tmp_path / "seed", initialize=True)
+    settings = current_config.CurrentSettings(seed)
+    with duckdb.connect(str(settings.store_path)) as conn:
+        conn.execute("CREATE TABLE evidence(value INTEGER)")
+        conn.execute("INSERT INTO evidence VALUES (42)")
+    before = benchmark.digest(settings.store_path)
+    visited = []
+
+    def validate(conn):
+        visited.append(True)
+        assert conn.execute("SELECT * FROM evidence").fetchall() == [(42,)]
+        assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == 2
+        assert conn.execute("SELECT current_setting('memory_limit')").fetchone()[0] == "1.8 GiB"
+        assert conn.execute("SELECT current_setting('temp_directory')").fetchone()[0] == str(
+            seed / "tmp"
+        )
+        assert (
+            conn.execute("SELECT current_setting('max_temp_directory_size')").fetchone()[0]
+            == "8.0 GiB"
+        )
+        with pytest.raises(duckdb.InvalidInputException, match="read-only"):
+            conn.execute("INSERT INTO evidence VALUES (43)")
+        raise ValueError("preflight resource probe complete")
+
+    monkeypatch.setattr(benchmark, "validate_store", validate)
+    if temporary_full:
+        original_size = current_config.directory_bytes
+        monkeypatch.setattr(
+            current_config,
+            "directory_bytes",
+            lambda path: (
+                settings.limits.max_temp_bytes + 1 if path == seed / "tmp" else original_size(path)
+            ),
+        )
+    output = tmp_path / "output"
+    args = benchmark.parser().parse_args(["--seed-root", str(seed), "--output", str(output)])
+    assert benchmark.run(args) == 1
+    report = benchmark.json.loads((output / "report.json").read_text())
+    if temporary_full:
+        assert "temporary storage allowance exhausted" in report["error"]
+        assert visited == []
+    else:
+        assert report["error"] == "ValueError: preflight resource probe complete"
+        assert visited == [True]
+        assert (seed / "tmp").is_dir()
+    assert benchmark.digest(settings.store_path) == before
+    assert not (seed / "catalogue.duckdb.wal").exists()

@@ -246,14 +246,14 @@ def test_old_private_protocol_requires_fresh_root(tmp_path):
 
 def test_late_evidence_failure_rolls_back_supplement_rows_and_claims(tmp_path, monkeypatch):
     seed = setup(tmp_path, [{"id": "1", "markets": [market()]}])
-    original = importer._identity_checks
+    original = importer._finish_memberships
 
-    def fail(conn):
-        original(conn)
+    def fail(conn, **kwargs):
+        original(conn, **kwargs)
         assert conn.execute("SELECT count(*) FROM markets WHERE market_id='9'").fetchone() == (1,)
         raise RuntimeError("late supplemental failure")
 
-    monkeypatch.setattr(importer, "_identity_checks", fail)
+    monkeypatch.setattr(importer, "_finish_memberships", fail)
     with pytest.raises(CurrentError, match="late supplemental failure"):
         finish(seed)
     conn = seed[1]
@@ -262,7 +262,7 @@ def test_late_evidence_failure_rolls_back_supplement_rows_and_claims(tmp_path, m
     assert conn.execute("SELECT count(*) FROM _receipts WHERE id='9'").fetchone() == (0,)
     assert store.generation(conn) == 0
     assert store.get_state(conn, "seed_pending")["stage"] == "evidence"
-    monkeypatch.setattr(importer, "_identity_checks", original)
+    monkeypatch.setattr(importer, "_finish_memberships", original)
     assert finish(seed)["valid"]
 
 
@@ -323,3 +323,36 @@ def test_unusable_baseline_and_supplement_preserve_meaningful_identity_errors(
     assert conn.execute("SELECT identity_error FROM markets WHERE market_id='9'").fetchone() == (
         "v2 market lacks positionIds",
     )
+
+
+def test_identity_phase_failure_keeps_private_evidence_for_retry(tmp_path, monkeypatch):
+    seed = setup(tmp_path, [{"id": "1", "markets": [market()]}])
+    settings, conn, release, args = seed
+    assert importer.import_release(settings, conn, release, **args)["phase"] == "verify"
+    tables = ("markets", "outcomes", "_identity", "_identity_claims", "_receipts")
+    before = {
+        table: conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall() for table in tables
+    }
+    original = importer._identity_checks
+
+    def fail(conn):
+        original(conn)
+        conn.execute("UPDATE markets SET usable=false WHERE market_id='9'")
+        raise RuntimeError("identity verification failure")
+
+    monkeypatch.setattr(importer, "_identity_checks", fail)
+    with pytest.raises(CurrentError, match="identity verification failure"):
+        importer.import_release(settings, conn, release, **args)
+    assert store.get_state(conn, "seed_pending")["stage"] == "verify"
+    assert store.generation(conn) == 0
+    assert store.get_state(conn, "seed") is None
+    assert before == {
+        table: conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall() for table in tables
+    }
+    monkeypatch.setattr(importer, "_identity_checks", original)
+
+    def no_replay(*args):
+        raise AssertionError("phase C replayed raw pages")
+
+    monkeypatch.setattr(importer, "_event_pages", no_replay)
+    assert importer.import_release(settings, conn, release, **args)["valid"]
