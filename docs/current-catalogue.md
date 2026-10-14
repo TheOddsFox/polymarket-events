@@ -207,6 +207,10 @@ uv run catalogue --root /srv/metadata-producer metadata export \
 Repeat `--market-id` for more IDs. Preserve metadata.v1 validation and consumer behavior;
 use an isolated producer root. A v3 root is rejected and refresh rejects an existing
 legacy warehouse/ledger producer root. Export is offline; refresh calls Gamma.
+Producer and output paths must also stay outside v3 root descendants. Refresh checks
+its configured raw-evidence and lock paths too, including resolved symlink targets,
+before creating directories or making requests. Offline export from legacy evidence
+remains supported.
 
 ## Verification and deployment evidence
 

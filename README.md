@@ -36,13 +36,16 @@ uv run catalogue --root /srv/catalogue-v3 status
 uv run catalogue --root /srv/catalogue-v3 verify
 ```
 
-Normal refresh below 300 seconds is a target, **unproven until representative benchmark
-evidence exists**. Active/unknown checks within six hours and cold closed checks within
-a month depend on provider behavior, backlog, and invocation cadence. Observed coverage
-is never a claim of source completeness.
+**Deployment acceptance remains open:** full-store refresh and verification exceeded
+the 300-second deadline, and the measured seven-backup publication reservation exceeded
+the storage limit. See the [acceptance evidence](docs/current-catalogue-acceptance.md).
+Active/unknown checks within six hours and cold closed checks within a month remain
+conditional on provider behavior, backlog, invocation cadence and measured capacity.
+Observed coverage is never a claim of source completeness.
 
 The isolated `metadata refresh` and `metadata export` CLI and metadata.v1 consumer
-contract remain available; see the guide. Do not point them at a v3 or legacy producer root.
+contract remain available; see the guide. Refresh requires an isolated producer root;
+offline export can read legacy raw evidence. Both commands reject v3 roots.
 
 Development checks (no live Gamma calls):
 

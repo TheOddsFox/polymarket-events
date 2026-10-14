@@ -82,8 +82,16 @@ def _metadata(args):
     from .metadata import GammaClient, export_metadata, refresh_metadata
 
     settings = load_settings(root=args.root)
-    if (settings.root / "catalogue.json").exists():
-        raise CurrentError("metadata.v1 requires an isolated producer root")
+    locations = [settings.root, args.output]
+    if args.metadata_command == "refresh":
+        locations.extend([settings.data_dir / "metadata" / "raw", settings.run_lock_path])
+    for location in locations:
+        try:
+            actual = location.resolve(strict=False)
+        except RuntimeError as exc:
+            raise CurrentError("invalid metadata.v1 isolation path") from exc
+        if any((parent / "catalogue.json").exists() for parent in (actual, *actual.parents)):
+            raise CurrentError("metadata.v1 requires isolated producer and output roots")
     if args.metadata_command == "refresh" and (
         settings.warehouse_path.exists() or settings.ledger_path.exists()
     ):
