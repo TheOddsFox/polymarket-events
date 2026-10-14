@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-
-FIXED_NOW = datetime(2026, 10, 8, 6, 0, 0, tzinfo=UTC)
 
 
 @dataclass
