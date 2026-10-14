@@ -84,6 +84,10 @@ logs and dlt state stay under the operator root.
 dlt telemetry, pipeline tracing and configuration resolver tracing are disabled during
 loading. Resolver histories cannot accumulate across chunks; an existing caller's
 trace context is restored when loading exits.
+Repeated load chunks skip empty dlt runs only after validating committed native
+schema state and the exact existing table schema, with no pending packages.
+Absent state uses ordinary materialization; incompatible schemas fail. Nonempty
+resources and storage admission remain mandatory.
 Optional launchd templates require separate `__PROJECT_ROOT__` and `__OPERATOR_ROOT__`
 paths; editing these templates does not activate scheduling.
 

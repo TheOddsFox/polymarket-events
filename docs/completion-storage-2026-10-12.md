@@ -4,6 +4,38 @@ The acceptance limit remains **256 GiB combined working and recovery storage**, 
 32 GiB combined temporary storage. Product defaults remain 64/8 GiB. No retained
 catalogue roots have been migrated, deleted or declared complete.
 
+## Current acceptance status — 2026-10-14
+
+The bootstrap warehouse build completed all **89 dbt steps**: 26 models and
+63 tests, with no failed or skipped nodes. Full certification covers 29 semantic
+relations, 30 schemas and seven public projections. The certified build took
+8,695.50 seconds, including 1,627.00 seconds for dbt.
+
+The bootstrap release `20261013T191053Z` was published within the four-hour
+invocation limit and independently verified. Its manifest SHA-256 is
+`fcc2760fcb9e1808e923c5df7a5ad6fcd6fbc6e89064ca0a74d3aaac5fc9621f`.
+It contains 1,138,596 events, 4,321,104 markets, 8,638,875 outcomes and
+1,714 accounted unusable market identities. Malformed-record quarantines are zero.
+These are bootstrap counts; daily and reconcile must finish before final counts
+are frozen.
+
+Daily capture completed its sealed scope under the approved limits: 1,108 latest
+scan groups, 105,421 pages and 394,284 top-level records, including the selected
+closure checks and parent-event follow-ups. Its seven invocations consumed
+105,440 HTTP attempts and 4,668,721,300 downloaded bytes, including failed attempts.
+Two separately accounted availability probes added two attempts and 9,955 bytes.
+Daily loading is still in progress. Oversized successful keyset responses now
+reduce the request limit at the same cursor; partial downloads and retries remain
+charged. The installed runtime at
+`41065172e8cebe8eb7d395b674db643cc258d8f0` passed 1,520 offline tests,
+distribution and installed-workflow checks, a bounded public catalogue smoke,
+independent review and [exact-commit CI](https://github.com/TheOddsFox/polymarket-events/actions/runs/38484699593).
+
+Daily/reconcile completion, full-data replay and raw rebuild, complete backup
+restoration, final-root verification and approved cleanup remain incomplete.
+The historical failures and measurements below explain the changes; they do
+not supersede the successful bootstrap certification.
+
 ## Implemented layout
 
 Fresh warehouses use `oddsfox.polymarket.warehouse.v4`. Each normalized observation
@@ -16,6 +48,12 @@ Market staging, market history and current markets are views, avoiding additiona
 copies of the retained observations. Their columns, semantic values and observation grain are unchanged.
 Loads still invalidate build certification; a subset build cannot publish. The public
 `catalogue.v2` and `metadata.v1` contracts are unchanged.
+
+Later load chunks avoid another empty dlt run when committed native schema state,
+the exact physical table schema and its required observation view are present,
+with no extracted or normalized packages pending. Missing state retains ordinary
+materialization and recovery; incompatible schemas fail explicitly. Nonempty
+resources, raw checks, storage admission and loaded checkpoints remain mandatory.
 
 The old warehouse.v3 root stays intact with its matching runtime. The completion run
 must reuse its exact verified raw captures in a fresh owned root; it must not reacquire

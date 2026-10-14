@@ -262,6 +262,7 @@ else:
     resource_runs = []
     resource_pipelines = []
     resource_owners = []
+    invocation_ranges = []
     def checked_run(self, *args, **kwargs):
         traces = Container()[TraceLogContext]
         assert traces is not caller
@@ -289,6 +290,7 @@ else:
             load_runtime = LoadRuntime(settings, ledger)
             batches = []
             for _ in range(3):
+                first_run = len(resource_runs)
                 run_capture(CaptureRuntime(settings, client, ledger), "selected", market_ids=["1"])
                 result = load_pending(load_runtime)
                 assert result.pages_loaded == result.market_rows == 1
@@ -300,15 +302,16 @@ else:
                 assert Container()[TraceLogContext] is caller
                 assert caller.logging_enabled is True
                 assert (tuple(caller.resolved_traces), tuple(caller.all_traces)) == caller_history
+                invocation_ranges.append((first_run, len(resource_runs)))
             assert len(set(batches)) == 3
-            assert len(resource_runs) == 12
+            assert len(resource_runs) == 10
             assert load_pending(load_runtime).pages_loaded == 0
-            assert len(resource_runs) == 12
+            assert len(resource_runs) == 10
             assert Container()[TraceLogContext] is caller
             assert (tuple(caller.resolved_traces), tuple(caller.all_traces)) == caller_history
             pipeline = resource_pipelines[-1]
             assert len({id(owner) for owner in resource_owners}) == 3
-            assert all(len({id(owner) for owner in resource_owners[start:start+4]}) == 1 for start in (0,4,8))
+            assert all(len({id(owner) for owner in resource_owners[start:end]}) == 1 for start,end in invocation_ranges)
             for owner in resource_owners:
                 try:
                     owner.execute('SELECT 1')

@@ -53,13 +53,17 @@ from oddsfox_catalogue.load.rows import (
 )
 from oddsfox_catalogue.load.runtime import confined_runtime
 from oddsfox_catalogue.load.source import (
+    QUARANTINE_COLUMNS,
+    event_columns,
     event_resource,
     interrupted,
     make_destination,
     make_pipeline,
+    market_columns,
     market_resource,
     quarantine_resource,
     registry_resource,
+    stored_columns,
 )
 from oddsfox_catalogue.load.storage import (
     EVENT_FIELDS,
@@ -330,14 +334,95 @@ def _mid_load_fault() -> None:
     fault_point("mid_dlt_load")
 
 
-def _chunk_resources(rows: RowSet) -> Iterator[DltResource]:
+def _empty_table_ready(rt: LoadRuntime, name: str, columns: dict) -> bool:
+    pipeline = rt.pipeline
+    if pipeline is None or rt.connection is None:
+        return False
+    if (
+        not pipeline.default_schema_name
+        or not pipeline.schemas.has_schema(pipeline.default_schema_name)
+        or pipeline.list_extracted_load_packages()
+        or pipeline.list_normalized_load_packages()
+    ):
+        return False
+    schema = pipeline.default_schema
+    if (
+        schema.is_new
+        or schema.is_modified
+        or name not in schema.tables
+        or not pipeline.schemas.has_schema(pipeline.default_schema_name)
+    ):
+        return False
+    table = schema.tables[name]
+    declared = schema.get_table_columns(name, include_incomplete=True)
+    if not columns.keys() <= declared.keys() or declared.keys() - columns.keys() - {
+        "_dlt_load_id",
+        "_dlt_id",
+    }:
+        raise LoadBlocked("empty resource has incompatible native schema columns")
+    for column, expected in columns.items():
+        if any(declared[column].get(key) != value for key, value in expected.items()):
+            raise LoadBlocked("empty resource has incompatible native schema hints")
+    target = rt.connection.execute(
+        "SELECT table_type FROM information_schema.tables WHERE table_schema=? AND table_name=?",
+        [rt.settings.load.dataset_name, name],
+    ).fetchone()
+    if target is None:
+        return False
+    if target != ("BASE TABLE",):
+        raise LoadBlocked("empty resource target is not a physical table")
+    mapper = pipeline.destination.capabilities().get_type_mapper()
+    expected = {
+        column: (mapper.to_destination_type(hints, table), hints.get("nullable", True))
+        for column, hints in declared.items()
+    }
+    actual = {
+        column: (kind, nullable == "YES")
+        for column, kind, nullable in rt.connection.execute(
+            "SELECT column_name,data_type,is_nullable FROM information_schema.columns "
+            "WHERE table_schema=? AND table_name=?",
+            [rt.settings.load.dataset_name, name],
+        ).fetchall()
+    }
+    if actual != expected:
+        raise LoadBlocked("empty resource target has incompatible physical schema")
+    if name.endswith("_values"):
+        # Views are validated before the loop and after every actual resource run.
+        view = rt.connection.execute(
+            "SELECT table_type FROM information_schema.tables "
+            "WHERE table_schema=? AND table_name=?",
+            [rt.settings.load.dataset_name, name.removesuffix("_values")],
+        ).fetchone()
+        if view != ("VIEW",):
+            return False
+    return True
+
+
+def _chunk_resources(rt: LoadRuntime, rows: RowSet) -> Iterator[DltResource | None]:
     """Build each resource lazily so it is created immediately before its run."""
     # Typed empty resources are required for selected/empty captures and quarantine exports.
-    yield event_resource(
-        interrupted(rows.events, _mid_load_fault), materialize_only=not rows.events
-    )
-    yield market_resource(rows.markets, materialize_only=not rows.markets)
-    yield quarantine_resource(rows.quarantine, materialize_only=not rows.quarantine)
+    for data, factory, name, columns in (
+        (
+            rows.events,
+            event_resource,
+            "event_observations_values",
+            stored_columns(event_columns(), EVENT_FIELDS),
+        ),
+        (
+            rows.markets,
+            market_resource,
+            "market_observations_values",
+            stored_columns(market_columns(), MARKET_FIELDS),
+        ),
+        (rows.quarantine, quarantine_resource, "quarantined_records", QUARANTINE_COLUMNS),
+    ):
+        if not data and _empty_table_ready(rt, name, columns):
+            yield None
+        else:
+            yield factory(
+                interrupted(data, _mid_load_fault) if factory is event_resource else data,
+                materialize_only=not data,
+            )
 
 
 def _load_chunk(
@@ -357,8 +442,10 @@ def _load_chunk(
     # several resources before running them corrupts dlt's shared schema (json_pointer
     # hints leak into event_observations). Each run is idempotent under insert-only merge,
     # so a crash between runs is safe.
-    for resource, size in zip(_chunk_resources(rows), serialized_bytes, strict=True):
+    for resource, size in zip(_chunk_resources(rt, rows), serialized_bytes, strict=True):
         _preflight_load_bytes(rt, size)
+        if resource is None:
+            continue
         info = _run_resource(rt, resource)
         _reset_load_budget(rt)
         if info.loads_ids:

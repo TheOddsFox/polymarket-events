@@ -113,6 +113,27 @@ def _load(settings: Settings) -> Any:
         ledger.close()
 
 
+def test_repeated_chunks_materialize_empty_quarantine_only_once(tmp_path, monkeypatch):
+    from oddsfox_catalogue.load import runner
+
+    batch_id = _capture(tmp_path)
+    settings = make_settings(tmp_path, {"CATALOGUE_LOAD_MAX_PAGES_PER_RUN": "1"})
+    materializations = []
+    original = runner.quarantine_resource
+
+    def resource(rows, **kwargs):
+        materializations.append(kwargs.get("materialize_only", False))
+        return original(rows, **kwargs)
+
+    monkeypatch.setattr(runner, "quarantine_resource", resource)
+    result = _load(settings)
+    assert result.pages_loaded > 1
+    assert result.batches_registered == [batch_id]
+    assert result.quarantined == 0
+    assert _table_count(settings, "quarantined_records") == 0
+    assert materializations == [True]
+
+
 def _query(settings: Settings, sql: str) -> Any:
     con = duckdb.connect(str(settings.warehouse_path), read_only=True)
     try:

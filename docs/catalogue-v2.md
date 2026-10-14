@@ -19,6 +19,13 @@ retain the previous root and its matching installation; no state migration is pr
 The public catalogue.v2 and metadata.v1 schemas remain unchanged, and immutable release
 verification remains independent of the warehouse layout.
 
+Empty resources materialize missing typed tables. Subsequent chunks can skip an
+empty dlt run only with committed matching native schema state, an exact physical
+schema and the required validated observation view, with no extracted or normalized
+packages pending. Missing state retains ordinary recovery; incompatible schemas fail.
+An entirely empty ready chunk checkpoints its verified zero counts without inventing
+a dlt load receipt. Registration and all storage and quarantine gates still apply.
+
 Market staging, history and current markets are views over the retained evidence rather than
 duplicate physical copies. Their logical columns and observation grain are unchanged.
 Publication and aggregate relations still require a full successful build and certification;
