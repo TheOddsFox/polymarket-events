@@ -5,7 +5,7 @@ Use a fresh operator root. Retain old evidence and state separately; neither mig
 compatibility views are provided. The independent `oddsfox.polymarket.metadata.v1` JSON bundle
 shape remains supported, using the same normalization rules.
 
-The internal warehouse layout is `oddsfox.polymarket.warehouse.v4`. Bronze event and
+The internal warehouse layout is `oddsfox.polymarket.warehouse.v5`. Bronze event and
 market observations retain the full canonical source hash, normalized fields and
 provenance; the complete source JSON remains in checksummed raw captures. Quarantine
 still retains its decoded payload. Normalized fields are stored separately as canonical JSON-valued text so DuckDB can
@@ -26,11 +26,22 @@ packages pending. Missing state retains ordinary recovery; incompatible schemas 
 An entirely empty ready chunk checkpoints its verified zero counts without inventing
 a dlt load receipt. Registration and all storage and quarantine gates still apply.
 
-Market staging, history and current markets are views over the retained evidence rather than
-duplicate physical copies. Their logical columns and observation grain are unchanged.
-Publication and aggregate relations still require a full successful build and certification;
-loading new evidence dirties that certification even though the views can already read it.
-This saves retained and recovery storage at the cost of recomputing those projections.
+Bronze observation views, staging and view-based market history expose registered retained
+evidence immediately. Current selection is build-consistent: compact event and market selection
+state advances during dbt builds, and current views join the winning IDs back to complete
+observations. Event history and event/market metrics incrementally process registered batches;
+they also advance during builds. A newly loaded row can therefore be visible in staging and
+market history before current selection or materialized history/metrics incorporate it.
+Whole-row winner semantics, observation grain, nulls, source priority and tie ordering are unchanged.
+
+Private versioned per-model checkpoints track registered batch IDs. Affected selection keys are
+reranked against their complete history; append-only history and metrics process new registered
+batches. Compact asset nominations and conflict-owner tables refresh during builds. Loading dirties
+certification. Only a complete successful build and certification permits publication; querying a
+partially advanced derived relation does not establish a consistent published snapshot.
+Warehouse v4 roots must remain with their matching installation. Build v5 in a fresh root from
+verified raw evidence; no destructive migration or checkpoint adoption is supported. See the
+[performance and recovery guide](pipeline-performance.md) for commands, checkpoint repair and rollback.
 
 The six original filenames contain explicit replacement projections: `events.parquet`,
 `markets.parquet`, `outcomes.parquet`, `event_tags.parquet`, `event_series.parquet` and

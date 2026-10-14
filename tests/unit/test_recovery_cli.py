@@ -1,5 +1,9 @@
 """Operator recovery failures are explicit and never overwrite an existing root."""
 
+import json
+
+import pytest
+
 from oddsfox_catalogue.backup import create_backup
 from oddsfox_catalogue.cli import main
 from oddsfox_catalogue.config import Settings
@@ -64,3 +68,51 @@ def test_backup_create_final_verification_uses_the_explicit_operator_cap(
     assert cli.main(["backup", "create", "--dest", str(tmp_path / "backups")]) == 0
     assert observed == [cap]
     capsys.readouterr()
+
+
+@pytest.mark.parametrize("explicit_release", [False, True])
+def test_verify_checks_release_once_through_the_correct_pointer_or_explicit_path(
+    tmp_path, monkeypatch, capsys, explicit_release
+):
+    from oddsfox_catalogue import cli, publish
+
+    settings = Settings(tmp_path)
+    release_id = "20261014T101112Z"
+    created_at = "2026-10-14T10:11:12Z"
+    release = settings.published_dir / "releases" / release_id
+    release.mkdir(parents=True)
+    manifest_sha256 = "a" * 64
+    (settings.published_dir / publish.CURRENT_POINTER).write_text(
+        json.dumps(
+            {
+                "release_id": release_id,
+                "path": f"releases/{release_id}",
+                "published_at": created_at,
+                "manifest_sha256": manifest_sha256,
+            }
+        )
+    )
+    verified, direct_calls = [], []
+
+    def verify(selected, path, expected_hash=None):
+        assert selected.root == settings.root
+        verified.append((path, expected_hash))
+        return {"release_id": release_id, "created_at": created_at}
+
+    def direct_verify(*args, **kwargs):
+        direct_calls.append(True)
+        return verify(*args, **kwargs)
+
+    monkeypatch.setenv("CATALOGUE_ROOT", str(tmp_path))
+    monkeypatch.setattr(publish, "verify_release", verify)
+    monkeypatch.setattr(cli, "verify_release", direct_verify)
+    assert cli.current_release is publish.current_release
+    arguments = ["verify", *(["--release", str(release)] if explicit_release else [])]
+    assert cli.main(arguments) == 0
+    assert verified == [(release, None if explicit_release else manifest_sha256)]
+    assert direct_calls == ([True] if explicit_release else [])
+    assert json.loads(capsys.readouterr().out) == {
+        "verified": True,
+        "release_id": release_id,
+        "path": str(release),
+    }

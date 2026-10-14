@@ -36,6 +36,7 @@ from oddsfox_catalogue.inventory import (
 )
 from oddsfox_catalogue.limits import enforce_storage_limits
 from oddsfox_catalogue.semantics import bounded_connection, canonical_json_chunks, json_descriptor
+from oddsfox_catalogue.timing import phase_timing
 from oddsfox_catalogue.warehouse import BaselineMissing
 
 PROJECTION_TABLE_QUERIES = projection_queries()
@@ -60,6 +61,7 @@ class ReleaseInfo:
     tables: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
+@phase_timing("publish.physical_hash")
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -251,6 +253,7 @@ def _validate_coverage(coverage, inventory, batch_ids) -> None:
         raise ValueError("coverage unit locators differ from the capture inventory")
 
 
+@phase_timing("publish.verify")
 def verify_release(settings: Settings, release_path: Path, manifest_sha256: str | None = None):
     """Verify only immutable release evidence; no warehouse certification is required."""
     try:
@@ -454,7 +457,12 @@ def publish_release(
     staging = releases / f".staging-{release_id}"
     staging.mkdir()
     manifest = _export_release(settings, staging, release_id, when, git_sha, receipt)
-    verify_release(settings, staging)
+    try:
+        verify_release(settings, staging)
+    except PublishBlocked as exc:
+        raise PublishBlocked(
+            "exported relation differs from its certified projection or candidate verification failed"
+        ) from exc
     try:
         if assert_build_valid(settings)["binding"] != receipt["binding"]:
             raise PublishBlocked("warehouse changed during candidate export")
@@ -480,16 +488,20 @@ def publish_release(
     return ReleaseInfo(release_id=release_id, path=final, tables=manifest["tables"])
 
 
+@phase_timing("publish.export")
 def _export_release(
     settings: Settings, staging: Path, release_id: str, when: datetime, git_sha: str | None, receipt
 ) -> dict[str, Any]:
     tables = {}
+    standard_queries = projection_queries()
+    unordered_queries = projection_queries(ordered=False)
     with bounded_connection(settings) as connection:
         for name, query in PROJECTION_TABLE_QUERIES.items():
+            size_query = unordered_queries[name] if query == standard_queries.get(name) else query
             # Bound admission using the exact JSON row bytes, plus conservative
             # pinned-writer overhead for Parquet headers, dictionaries and pages.
             size = connection.execute(
-                f"SELECT coalesce(sum(octet_length(encode(to_json(r)))), 0) FROM ({query}) r"
+                f"SELECT coalesce(sum(octet_length(encode(to_json(r)))), 0) FROM ({size_query}) r"
             ).fetchone()[0]
             enforce_storage_limits(settings, additional_bytes=8 * 1024**2 + 4 * int(size))
             target = staging / f"{name}.parquet"
@@ -501,11 +513,8 @@ def _export_release(
                 "file": target.name,
                 "bytes": target.stat().st_size,
                 "sha256": _sha256_file(target),
-                **fingerprint_parquet(connection, target),
+                **receipt["binding"]["published"][name],
             }
-            expected = receipt["binding"]["published"][name]
-            if any(tables[name].get(key) != value for key, value in expected.items()):
-                raise PublishBlocked("exported relation differs from its certified projection")
             enforce_storage_limits(settings)
         registered = connection.execute(
             "SELECT batch_id, page_count FROM bronze.batch_registry ORDER BY batch_id"

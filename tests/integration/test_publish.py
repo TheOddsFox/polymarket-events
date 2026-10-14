@@ -144,7 +144,7 @@ def test_complete_binding_runs_once_after_candidate_verification_before_promotio
         "pointer promotion",
     ]
     assert set(bindings[0]["warehouse"]["relations"]) == set(SEMANTIC_RELATIONS)
-    assert len(bindings[0]["warehouse"]["schemas"]) == 30
+    assert len(bindings[0]["warehouse"]["schemas"]) == len(SEMANTIC_RELATIONS) + 1
     assert set(bindings[0]["published"]) == set(PROJECTION_TABLE_QUERIES)
     assert bindings[0]["capture"]["batch_ids"]
     assert current_release(settings)["release_id"] == info.release_id

@@ -337,6 +337,40 @@ def successful_workflow(monkeypatch, tmp_path):
     return witnesses, launches, pointer, restored_pointer
 
 
+@pytest.mark.parametrize("extra_states", [0, 4])
+def test_successful_workflow_reports_the_inventory_it_actually_compared(
+    successful_workflow, monkeypatch, tmp_path, extra_states
+):
+    witnesses, launches, _, _ = successful_workflow
+    original = smoke._catalogue_state
+    added_relations = [f"core.future_state_{index}" for index in range(extra_states)]
+    added_schemas = [*added_relations, "marts.future_operational"] if extra_states else []
+    added_projections = ["future_projection"] if extra_states else []
+
+    def state(*args):
+        binding, manifest, coverage = original(*args)
+        binding["warehouse"]["relations"].update({name: {"rows": 1} for name in added_relations})
+        binding["warehouse"]["schemas"].update({name: [] for name in added_schemas})
+        binding["published"].update({name: {"rows": 1} for name in added_projections})
+        return binding, manifest, coverage
+
+    comparisons = witnesses["raw_rebuild"]["tables"]
+    comparisons.update({name: {} for name in added_relations})
+    comparisons.update({"schema:" + name: {} for name in added_schemas})
+    comparisons.update({"published:" + name: {} for name in added_projections})
+    monkeypatch.setattr(smoke, "_catalogue_state", state)
+    report = {"steps": []}
+    smoke.run_catalogue(tmp_path, ["1"], report)
+    binding = report["semantic_binding"]
+    assert report["compared_relations"] == {
+        "warehouse": len(binding["warehouse"]["relations"]),
+        "warehouse_schemas": len(binding["warehouse"]["schemas"]),
+        "published": len(binding["published"]),
+    }
+    assert len(comparisons) == sum(report["compared_relations"].values()) + 2
+    assert launches[-1] == "runtime_evidence"
+
+
 @pytest.mark.parametrize(
     "step,field",
     [("raw_rebuild", "matched"), ("backup_verify", "verified"), ("backup_restore", "restored")],

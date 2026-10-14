@@ -43,8 +43,8 @@ from oddsfox_catalogue.load.runner import (
     _preflight_load_bytes,
     _rows_for_chunk,
 )
-from oddsfox_catalogue.load.source import event_columns, market_columns
-from oddsfox_catalogue.load.storage import EVENT_FIELDS, MARKET_FIELDS, stored_rows
+from oddsfox_catalogue.load.source import event_columns, market_columns, stored_columns
+from oddsfox_catalogue.load.storage import EVENT_FIELDS, MARKET_FIELDS, stored_row
 from oddsfox_catalogue.publish import _validate_coverage
 
 BATCH = "20261010T142904Z-bootstrap"
@@ -62,11 +62,10 @@ def observation_row(index, *, market=False):
         "endpoint": "/markets/keyset" if market else "/events/keyset",
         "payload_hash": f"payload-{index}",
         "normalized": {
-            "amount": Decimal("0.12345678901234567890123456789"),
-            "nullable": None,
-            "labels": ["Yes", "No"],
-            "minimum": Decimal("0.0100"),
-            "active": None,
+            **dict.fromkeys(MARKET_FIELDS if market else EVENT_FIELDS),
+            "volume": Decimal("0.12345678901234567890123456789"),
+            "liquidity": Decimal("0.0100"),
+            "outcomes" if market else "tags": ["Yes", "No"],
         },
     }
     if market:
@@ -75,9 +74,8 @@ def observation_row(index, *, market=False):
 
 
 def stored_observation(row):
-    stored = copy.deepcopy(row)
-    stored["normalized"] = canonical_json(row["normalized"])
-    return stored
+    fields = MARKET_FIELDS if "source_kind" in row else EVENT_FIELDS
+    return stored_row(row, fields)
 
 
 class ObservationCursor:
@@ -117,9 +115,8 @@ class ObservationConnection:
         self.prohibit_fetchall = prohibit_fetchall
         self.fail_after = fail_after
         self.queries = []
-        self.schema_binds = []
-        self.wide_queries = []
-        self.query_order = []
+        self.query_columns = []
+        self.views_checked = False
         self.cursors = []
         self.closed = False
 
@@ -129,24 +126,13 @@ class ObservationConnection:
             return ObservationCursor([(table,) for table in self.tables])
         table = query.split("FROM bronze.", 1)[1].split()[0]
         columns = query.removeprefix("SELECT ").split(" FROM ", 1)[0].split(", ")
-        if query.endswith("WHERE FALSE"):
-            assert params is None
-            self.schema_binds.append((table, columns))
-            self.query_order.append((table, "schema"))
-            return ObservationCursor([])
         assert "WHERE observation_id IN (SELECT unnest(?))" in query
         assert len(params) == 1 and isinstance(params[0], list)
         ids = params[0]
         assert all(value not in query for value in ids), "IDs must remain bound parameters"
         selected = set(ids)
-        if columns == ["1"]:
-            assert query.endswith("LIMIT 1")
-            self.queries.append((table, ids))
-            self.query_order.append((table, "probe"))
-            matching = any(row["observation_id"] in selected for row in self.tables[table])
-            return ObservationCursor([(1,)] if matching else [])
-        self.wide_queries.append((table, ids))
-        self.query_order.append((table, "wide"))
+        self.queries.append((table, ids))
+        self.query_columns.append((table, columns))
         cursor = ObservationCursor(
             [
                 tuple(row[column] for column in columns)
@@ -163,7 +149,10 @@ class ObservationConnection:
 def observation_guard(monkeypatch, tmp_path, tables, **cursor_options):
     path = tmp_path / "warehouse.duckdb"
     path.touch()
-    runtime = SimpleNamespace(settings=SimpleNamespace(warehouse_path=path), connection=None)
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(warehouse_path=path, load=SimpleNamespace(dataset_name="bronze")),
+        connection=None,
+    )
     observed = ObservationConnection(tables, **cursor_options)
 
     @contextmanager
@@ -175,12 +164,18 @@ def observation_guard(monkeypatch, tmp_path, tables, **cursor_options):
         finally:
             observed.closed = True
 
+    def ensure_views(connection, dataset):
+        assert connection is observed and dataset == "bronze"
+        observed.views_checked = True
+
     monkeypatch.setattr("oddsfox_catalogue.load.runner.bounded_connection", connect)
+    monkeypatch.setattr("oddsfox_catalogue.load.runner.ensure_observation_views", ensure_views)
     return runtime, observed
 
 
 def observation_rowset(incoming, *, market):
-    return RowSet(markets=incoming) if market else RowSet(events=incoming)
+    encoded = [stored_row(row, MARKET_FIELDS if market else EVENT_FIELDS) for row in incoming]
+    return RowSet(markets=encoded) if market else RowSet(events=encoded)
 
 
 @pytest.mark.parametrize("market", [False, True])
@@ -193,13 +188,16 @@ def test_existing_observations_query_each_relation_once_and_read_bounded_results
     stored = [stored_observation(row) for row in incoming]
     if count > 512:
         stored.append(copy.deepcopy(stored[0]))
-    table = "market_observations" if market else "event_observations"
+    table = "market_observations_values" if market else "event_observations_values"
     runtime, connection = observation_guard(
         monkeypatch, tmp_path, {table: stored}, prohibit_fetchall=prohibit_fetchall
     )
     _check_existing_observations(runtime, observation_rowset(incoming, market=market))
     assert connection.queries == [(table, [row["observation_id"] for row in incoming])]
-    assert connection.wide_queries == connection.queries
+    columns = market_columns() if market else event_columns()
+    fields = MARKET_FIELDS if market else EVENT_FIELDS
+    assert connection.query_columns == [(table, list(stored_columns(columns, fields)))]
+    assert connection.views_checked
     assert connection.cursors[0].offset == len(stored)
     assert connection.cursors[0].fetch_sizes
     assert connection.closed
@@ -215,7 +213,7 @@ def test_existing_observation_conflicts_after_first_result_batch_block_loading(
     if conflict == "persisted_duplicate":
         stored.append(copy.deepcopy(stored[0]))
     stored[-1]["payload_hash"] = "conflicting-retained-evidence"
-    table = "market_observations" if market else "event_observations"
+    table = "market_observations_values" if market else "event_observations_values"
     runtime, connection = observation_guard(monkeypatch, tmp_path, {table: stored})
     with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
         _check_existing_observations(runtime, observation_rowset(incoming, market=market))
@@ -232,11 +230,11 @@ def test_existing_observation_comparison_preserves_exact_json_nulls_and_timestam
     stored = stored_observation(row)
     stored["observed_at"] = FIXED_NOW.astimezone(timezone(timedelta(hours=2)))
     stored["source_updated_at"] = FIXED_NOW.astimezone(timezone(timedelta(hours=-5)))
-    stored["normalized"] = (
-        '{ "labels": ["Yes", "No"], "nullable": null, '
-        '"amount": 0.12345678901234567890123456789, "minimum": 0.01, "active": null }'
-    )
-    table = "market_observations" if market else "event_observations"
+    stored["n_volume"] = " 0.12345678901234567890123456789 "
+    stored["n_liquidity"] = "0.01"
+    stored["n_outcomes" if market else "n_tags"] = '[ "Yes", "No" ]'
+    stored["n_active"] = " null "
+    table = "market_observations_values" if market else "event_observations_values"
     runtime, connection = observation_guard(monkeypatch, tmp_path, {table: [stored]})
     _check_existing_observations(runtime, observation_rowset([row], market=market))
     assert row == original
@@ -254,8 +252,8 @@ def test_existing_observation_comparison_preserves_exact_json_nulls_and_timestam
         ("source_updated_at", FIXED_NOW),
         ("endpoint", "/events/keyset"),
         ("payload_hash", "different-payload-hash"),
-        ("normalized", '{"amount":0.12345678901234567890123456788}'),
-        ("normalized", '{"amount":0.01,"active":false}'),
+        ("n_volume", "0.12345678901234567890123456788"),
+        ("n_active", "false"),
         ("source_kind", "event_embedded"),
         ("json_pointer", "/events/0/markets/0"),
     ],
@@ -267,23 +265,25 @@ def test_existing_observation_rejects_changes_to_projected_evidence(
     stored = stored_observation(row)
     stored[field] = value
     runtime, connection = observation_guard(
-        monkeypatch, tmp_path, {"market_observations": [stored]}
+        monkeypatch, tmp_path, {"market_observations_values": [stored]}
     )
     with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
-        _check_existing_observations(runtime, RowSet(markets=[row]))
+        _check_existing_observations(runtime, observation_rowset([row], market=True))
     assert connection.closed
 
 
-@pytest.mark.parametrize("invalid_json", ['{"amount":NaN}', '{"amount":Infinity}', "{"])
+@pytest.mark.parametrize("invalid_json", ["NaN", "Infinity", "{"])
 def test_existing_observation_rejects_untrustworthy_persisted_json(
     monkeypatch, tmp_path, invalid_json
 ):
     row = observation_row(1)
     stored = stored_observation(row)
-    stored["normalized"] = invalid_json
-    runtime, connection = observation_guard(monkeypatch, tmp_path, {"event_observations": [stored]})
+    stored["n_volume"] = invalid_json
+    runtime, connection = observation_guard(
+        monkeypatch, tmp_path, {"event_observations_values": [stored]}
+    )
     with pytest.raises((LoadBlocked, ValueError)):
-        _check_existing_observations(runtime, RowSet(events=[row]))
+        _check_existing_observations(runtime, observation_rowset([row], market=False))
     assert connection.closed
 
 
@@ -295,17 +295,17 @@ def test_missing_warehouse_does_not_open_a_connection(monkeypatch, tmp_path):
         "oddsfox_catalogue.load.runner.bounded_connection",
         lambda *_, **__: pytest.fail("a missing warehouse must not be opened"),
     )
-    _check_existing_observations(runtime, RowSet(events=[observation_row(1)]))
+    _check_existing_observations(runtime, observation_rowset([observation_row(1)], market=False))
 
 
 @pytest.mark.parametrize("case", ["missing_table", "empty_incoming", "absent_ids"])
 def test_existing_observation_guard_allows_missing_tables_empty_input_and_new_ids(
     monkeypatch, tmp_path, case
 ):
-    tables = {"event_observations": [stored_observation(observation_row(2))]}
-    incoming = RowSet(events=[observation_row(1)])
+    tables = {"event_observations_values": [stored_observation(observation_row(2))]}
+    incoming = observation_rowset([observation_row(1)], market=False)
     if case == "missing_table":
-        tables = {"market_observations": []}
+        tables = {"market_observations_values": []}
     elif case == "empty_incoming":
         incoming = RowSet()
     runtime, connection = observation_guard(monkeypatch, tmp_path, tables)
@@ -321,42 +321,44 @@ def test_existing_observation_result_failure_after_first_batch_is_not_silently_a
     runtime, connection = observation_guard(
         monkeypatch,
         tmp_path,
-        {"event_observations": [stored_observation(row) for row in incoming]},
+        {"event_observations_values": [stored_observation(row) for row in incoming]},
         fail_after=512,
     )
     with pytest.raises(RuntimeError, match="observation cursor interrupted"):
-        _check_existing_observations(runtime, RowSet(events=incoming))
+        _check_existing_observations(runtime, observation_rowset(incoming, market=False))
     assert connection.closed
 
 
 @pytest.mark.parametrize("market", [False, True])
-def test_new_observation_ids_bind_full_schema_before_probe_without_reading_wide_rows(
+def test_new_observation_ids_bind_full_schema_in_one_query_without_reading_unrelated_rows(
     monkeypatch, tmp_path, market
 ):
     incoming = observation_row(1, market=market)
     incoming["observation_id"] = "new-observation') OR TRUE --"
     stored = stored_observation(observation_row(2, market=market))
-    stored["normalized"] = "unread malformed normalization"
-    table = "market_observations" if market else "event_observations"
+    stored["n_volume"] = "unread malformed normalization"
+    table = "market_observations_values" if market else "event_observations_values"
     runtime, connection = observation_guard(monkeypatch, tmp_path, {table: [stored]})
     _check_existing_observations(runtime, observation_rowset([incoming], market=market))
-    assert connection.schema_binds == [(table, list(incoming))]
+    assert connection.query_columns == [(table, list(stored_observation(incoming)))]
     assert connection.queries == [(table, [incoming["observation_id"]])]
-    assert connection.query_order == [(table, "schema"), (table, "probe")]
-    assert connection.wide_queries == [] and connection.cursors == []
+    assert len(connection.cursors) == 1
+    assert connection.cursors[0].rows == []
+    assert connection.cursors[0].fetch_sizes == [512]
     assert connection.closed
 
 
 @pytest.mark.parametrize(
     "market,missing",
-    [(False, "payload_hash"), (False, "normalized"), (True, "source_kind"), (True, "json_pointer")],
+    [(False, "payload_hash"), (False, "n_volume"), (True, "source_kind"), (True, "json_pointer")],
 )
 def test_empty_existing_relation_still_rejects_missing_required_columns(tmp_path, market, missing):
     settings = Settings(tmp_path)
     path = settings.warehouse_path
     path.parent.mkdir(parents=True)
-    table = "market_observations" if market else "event_observations"
-    columns = market_columns() if market else event_columns()
+    table = "market_observations_values" if market else "event_observations_values"
+    fields = MARKET_FIELDS if market else EVENT_FIELDS
+    columns = stored_columns(market_columns() if market else event_columns(), fields)
     types = {"text": "VARCHAR", "json": "JSON", "timestamp": "TIMESTAMPTZ"}
     declaration = ", ".join(
         f"{name} {types[hint['data_type']]}" for name, hint in columns.items() if name != missing
@@ -379,18 +381,18 @@ def test_mixed_new_and_existing_ids_still_detect_late_conflicting_persisted_dupl
     incoming = [*existing, observation_row(1000, market=market)]
     stored = [stored_observation(row) for row in existing]
     unrelated = stored_observation(observation_row(2000, market=market))
-    unrelated["normalized"] = "unread unrelated invalid JSON"
+    unrelated["n_volume"] = "unread unrelated invalid JSON"
     conflicting = copy.deepcopy(stored[0])
     conflicting["payload_hash"] = "late conflicting duplicate"
-    table = "market_observations" if market else "event_observations"
+    table = "market_observations_values" if market else "event_observations_values"
     runtime, connection = observation_guard(
         monkeypatch, tmp_path, {table: [*stored, unrelated, conflicting]}, prohibit_fetchall=True
     )
     with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
         _check_existing_observations(runtime, observation_rowset(incoming, market=market))
     expected = [(table, [row["observation_id"] for row in incoming])]
-    assert connection.queries == expected and connection.wide_queries == expected
-    assert connection.query_order == [(table, "schema"), (table, "probe"), (table, "wide")]
+    assert connection.queries == expected
+    assert len(connection.query_columns) == 1
     assert connection.cursors[0].offset == 513
     assert connection.cursors[0].fetch_sizes == [512, 512]
     assert connection.closed
@@ -414,12 +416,14 @@ def test_unmodeled_source_change_still_conflicts_with_compact_observation(
     assert before["normalized"] == after["normalized"]
     assert before["observation_id"] == after["observation_id"]
     assert before["payload_hash"] != after["payload_hash"]
-    table = "market_observations" if market else "event_observations"
+    table = "market_observations_values" if market else "event_observations_values"
     runtime, connection = observation_guard(
         monkeypatch, tmp_path, {table: [stored_observation(before)]}
     )
     with pytest.raises(LoadBlocked, match="conflicting persisted observation"):
-        _check_existing_observations(runtime, changed)
+        _check_existing_observations(
+            runtime, observation_rowset(getattr(changed, key), market=market)
+        )
     assert connection.closed
 
 
@@ -716,11 +720,7 @@ def streamed_relation_totals(rows):
     )
     return tuple(
         sum(sum(len(part.encode()) for part in encoder.iterencode(row)) + 1 for row in relation)
-        for relation in (
-            stored_rows(rows.events, EVENT_FIELDS),
-            stored_rows(rows.markets, MARKET_FIELDS),
-            rows.quarantine,
-        )
+        for relation in (rows.events, rows.markets, rows.quarantine)
     )
 
 
@@ -800,11 +800,7 @@ def test_load_chunk_encodes_each_row_once_and_keeps_all_admission_calls(monkeypa
     summary = LoadSummary()
     _load_chunk(fixture.runtime, fixture.pages, summary)
     relations = (expected_rows.events, expected_rows.markets, expected_rows.quarantine)
-    assert [data for _, data in writes] == [
-        list(stored_rows(expected_rows.events, EVENT_FIELDS)),
-        list(stored_rows(expected_rows.markets, MARKET_FIELDS)),
-        expected_rows.quarantine,
-    ]
+    assert [data for _, data in writes] == list(relations)
     assert len(encoded) == len(set(encoded)) == sum(map(len, relations))
     page_totals = [
         sum(

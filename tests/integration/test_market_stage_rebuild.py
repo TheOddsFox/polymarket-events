@@ -17,6 +17,7 @@ from oddsfox_catalogue.load.runner import LoadRuntime, load_pending
 from oddsfox_catalogue.metadata import export_metadata
 from oddsfox_catalogue.pipeline import dbt_stage, publish_stage
 from oddsfox_catalogue.publish import CURRENT_POINTER, PublishBlocked, verify_release
+from oddsfox_catalogue.rebuild import rebuild_and_verify
 from oddsfox_catalogue.semantics import bounded_connection, published_snapshot, warehouse_snapshot
 
 
@@ -83,6 +84,7 @@ def test_market_views_preserve_observations_and_require_full_build_certification
         "SELECT table_type FROM information_schema.tables "
         "WHERE table_schema='core' AND table_name='markets_current'",
     ) == [("VIEW",)]
+    original_schemas = warehouse_snapshot(settings)["schemas"]
     original = _observations(settings, stage)
     assert len(original) == 2 and all(count == 1 for _, count in original)
     assert _rows(settings, "SELECT question, source_kind FROM core.markets_current") == [
@@ -108,8 +110,15 @@ def test_market_views_preserve_observations_and_require_full_build_certification
     assert len(expected) == 4 and all(count == 1 for _, count in expected)
     assert _observations(settings, stage) == expected
     assert _observations(settings, "history.market_history") == expected
+    for relation in (stage, "history.market_history"):
+        assert _rows(
+            settings,
+            f"SELECT question FROM {relation} WHERE source_kind='market_direct' ORDER BY observed_at",
+        ) == [("Direct original",), ("Direct revised",)]
     assert read_build_validity(settings)["status"] == "dirty"
-    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct revised",)]
+    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct original",)]
+    with pytest.raises(BuildInvalid, match="dirty"):
+        assert_build_valid(settings)
     with pytest.raises(PublishBlocked, match="certification"):
         publish_stage(settings, now=lambda: FIXED_NOW + timedelta(days=1))
     assert (settings.published_dir / CURRENT_POINTER).read_bytes() == pointer
@@ -118,7 +127,8 @@ def test_market_views_preserve_observations_and_require_full_build_certification
     _build(settings, "--select", "markets_current market_history")
     assert _observations(settings, stage) == expected
     assert _observations(settings, "history.market_history") == expected
-    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct revised",)]
+    assert _rows(settings, "SELECT question FROM core.markets_current") == [("Direct original",)]
+    assert read_build_validity(settings)["status"] == "dirty"
     with pytest.raises(BuildInvalid, match="dirty"):
         assert_build_valid(settings)
     with pytest.raises(PublishBlocked, match="certification"):
@@ -189,9 +199,19 @@ def test_market_views_preserve_observations_and_require_full_build_certification
         ]
     )
     semantic = warehouse_snapshot(settings)
+    assert semantic["schemas"] == original_schemas
     _build(settings)
     assert_build_valid(settings)
     assert warehouse_snapshot(settings) == semantic
     assert published_snapshot(settings) == public
     assert _observations(settings, stage) == expected
     assert _observations(settings, "history.market_history") == expected
+
+    report = rebuild_and_verify(settings, scratch=tmp_path / "raw-rebuild")
+    assert report.matched and not report.mismatches
+    for relation, descriptor in semantic["relations"].items():
+        assert report.tables[relation] == {"live": descriptor, "rebuilt": descriptor}
+    for relation, schema in semantic["schemas"].items():
+        assert report.tables[f"schema:{relation}"] == {"live": schema, "rebuilt": schema}
+    for name, descriptor in public.items():
+        assert report.tables[f"published:{name}"] == {"live": descriptor, "rebuilt": descriptor}

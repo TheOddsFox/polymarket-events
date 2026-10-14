@@ -132,8 +132,12 @@ def _resource(
 
 
 def event_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource:
+    return _stored_event_resource(stored_rows(rows, EVENT_FIELDS), **kwargs)
+
+
+def _stored_event_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource:
     return _resource(
-        stored_rows(rows, EVENT_FIELDS),
+        rows,
         name=EVENT_TABLE + "_values",
         columns=stored_columns(event_columns(), EVENT_FIELDS),
         primary_key="observation_id",
@@ -142,8 +146,12 @@ def event_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource
 
 
 def market_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource:
+    return _stored_market_resource(stored_rows(rows, MARKET_FIELDS), **kwargs)
+
+
+def _stored_market_resource(rows: Iterable[dict[str, Any]], **kwargs: Any) -> DltResource:
     return _resource(
-        stored_rows(rows, MARKET_FIELDS),
+        rows,
         name=MARKET_TABLE + "_values",
         columns=stored_columns(market_columns(), MARKET_FIELDS),
         primary_key="observation_id",

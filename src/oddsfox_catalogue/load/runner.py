@@ -40,9 +40,8 @@ from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
 from oddsfox_catalogue.ids import canonical_json, iso_utc, utc_now
 from oddsfox_catalogue.limits import (
     enforce_storage_limits,
+    measure_storage,
     remaining_temp_bytes,
-    retained_bytes,
-    temporary_bytes,
 )
 from oddsfox_catalogue.load.rows import (
     PageContext,
@@ -54,13 +53,13 @@ from oddsfox_catalogue.load.rows import (
 from oddsfox_catalogue.load.runtime import confined_runtime
 from oddsfox_catalogue.load.source import (
     QUARANTINE_COLUMNS,
+    _stored_event_resource,
+    _stored_market_resource,
     event_columns,
-    event_resource,
     interrupted,
     make_destination,
     make_pipeline,
     market_columns,
-    market_resource,
     quarantine_resource,
     registry_resource,
     stored_columns,
@@ -72,6 +71,7 @@ from oddsfox_catalogue.load.storage import (
     stored_row,
 )
 from oddsfox_catalogue.semantics import bounded_connection
+from oddsfox_catalogue.timing import phase_timing, record_counter
 from oddsfox_catalogue.warehouse_version import ensure_warehouse_contract
 
 
@@ -122,6 +122,7 @@ def _pipeline(rt: LoadRuntime) -> dlt.Pipeline:
     return rt.pipeline
 
 
+@phase_timing("load.dlt")
 def _run_resource(rt: LoadRuntime, resource: DltResource):
     # Pipeline state is retained; each public run gets a fresh destination config.
     pipeline = _pipeline(rt)
@@ -166,9 +167,10 @@ def _encoded_row_bytes(row: dict[str, Any]) -> int:
     return len(encoder.encode(row).encode()) + 1
 
 
+@phase_timing("load.accounting")
 def _reset_load_budget(rt: LoadRuntime) -> None:
-    retained = retained_bytes(rt.settings)
-    temporary = temporary_bytes(rt.settings)
+    usage = measure_storage(rt.settings)
+    retained, temporary = usage.retained_bytes, usage.temporary_bytes
     if (
         retained > rt.settings.capture.max_retained_bytes
         or temporary > rt.settings.capture.max_temp_bytes
@@ -190,6 +192,7 @@ def _preflight_load_bytes(rt: LoadRuntime, size: int) -> None:
         raise LoadReservationExceeded("load estimate exceeds retained storage allowance")
 
 
+@phase_timing("load.encode")
 def _rows_for_chunk(
     rt: LoadRuntime,
     pages: list[dict[str, Any]],
@@ -252,78 +255,64 @@ def _rows_for_chunk(
             (page_rows.events, page_rows.markets, page_rows.quarantine)
         ):
             fields = (EVENT_FIELDS, MARKET_FIELDS, None)[index]
-            serialized_bytes[index] += sum(
-                _encoded_row_bytes(stored_row(row, fields) if fields else row) for row in relation
-            )
+            for position in range(len(relation)):
+                if fields:
+                    relation[position] = stored_row(relation[position], fields)
+                serialized_bytes[index] += _encoded_row_bytes(relation[position])
         _preflight_load_bytes(rt, sum(serialized_bytes))
         rows.extend(page_rows)
 
     assert_unique(rows.events)
     assert_unique(rows.markets)
     assert_unique(rows.quarantine, "quarantine_id")
+    record_counter("load.encoded_rows", len(rows.events) + len(rows.markets))
     return rows, counts, (serialized_bytes[0], serialized_bytes[1], serialized_bytes[2])
 
 
+@phase_timing("load.historical_matches")
 def _check_existing_observations(rt: LoadRuntime, rows: RowSet) -> None:
     """Insert-only merge must not hide conflicting evidence behind an existing key."""
     if not rt.settings.warehouse_path.exists():
         return
-    fields = (
-        "observation_id",
-        "venue",
-        "entity_id",
-        "batch_id",
-        "page_id",
-        "observed_at",
-        "source_updated_at",
-        "endpoint",
-        "payload_hash",
-        "normalized",
-    )
     with bounded_connection(rt.settings, connection=rt.connection) as connection:
+        ensure_observation_views(connection, rt.settings.load.dataset_name)
         tables = {
             row[0]
             for row in connection.execute(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'bronze'"
             ).fetchall()
         }
-        for table, incoming in (
-            ("event_observations", rows.events),
-            ("market_observations", rows.markets),
+        for table, incoming, normalized_fields, envelope in (
+            ("event_observations_values", rows.events, EVENT_FIELDS, event_columns()),
+            ("market_observations_values", rows.markets, MARKET_FIELDS, market_columns()),
         ):
             if table not in tables or not incoming:
                 continue
-            columns = fields + (
-                ("source_kind", "json_pointer") if table == "market_observations" else ()
-            )
+            columns = tuple(stored_columns(envelope, normalized_fields))
+            normalized_columns = {"n_" + name for name in normalized_fields}
             by_id = {row["observation_id"]: row for row in incoming}
-            ids = [list(by_id)]
-            projection = f"SELECT {', '.join(columns)} FROM bronze.{table} "
-            # Bind the schema before avoiding large JSON reads for entirely new observations.
-            connection.execute(projection + "WHERE FALSE")
-            hit = connection.execute(
-                f"SELECT 1 FROM bronze.{table} WHERE observation_id IN (SELECT unnest(?)) LIMIT 1",
-                ids,
-            ).fetchone()
-            if hit is None:
-                continue
+            record_counter("load.historical_queries", 1)
             existing = connection.execute(
-                projection + "WHERE observation_id IN (SELECT unnest(?))", ids
+                f"SELECT {', '.join(columns)} FROM bronze.{table} "
+                "WHERE observation_id IN (SELECT unnest(?))",
+                [list(by_id)],
             )
             while values_batch := existing.fetchmany(512):
                 for values in values_batch:
                     row = by_id[values[0]]
-                    prior = dict(zip(columns, values, strict=True))
-                    for field in columns:
-                        current = row[field]
-                        previous = prior[field]
-                        if field == "normalized":
+                    for name, previous in zip(columns, values, strict=True):
+                        current = row[name]
+                        if name in normalized_columns:
                             previous = canonical_json(
                                 json.loads(
                                     previous, parse_float=Decimal, parse_constant=_invalid_number
                                 )
                             )
-                            current = canonical_json(current)
+                            current = canonical_json(
+                                json.loads(
+                                    current, parse_float=Decimal, parse_constant=_invalid_number
+                                )
+                            )
                         if previous != current:
                             raise LoadBlocked(
                                 "conflicting persisted observation; refusing insert-only merge"
@@ -404,13 +393,13 @@ def _chunk_resources(rt: LoadRuntime, rows: RowSet) -> Iterator[DltResource | No
     for data, factory, name, columns in (
         (
             rows.events,
-            event_resource,
+            _stored_event_resource,
             "event_observations_values",
             stored_columns(event_columns(), EVENT_FIELDS),
         ),
         (
             rows.markets,
-            market_resource,
+            _stored_market_resource,
             "market_observations_values",
             stored_columns(market_columns(), MARKET_FIELDS),
         ),
@@ -420,7 +409,7 @@ def _chunk_resources(rt: LoadRuntime, rows: RowSet) -> Iterator[DltResource | No
             yield None
         else:
             yield factory(
-                interrupted(data, _mid_load_fault) if factory is event_resource else data,
+                interrupted(data, _mid_load_fault) if factory is _stored_event_resource else data,
                 materialize_only=not data,
             )
 

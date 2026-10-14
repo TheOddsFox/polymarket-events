@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import signal
 import subprocess
@@ -219,3 +220,152 @@ raise SystemExit(harness.main())
         if group.exists():
             with suppress(ProcessLookupError):
                 os.killpg(int(group.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("missing", [None, "report-count", "rebuild-entry"])
+def test_verify_accepts_expanded_inventories_and_rejects_incomplete_comparisons(
+    tmp_path, monkeypatch, missing
+):
+    semantic = (*harness.SEMANTIC_RELATIONS, "core.future_state", "history.future_evidence")
+    operational = (*harness.OPERATIONAL_RELATIONS, "marts.future_operations")
+    projections = {**harness.projection_queries(), "future_projection": "select 1"}
+    schemas = (*semantic, *operational)
+    comparisons = {
+        **dict.fromkeys(semantic, {}),
+        **dict.fromkeys(("schema:" + name for name in schemas), {}),
+        **dict.fromkeys(("published:" + name for name in projections), {}),
+        "coverage": {},
+        "capture_inventory": {},
+    }
+    monkeypatch.setattr(harness, "SEMANTIC_RELATIONS", semantic)
+    monkeypatch.setattr(harness, "OPERATIONAL_RELATIONS", operational)
+    monkeypatch.setattr(harness, "projection_queries", lambda: projections)
+    measured = {
+        "http_attempts": 2,
+        "downloaded_bytes": 17,
+        "exhausted": False,
+        "responses": [
+            {"path": "/markets/5001", "status": 200, "bytes": 8},
+            {"path": "/markets/5001", "status": 200, "bytes": 9},
+        ],
+    }
+
+    class Source:
+        url = "http://127.0.0.1:9"
+
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def accounting(self):
+            return measured
+
+    monkeypatch.setattr(harness, "GammaServer", Source)
+    resources = tmp_path / "venv/lib/site-packages/oddsfox_catalogue/dbt"
+    calls = []
+
+    def child(argv, cwd, env, log, timeout=600):
+        calls.append(log.name)
+        if log.name == "build.log":
+            dist = tmp_path / "dist"
+            dist.mkdir()
+            (dist / "catalogue.whl").write_bytes(b"wheel")
+            (dist / "catalogue.tar.gz").write_bytes(b"sdist")
+        elif log.name == "distribution-audit.json":
+            log.write_text('{"verified": true}')
+        elif log.name == "installed-probe.log":
+            resources.mkdir(parents=True)
+            (resources / "dbt_project.yml").write_text("project")
+            (resources / "profiles.yml").write_text("profile")
+            (tmp_path / "installed-paths.json").write_text(
+                json.dumps(
+                    {
+                        "cli": str(resources.parent / "cli.py"),
+                        "smoke": str(resources.parent / "smoke.py"),
+                        "dbt": str(resources),
+                        "sys_path": [str(resources.parent.parent)],
+                    }
+                )
+            )
+        elif log.name in {"catalogue-smoke.log", "metadata-smoke.log"}:
+            workflow = log.name.removesuffix("-smoke.log")
+            proof = tmp_path / workflow
+            proof.mkdir()
+            counts = {
+                "warehouse": len(semantic),
+                "warehouse_schemas": len(schemas),
+                "published": len(projections),
+            }
+            if missing == "report-count":
+                counts["warehouse"] -= 1
+            acquisition = "capture_1" if workflow == "catalogue" else "refresh"
+            steps = [{"name": acquisition, "result": {"http_attempts": 2, "downloaded_bytes": 17}}]
+            steps.extend(
+                {"name": name}
+                for name in (
+                    "raw_rebuild",
+                    "backup_create",
+                    "backup_verify",
+                    "backup_restore",
+                    "verify_restore",
+                    "injected_publication",
+                    "verify_after_failure",
+                    "offline_replay",
+                )
+            )
+            (proof / "report.json").write_text(
+                json.dumps(
+                    {
+                        "workflow": workflow,
+                        "status": "passed",
+                        "accounting_complete": True,
+                        "http_attempts": 2,
+                        "downloaded_bytes": 17,
+                        "catalogue_root": str(proof / "catalogue"),
+                        "steps": steps,
+                        "semantic_comparisons": {
+                            "offline_replay": True,
+                            "raw_rebuild": True,
+                            "restore": True,
+                        },
+                        "compared_relations": counts,
+                    }
+                )
+            )
+        elif log.name.startswith("rebuild-step-"):
+            number = int(log.stem.rsplit("-", 1)[1])
+            tables = dict(comparisons) if number == 4 else {}
+            if missing == "rebuild-entry" and number == 4:
+                tables.pop("core.future_state")
+            Path(argv[4]).write_text(
+                json.dumps(
+                    {
+                        "pending": number < 4,
+                        "matched": number == 4,
+                        "mismatches": [],
+                        "tables": tables,
+                    }
+                )
+            )
+
+    monkeypatch.setattr(harness, "run_command", child)
+    try:
+        if missing is None:
+            result = harness.verify(tmp_path)
+            assert result["status"] == "passed"
+            assert set(result["workflows"]) == {"catalogue", "metadata"}
+            assert "rebuild-step-4.log" in calls and "metadata-smoke.log" in calls
+        else:
+            with pytest.raises(ValueError, match="semantic comparisons"):
+                harness.verify(tmp_path)
+            assert "metadata-smoke.log" not in calls
+    finally:
+        if resources.exists():
+            resources.chmod(0o700)
+            for path in resources.iterdir():
+                path.chmod(0o600)

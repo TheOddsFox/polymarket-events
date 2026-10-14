@@ -23,6 +23,8 @@ sys.path.insert(0, str(REPO / "tests"))
 from fakes.fake_gamma import FakeGamma  # noqa: E402
 from fakes.gamma_server import GammaServer  # noqa: E402
 from fakes.world import demo_world  # noqa: E402
+from oddsfox_catalogue.contract import projection_queries  # noqa: E402
+from oddsfox_catalogue.semantics import OPERATIONAL_RELATIONS, SEMANTIC_RELATIONS  # noqa: E402
 from oddsfox_catalogue.signals import SIGNALS, Terminated  # noqa: E402
 
 
@@ -285,7 +287,12 @@ Path(sys.argv[1]).write_text(json.dumps({'cli': cli.__file__, 'smoke': smoke.__f
                         or result["mismatches"]
                     ):
                         raise ValueError("installed stepped rebuild claimed incorrect completion")
-                    if number == 4 and len(result["tables"]) != 68:
+                    if number == 4 and len(result["tables"]) != (
+                        2 * len(SEMANTIC_RELATIONS)
+                        + len(OPERATIONAL_RELATIONS)
+                        + len(projection_queries())
+                        + 2
+                    ):
                         raise ValueError("installed stepped rebuild omitted semantic comparisons")
             measured = source.accounting()
         allowed = {f"/markets/{market_id}" for market_id in market_ids}
@@ -310,9 +317,9 @@ Path(sys.argv[1]).write_text(json.dumps({'cli': cli.__file__, 'smoke': smoke.__f
                 "raw_rebuild": True,
                 "restore": True,
             } or report.get("compared_relations") != {
-                "warehouse": 29,
-                "published": 7,
-                "warehouse_schemas": 30,
+                "warehouse": len(SEMANTIC_RELATIONS),
+                "published": len(projection_queries()),
+                "warehouse_schemas": len(SEMANTIC_RELATIONS) + len(OPERATIONAL_RELATIONS),
             }:
                 raise ValueError("installed catalogue proof omitted complete semantic comparisons")
         workflows[workflow] = {"report": str(proof / "report.json"), "fixture": measured}

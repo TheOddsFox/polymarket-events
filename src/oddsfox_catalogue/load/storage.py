@@ -1,9 +1,10 @@
 """Compress normalized fields independently; expose the original logical JSON rows."""
 
 from collections.abc import Iterable, Iterator
+from contextlib import suppress
 from typing import Any
 
-from duckdb import DuckDBPyConnection
+from duckdb import DuckDBPyConnection, Error
 
 from oddsfox_catalogue.ids import canonical_json
 
@@ -142,5 +143,10 @@ def ensure_observation_views(connection: DuckDBPyConnection, dataset: str) -> No
                 )
             elif actual[0].split(" AS ", 1)[1] != expected_sql:
                 raise ValueError("normalized observation view does not match warehouse contract")
-        finally:
+        except BaseException:
+            # A rejected statement aborts an explicit snapshot transaction.
+            with suppress(Error):
+                connection.execute(f"DROP VIEW {expected}")
+            raise
+        else:
             connection.execute(f"DROP VIEW {expected}")

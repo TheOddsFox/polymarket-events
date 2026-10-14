@@ -722,9 +722,9 @@ def run_catalogue(output, market_ids, report):
             "restore": True,
         },
         compared_relations={
-            "warehouse": 29,
-            "published": 7,
-            "warehouse_schemas": 30,
+            "warehouse": len(replayed["warehouse"]["relations"]),
+            "published": len(replayed["published"]),
+            "warehouse_schemas": len(replayed["warehouse"]["schemas"]),
         },
         runtime=details["runtime"],
         retained_bytes=_storage(output, report),

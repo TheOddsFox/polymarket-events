@@ -227,8 +227,12 @@ def test_nonwinning_corrupt_observation_still_blocks_full_certification(certifie
             "SELECT count(*) FROM core.int_market_selected "
             "WHERE observation_id LIKE '%-older-corrupt'"
         ).fetchone() == (0,)
+    result = dbt_stage(settings, ["build"])
+    assert result.returncode != 0, result.stdout
+    from oddsfox_catalogue.semantics import warehouse_snapshot
+
     with pytest.raises(duckdb.Error, match="Malformed JSON"):
-        dbt_stage(settings, ["build"])
+        warehouse_snapshot(settings)
     assert read_build_validity(settings)["status"] == "dirty"
     with pytest.raises(PublishBlocked):
         publish_stage(settings)

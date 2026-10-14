@@ -5,7 +5,7 @@ import duckdb
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.contract import NORMALIZATION_REVISION
 
-WAREHOUSE_CONTRACT = "oddsfox.polymarket.warehouse.v4"
+WAREHOUSE_CONTRACT = "oddsfox.polymarket.warehouse.v5"
 
 
 class WarehouseVersionError(ValueError):

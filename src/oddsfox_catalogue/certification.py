@@ -31,6 +31,7 @@ from oddsfox_catalogue.semantics import (
     published_snapshot,
     warehouse_snapshot,
 )
+from oddsfox_catalogue.timing import phase_timing
 from oddsfox_catalogue.warehouse_version import WAREHOUSE_CONTRACT, ensure_warehouse_contract
 
 RECEIPT_REVISION = 1
@@ -253,6 +254,7 @@ def _model_revision(settings: Settings):
     return json_descriptor(files)["sha256"]
 
 
+@phase_timing("certification.capture")
 def capture_binding(settings: Settings):
     """Require every declared capture to be complete, loaded and registered exactly."""
     with bounded_connection(settings) as connection:
@@ -358,6 +360,7 @@ def _validate_artifacts(settings: Settings, target: Path):
     return invocation, effective_vars
 
 
+@phase_timing("certification.complete")
 def certify_build(settings: Settings, target_path: Path):
     """Certify successful artifacts only after their actual warehouse passes all bindings."""
     try:
@@ -471,6 +474,7 @@ def read_certified_receipt(settings: Settings):
     return receipt
 
 
+@phase_timing("certification.rebind")
 def assert_build_valid(settings: Settings):
     """Detect partial loads/builds, changed quality, raw tampering and external dbt writes."""
     receipt = read_certified_receipt(settings)

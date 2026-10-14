@@ -19,6 +19,7 @@ from oddsfox_catalogue.ids import iso_utc, utc_now
 from oddsfox_catalogue.limits import enforce_storage_limits, retained_bytes
 from oddsfox_catalogue.runlock import current_git_sha
 from oddsfox_catalogue.semantics import bounded_connection
+from oddsfox_catalogue.timing import phase_timing
 
 MANIFEST = "backup.json"
 BACKUP_VERSION = 2
@@ -285,6 +286,7 @@ def _snapshot_ledger(source: Path, dest: Path, *, max_bytes: int | None = None) 
         src.close()
 
 
+@phase_timing("recovery.backup.create_backup")
 def create_backup(
     settings: Settings, *, dest_root: Path | None = None, now: datetime | None = None
 ) -> Path:
@@ -390,6 +392,7 @@ def create_backup(
     return dest
 
 
+@phase_timing("recovery.backup.verify_backup")
 def verify_backup(backup_dir: Path, *, max_bytes: int = MAX_RETAINED_BYTES) -> list[str]:
     """Validate every path, type, size and checksum without copying anything."""
     try:
@@ -399,6 +402,7 @@ def verify_backup(backup_dir: Path, *, max_bytes: int = MAX_RETAINED_BYTES) -> l
     return []
 
 
+@phase_timing("recovery.backup.restore_backup")
 def restore_backup(
     backup_dir: Path, destination: Path, *, max_bytes: int = MAX_RETAINED_BYTES
 ) -> Path:

@@ -6,8 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
-from oddsfox_catalogue.limits import directory_bytes
+from oddsfox_catalogue.limits import directory_bytes, measure_storage
+
+
+@pytest.fixture(params=["directory", "combined"], autouse=True)
+def accounting_api(request, monkeypatch):
+    if request.param == "combined":
+        monkeypatch.setitem(
+            globals(),
+            "directory_bytes",
+            lambda path: measure_storage(Settings(path)).retained_bytes,
+        )
 
 
 @pytest.fixture(autouse=True)

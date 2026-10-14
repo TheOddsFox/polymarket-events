@@ -14,6 +14,9 @@ Raw pages are the source of truth. Everything after them is derived and can be r
 The replacement warehouse exports `oddsfox.polymarket.catalogue.v2`; see
 [the catalogue contract](docs/catalogue-v2.md). Existing legacy warehouse roots must be retained
 and replaced with a fresh operator root. No migration or compatibility exports are provided.
+The internal warehouse is v5; retain v4 roots with their matching installation. See the
+[performance and recovery guide](docs/pipeline-performance.md) for fresh-root rebuilds,
+build-consistent derived state, rollback and the unproven end-to-end 2× performance gate.
 
 ## Setup
 

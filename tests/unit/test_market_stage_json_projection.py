@@ -288,21 +288,29 @@ def _insert_stored(connection, record, *, observation_id="observation-1", batch_
 def selection_queries():
     def render(text):
         def ref(name):
-            assert name == "stg_gamma__market_observations"
-            return "selection_stage"
+            return {
+                "stg_gamma__market_observations": "selection_stage",
+                "int_market_selection_state": "selection_state",
+            }[name]
 
-        return Template(text, undefined=StrictUndefined).render(ref=ref, config=lambda **kwargs: "")
+        return Template(text, undefined=StrictUndefined).render(
+            ref=ref, config=lambda **kwargs: "", registered_batches_predicate=lambda column: "true"
+        )
 
     return (
         render(REFERENCE.with_name("market_selection_wide.sql").read_text()),
+        render(
+            dbt_project_dir().joinpath("models/core/int_market_selection_state.sql").read_text()
+        ),
         render(dbt_project_dir().joinpath("models/core/int_market_selected.sql").read_text()),
     )
 
 
 def _selected_equivalent(connection, stage_query, queries):
     connection.execute("CREATE TEMP VIEW selection_stage AS " + stage_query)
+    connection.execute("CREATE TEMP TABLE selection_state AS " + queries[1])
     outputs = []
-    for index, query in enumerate(queries):
+    for index, query in enumerate((queries[0], queries[2])):
         name = f"selected_{index}"
         connection.execute(f"CREATE TEMP VIEW {name} AS {query}")
         schema = connection.execute(
@@ -386,9 +394,7 @@ def test_narrow_selection_window_carries_only_ordering_identity_fields(
     _insert_stored(stored_connection, _record())
     _selected_equivalent(stored_connection, stored_queries[1], selection_queries)
     pending = json.loads(
-        stored_connection.execute(
-            "EXPLAIN (FORMAT JSON) SELECT market_id,outcomes_json,usable FROM selected_1"
-        ).fetchone()[1]
+        stored_connection.execute("EXPLAIN (FORMAT JSON) " + selection_queries[1]).fetchone()[1]
     )
     windows = []
     while pending:
@@ -396,15 +402,38 @@ def test_narrow_selection_window_carries_only_ordering_identity_fields(
         pending.extend(node["children"])
         if node["name"] == "WINDOW":
             windows.append(node)
-        assert node["name"] not in {"CTE", "CTE_SCAN"}
     assert len(windows) == 1
-    assert set(windows[0]["children"][0]["extra_info"]["Projections"]) == {
-        "observation_id",
-        "venue",
-        "market_id",
-        "observed_at",
-        "source_kind",
-    }
+    ranking_fields = {"observation_id", "venue", "market_id", "observed_at", "source_kind"}
+    pending = list(windows[0]["children"])
+    ranking_projections = []
+    while pending:
+        node = pending.pop()
+        pending.extend(node["children"])
+        if node["name"] == "PROJECTION":
+            fields = set(node["extra_info"]["Projections"])
+            if not any(field.startswith("#") for field in fields):
+                assert fields <= ranking_fields
+                ranking_projections.append(fields)
+        if node.get("extra_info", {}).get("Table", "").endswith("market_observations_values"):
+            assert set(node["extra_info"]["Projections"]) == {
+                "observation_id",
+                "venue",
+                "entity_id",
+                "observed_at",
+                "source_kind",
+                "batch_id",
+            }
+    assert ranking_fields in ranking_projections
+    assert not re.search(r"\bover\s*\(", selection_queries[2], re.IGNORECASE)
+    pending = json.loads(
+        stored_connection.execute(
+            "EXPLAIN (FORMAT JSON) SELECT market_id,outcomes_json,usable FROM selected_1"
+        ).fetchone()[1]
+    )
+    while pending:
+        node = pending.pop()
+        pending.extend(node["children"])
+        assert node["name"] != "WINDOW"
 
 
 def _stored_equivalent(connection, queries):
