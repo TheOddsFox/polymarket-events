@@ -124,11 +124,6 @@ def build_source(conn, frontiers, count):
         )
         events[eid] = event
         new_events.append(eid)
-    # Asset values may exceed HUGEINT, so inspect decimal string maxima by length.
-    asset = conn.execute(
-        "SELECT asset_id FROM _identity_claims ORDER BY length(asset_id) DESC, asset_id DESC LIMIT 1"
-    ).fetchone()
-    base = (int(asset[0]) if asset else 0) + 1
     new_markets = []
     for index in range(count):
         sample = samples[index % len(samples)]
@@ -136,7 +131,9 @@ def build_source(conn, frontiers, count):
         eid = selected[index]["event_id"] if index < 10 else new_events[index % n_events]
         version = sample["source_market_version"]
         version = version if version and version.lower() in {"v1", "v2"} else "v2"
-        tokens = [str(base + index * 4 + offset) for offset in range(2)]
+        outcome_count = (8, 16, 32)[index] if index < 3 else 2
+        if count >= 1000 and 10 <= index < 130:
+            eid = new_events[0]
         row = {
             "id": mid,
             "question": sample["question"],
@@ -146,14 +143,53 @@ def build_source(conn, frontiers, count):
             "active": (True, False, None)[index % 3],
             "closed": (False, True, None)[index % 3],
             "archived": sample["archived"],
-            "outcomes": ["Yes", "No"],
-            "clobTokenIds": tokens if version.lower() == "v1" else None,
-            "positionIds": tokens if version.lower() == "v2" else None,
+            "outcomes": [f"Outcome {i + 1}" for i in range(outcome_count)]
+            if outcome_count > 2
+            else ["Yes", "No"],
+            "clobTokenIds": None,
+            "positionIds": None,
             "events": [{"id": eid}],
         }
         markets[mid] = row
         events[eid]["markets"].append(row)
         new_markets.append(mid)
+    # Hash over the full uint256 domain so lookup cannot prune all seed row groups.
+    slots = [(mid, i) for mid in new_markets for i in range(len(markets[mid]["outcomes"]))]
+    assets, attempts = {}, dict.fromkeys(slots, 0)
+    for _ in range(16):
+        reserved = set(assets.values())
+        for slot in slots:
+            if slot in assets:
+                continue
+            mid, outcome = slot
+            value = int.from_bytes(
+                hashlib.sha256(
+                    f"benchmark-current-v1:{mid}:{outcome}:{attempts[slot]}".encode()
+                ).digest(),
+                "big",
+            )
+            attempts[slot] += 1
+            if value and str(value) not in reserved:
+                assets[slot] = str(value)
+                reserved.add(str(value))
+        # One bounded candidate list checks accepted AND pending ownership reservations.
+        conflicts = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT c.asset_id FROM _identity_claims c "
+                "JOIN unnest(?::VARCHAR[]) proposed(asset_id) USING(asset_id) "
+                "WHERE c.venue='polymarket'",
+                [list(assets.values())],
+            ).fetchall()
+        }
+        assets = {slot: asset for slot, asset in assets.items() if asset not in conflicts}
+        if len(assets) == len(slots):
+            break
+    require(len(assets) == len(slots), "could not allocate disjoint native uint256 identifiers")
+    for mid in new_markets:
+        market = markets[mid]
+        key = "positionIds" if market["version"].lower() == "v2" else "clobTokenIds"
+        market[key] = [assets[mid, i] for i in range(len(market["outcomes"]))]
     controls = {}
     for lane, source in (("event", events), ("market", markets)):
         for status, flag in (("open", False), ("closed", True)):
@@ -466,14 +502,15 @@ def run(args):
                 "frontiers": frontiers,
                 "manifest_sha256": digest(Path(verified["path"]) / "manifest.json"),
             }
+            frozen_source = json.dumps([events, markets], sort_keys=True)
+            (output / "source.json").write_text(frozen_source)
             report["source"] = {
+                "payload_file": "source.json",
                 "new_events": len(new_events),
                 "new_markets": len(new_markets),
                 "selected_existing_events": len(events) - len(new_events),
                 "delay_s": args.delay_s,
-                "sha256": hashlib.sha256(
-                    json.dumps([events, markets], sort_keys=True).encode()
-                ).hexdigest(),
+                "sha256": hashlib.sha256(frozen_source.encode()).hexdigest(),
             }
         seed_size = sum(
             directory_bytes(seed / name) if (seed / name).is_dir() else (seed / name).stat().st_size

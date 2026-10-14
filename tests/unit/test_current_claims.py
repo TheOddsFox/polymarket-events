@@ -44,10 +44,9 @@ def conn():
         yield conn
 
 
-@pytest.mark.parametrize("write", [store.apply, current_import._overlay], ids=["apply", "overlay"])
-def test_repeated_same_maps_keep_one_claim_per_role_and_asset(conn, write):
+def test_repeated_same_maps_keep_one_claim_per_role_and_asset(conn):
     for day in (1, 2, 2, 1, 3):
-        write(conn, response(day))
+        store.apply(conn, response(day))
         assert claims(conn) == [
             ("2", "accepted", "11", 1),
             ("2", "accepted", "12", 1),
@@ -71,6 +70,10 @@ def test_repeated_seed_keeps_identical_candidate_and_accepted_roles(tmp_path):
             result = current_import.import_release(
                 settings, conn, release, manifest_sha256=checksum, raw_root=tmp_path / "raw"
             )
+            while not result["complete"]:
+                result = current_import.import_release(
+                    settings, conn, release, manifest_sha256=checksum, raw_root=tmp_path / "raw"
+                )
             assert result["resumed"] is resumed
             assert claims(conn) == [("2", "accepted", "123", 1), ("2", "candidate", "123", 1)]
             candidate, accepted = conn.execute(
@@ -83,11 +86,10 @@ def test_repeated_seed_keeps_identical_candidate_and_accepted_roles(tmp_path):
         conn.close()
 
 
-@pytest.mark.parametrize("write", [store.apply, current_import._overlay], ids=["apply", "overlay"])
-def test_candidate_change_and_malformed_map_keep_accepted_reservation_until_native(conn, write):
-    write(conn, response())
-    write(conn, response(2, assets=("21", "22")))
-    write(conn, response(3, assets=("bad", "22")))
+def test_candidate_change_and_malformed_map_keep_accepted_reservation_until_native(conn):
+    store.apply(conn, response())
+    store.apply(conn, response(2, assets=("21", "22")))
+    store.apply(conn, response(3, assets=("bad", "22")))
     assert claims(conn) == [
         ("2", "accepted", "11", 1),
         ("2", "accepted", "12", 1),

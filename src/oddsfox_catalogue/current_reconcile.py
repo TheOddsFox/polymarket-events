@@ -42,12 +42,18 @@ def _due(conn, lane, cold, now, interval):
     return conn.execute(
         f"""SELECT e.id,e.receipt FROM ({entities}) e
         LEFT JOIN _reconcile_attempts a ON a.kind=? AND a.id=e.id
-        WHERE (e.closed IS TRUE)=? AND
+        WHERE (? OR (e.closed IS TRUE)=?) AND
         (e.receipt IS NULL OR e.receipt<=? OR e.unresolved) AND
         (a.last_attempt IS NULL OR a.last_attempt<=?)
         ORDER BY a.last_attempt NULLS FIRST,e.receipt NULLS FIRST,try_cast(e.id AS BIGINT)
         LIMIT 100""",
-        [lane, cold, now - timedelta(seconds=interval), now - timedelta(hours=1)],
+        [
+            lane,
+            lane == "markets" and cold,
+            cold,
+            now - timedelta(seconds=interval),
+            now - timedelta(hours=1),
+        ],
     ).fetchall()
 
 
@@ -111,15 +117,10 @@ def reconcile(settings, conn, client, *, deadline):
     while time.monotonic() < stop:
         now = _now()
         state = current_store.get_state(
-            conn, "reconcile", {"turn": 0, "active_lane": 0, "cold_slot": 0, "windows": {}}
+            conn, "reconcile", {"turn": 0, "cold_slot": 0, "windows": {}}
         )
-        active = None
-        for offset in range(2):
-            lane = ("events", "markets")[(state["active_lane"] + offset) % 2]
-            rows = _due(conn, lane, False, now, settings.limits.active_recheck_s)
-            if rows:
-                active = (lane, rows)
-                break
+        rows = _due(conn, "events", False, now, settings.limits.active_recheck_s)
+        active = ("events", rows) if rows else None
         cold = _cold(conn, settings, now, state)
         if active is None and cold is None:
             break
@@ -132,7 +133,6 @@ def reconcile(settings, conn, client, *, deadline):
         if use_active:
             lane, rows = active
             ids = [r[0] for r in rows]
-            state["active_lane"] = 1 - ("events", "markets").index(lane)
             state["turn"] = min(3, state["turn"] + 1)
             counter = "active_batches"
         else:
@@ -215,11 +215,15 @@ def freshness(conn, *, now=None):
     now = now or _now()
     result = {"source_complete": False}
     for cold, prefix, interval in [(False, "active", 6 * 3600), (True, "cold", 30 * 86400)]:
+        entities = (
+            f"SELECT * FROM ({_entities('events')}) WHERE (closed IS TRUE)={str(cold).lower()}"
+        )
+        if cold:
+            entities += f" UNION ALL {_entities('markets')}"
         row = conn.execute(
             f"""SELECT count(*),count(*) FILTER (WHERE receipt IS NULL OR receipt<=?
-            OR unresolved),min(receipt) FROM ({_entities("events")} UNION ALL
-            {_entities("markets")}) WHERE (closed IS TRUE)=?""",
-            [now - timedelta(seconds=interval), cold],
+            OR unresolved),min(receipt) FROM ({entities})""",
+            [now - timedelta(seconds=interval)],
         ).fetchone()
         result.update(
             {

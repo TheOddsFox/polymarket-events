@@ -11,8 +11,10 @@ from .current_contract import (
     CurrentError,
     ResponseRows,
     columns,
+    native_integrity_queries,
     projection,
 )
+from .fingerprints import semantic_fingerprint
 
 
 def initialize(conn):
@@ -30,33 +32,39 @@ def initialize(conn):
             raise CurrentError("unrecognized or incomplete current store")
         _validate_schema(conn)
         return
-    for table, schema in SCHEMAS.items():
-        fields = ", ".join(f'"{name}" {kind}' for name, kind in schema)
-        key = ", ".join(KEYS[table])
-        conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({fields}, PRIMARY KEY ({key}))")
-    conn.execute("CREATE TABLE IF NOT EXISTS sync_state (key VARCHAR PRIMARY KEY, value JSON)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS _receipts (
-        kind VARCHAR, venue VARCHAR, id VARCHAR, receipt TIMESTAMPTZ, response VARCHAR,
-        PRIMARY KEY(kind,venue,id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS _membership (
-        venue VARCHAR,event_id VARCHAR,receipt TIMESTAMPTZ,response VARCHAR,
-        unresolved BOOLEAN, latest_receipt TIMESTAMPTZ, latest_response VARCHAR, PRIMARY KEY(venue,event_id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS _identity (
-        venue VARCHAR,market_id VARCHAR,candidate JSON,accepted JSON,
-        invalidated_at TIMESTAMPTZ,invalidated_response VARCHAR,
-        PRIMARY KEY(venue,market_id))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS _identity_claims (
-        venue VARCHAR NOT NULL,market_id VARCHAR NOT NULL,
-        role VARCHAR NOT NULL CHECK(role IN ('candidate','accepted')),
-        asset_kind VARCHAR NOT NULL,asset_id VARCHAR NOT NULL)""")
-    conn.execute("CREATE TABLE IF NOT EXISTS _parent_repairs (event_id VARCHAR PRIMARY KEY)")
-    for key, value in [
-        ("store_contract", STORE_CONTRACT),
-        ("projection_version", PROJECTION_VERSION),
-        ("generation", 0),
-    ]:
-        if get_state(conn, key) is None:
-            set_state(conn, key, value)
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for table, schema in SCHEMAS.items():
+            fields = ", ".join(f'"{name}" {kind}' for name, kind in schema)
+            key = ", ".join(KEYS[table])
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({fields}, PRIMARY KEY ({key}))")
+        conn.execute("CREATE TABLE IF NOT EXISTS sync_state (key VARCHAR PRIMARY KEY, value JSON)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS _receipts (
+            kind VARCHAR, venue VARCHAR, id VARCHAR, receipt TIMESTAMPTZ, response VARCHAR,
+            PRIMARY KEY(kind,venue,id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS _membership (
+            venue VARCHAR,event_id VARCHAR,receipt TIMESTAMPTZ,response VARCHAR,
+            unresolved BOOLEAN, latest_receipt TIMESTAMPTZ, latest_response VARCHAR, PRIMARY KEY(venue,event_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS _identity (
+            venue VARCHAR,market_id VARCHAR,candidate JSON,accepted JSON,
+            invalidated_at TIMESTAMPTZ,invalidated_response VARCHAR,
+            PRIMARY KEY(venue,market_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS _identity_claims (
+            venue VARCHAR NOT NULL,market_id VARCHAR NOT NULL,
+            role VARCHAR NOT NULL CHECK(role IN ('candidate','accepted')),
+            asset_kind VARCHAR NOT NULL,asset_id VARCHAR NOT NULL)""")
+        conn.execute("CREATE TABLE IF NOT EXISTS _parent_repairs (event_id VARCHAR PRIMARY KEY)")
+        for key, value in [
+            ("store_contract", STORE_CONTRACT),
+            ("projection_version", PROJECTION_VERSION),
+            ("generation", 0),
+        ]:
+            if get_state(conn, key) is None:
+                set_state(conn, key, value)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def get_state(conn, key, default=None):
@@ -116,6 +124,8 @@ def _identity_key(mapping):
 
 
 def apply(conn, response: ResponseRows, progress=None):
+    if conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone():
+        raise CurrentError("seed import incomplete; resume import-release with its frozen source")
     stamp = (
         datetime.fromisoformat(response.received_at.replace("Z", "+00:00")),
         response.response_id,
@@ -359,9 +369,14 @@ def _validate_schema(conn):
             raise CurrentError(f"invalid {table} types")
 
 
-def validate_store(conn):
+def validate_store(conn, *, allow_seeding=False):
     _validate_schema(conn)
-    for query in [
+    if (
+        not allow_seeding
+        and conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone()
+    ):
+        raise CurrentError("seed import incomplete; resume import-release with its frozen source")
+    for query in native_integrity_queries("events", "markets", "outcomes") + [
         "SELECT 1 FROM _identity_claims GROUP BY venue,market_id,role,asset_kind,asset_id HAVING count(*)>1",
         "SELECT 1 FROM markets m LEFT JOIN _identity i USING(venue,market_id) WHERE m.usable AND (i.accepted IS NULL OR i.invalidated_at IS NOT NULL)",
         "SELECT 1 FROM markets m JOIN _identity i USING(venue,market_id) WHERE m.usable AND (SELECT count(*) FROM outcomes o WHERE o.venue=m.venue AND o.market_id=m.market_id) <> json_array_length(i.accepted)",
@@ -373,6 +388,26 @@ def validate_store(conn):
     ]:
         if conn.execute(query + " LIMIT 1").fetchone():
             raise CurrentError("current store integrity violation")
+    structure = json.dumps([{name: kind for name, kind in SCHEMAS["outcomes"]}])
+    mapped = (
+        " FROM (SELECT i.venue AS owner_venue,i.market_id AS owner_market_id, "
+        + f"unnest(from_json(i.accepted, '{structure}')) AS mapping "
+        + "FROM _identity i JOIN markets m USING(venue,market_id) WHERE m.usable) maps"
+    )
+    if conn.execute(
+        "SELECT 1" + mapped + " WHERE mapping.venue IS DISTINCT FROM owner_venue "
+        "OR mapping.market_id IS DISTINCT FROM owner_market_id LIMIT 1"
+    ).fetchone():
+        raise CurrentError("accepted native mapping differs from its owner")
+    accepted = (
+        "SELECT "
+        + ", ".join(f'mapping."{name}" AS "{name}"' for name in columns("outcomes"))
+        + mapped
+    )
+    if semantic_fingerprint(conn, accepted) != semantic_fingerprint(
+        conn, f"SELECT {projection('outcomes')} FROM outcomes"
+    ):
+        raise CurrentError("current outcomes differ from accepted native mappings")
     return {"valid": True, "generation": generation(conn)}
 
 

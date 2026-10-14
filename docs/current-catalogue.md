@@ -35,13 +35,19 @@ uv run catalogue --root /srv/catalogue-v3 import-release /archive/releases/RELEA
 ```
 
 `init` writes `catalogue.json` with store contract
-`oddsfox.polymarket.catalogue_store.v2`. It rejects legacy roots, nonempty unstamped
+`oddsfox.polymarket.catalogue_store.v3`. It rejects legacy roots, nonempty unstamped
 roots, and roots nested inside legacy or current roots. There is no in-place migration.
 Import requires a pristine current store and verifies the pinned v2 release plus
 original event raw pages. It preserves original observation ages; it does not refresh
 them to import time. Original response IDs are unrecoverable: the recorded seed tie
 adaptation orders `legacy-baseline:<observation_id>` before `legacy-event:<page_id>`.
 Membership comes from independently verified event pages, not the old bridge table.
+Event evidence supplies memberships only; it does not overwrite imported entity
+descriptions, native mappings, or entity receipts. Import commits private baseline,
+membership, and validation phases, reopening DuckDB between phases to release index
+memory. Until validation commits, only status and an import with the same frozen
+source are allowed; publication and normal work remain blocked. Rerun the same import
+command after an interruption to resume the last committed phase.
 A repeated completed import verifies its pinned seed identity. Import is offline and
 makes no source-completeness claim. Never delete the old runtime/root to make room.
 Rollback means returning consumers and scheduling to that preserved pair.
@@ -72,8 +78,10 @@ requires a new probe; incompatible pending work fails with a recovery instructio
 Unsupported behavior remains blocked. Lifecycle transitions can cause omissions between
 passes, and the boolean controls do not prove coverage of unknown lifecycle values.
 Known entities remain retained and historical ranges are revisited.
-`refresh` advances durable discovery frontiers. `reconcile` revisits active/unknown
-records, cold closed records, and historical ID windows. It preserves work between runs.
+`refresh` advances durable discovery frontiers. `reconcile` prioritizes active/unknown
+events, then rotates closed events, all known markets, and historical ID windows monthly.
+Event responses also update their embedded markets. Unlinked market corrections may
+wait for monthly reconciliation. Work survives between invocations.
 `publish` explicitly builds a verified release; `current` and `verify` verify the pointer.
 `status` reports progress, backlog/freshness, last run, verified backup age, and a
 `recovery_point_overdue` flag when no backup exists or the last success exceeds 24 hours.
@@ -86,7 +94,8 @@ four-hour supervision. Normal refresh below 300 seconds remains a target, unprov
 until representative benchmark evidence exists. A deadline can stop work before a new
 publication; inspect the result and verify the existing pointer.
 
-Active/unknown freshness within six hours and cold closed freshness within a month
+Active/unknown event membership freshness within six hours, and closed events and all
+known markets within a month,
 are conditional targets, requiring compatible provider behavior and adequate cadence
 and capacity. Default due thresholds are 4.5 hours and 29 days, leaving scheduling
 margin. Neither a completed scan nor an empty response establishes source completeness.

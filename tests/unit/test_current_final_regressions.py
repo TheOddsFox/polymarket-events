@@ -250,7 +250,7 @@ def test_initial_publish_routes_record_actual_elapsed(catalogue, monkeypatch, op
 
     def seed(*args, **kwargs):
         current_store.set_state(conn, "seed", {"frontiers": {"events": 0, "markets": 0}})
-        return {"valid": True}
+        return {"valid": True, "complete": True}
 
     monkeypatch.setattr(current_publish, "publish", publish)
     monkeypatch.setattr("oddsfox_catalogue.current_import.import_release", seed)
@@ -397,7 +397,7 @@ def test_reconcile_natively_repairs_asset_conflicts(catalogue, monkeypatch):
     assert conn.execute("SELECT DISTINCT identity_error FROM markets").fetchall() == [
         ("asset_ownership_conflict",)
     ]
-    monkeypatch.setattr(current_reconcile, "_now", lambda: datetime(2026, 10, 14, tzinfo=UTC))
+    monkeypatch.setattr(current_reconcile, "_now", lambda: datetime(2026, 11, 1, tzinfo=UTC))
     native = []
 
     def handler(request):

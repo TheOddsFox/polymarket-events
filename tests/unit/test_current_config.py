@@ -29,7 +29,7 @@ def test_stamp_and_bounded_connection(tmp_path):
     settings = CurrentSettings(root)
     with connect_store(settings) as con:
         assert con.execute("select 42").fetchone() == (42,)
-    assert json.loads((root / "catalogue.json").read_text())["contract"].endswith("store.v2")
+    assert json.loads((root / "catalogue.json").read_text())["contract"].endswith("store.v3")
     assert admit(settings)["retained_bytes"] > 0
 
 

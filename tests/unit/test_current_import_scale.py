@@ -4,7 +4,7 @@ import hashlib
 import json
 
 import pytest
-from test_current_import import descriptor, release_fixture
+from test_current_import import descriptor, import_release, release_fixture
 
 from oddsfox_catalogue import current_import as importer
 from oddsfox_catalogue import current_store as store
@@ -29,8 +29,11 @@ def scale_release(tmp_path_factory):
         )
         conn.execute(
             """INSERT INTO seed_markets
-            (venue,market_id,condition_id,usable,last_observed_at,observation_id)
-            SELECT 'polymarket',id::VARCHAR,'condition:'||id,id<>100002,
+            (venue,market_id,source_market_version,protocol,condition_id,usable,last_observed_at,observation_id)
+            SELECT 'polymarket',id::VARCHAR,
+                CASE WHEN id=100003 THEN 'v2' ELSE 'v1' END,
+                CASE WHEN id=100003 THEN 'polymarket_v2' ELSE 'ctf' END,
+                CASE WHEN id=100003 THEN NULL ELSE '0x'||lpad(lower(to_hex(id)),64,'0') END,id<>100002,
                 '2026-10-12T00:00:00Z'::TIMESTAMPTZ,'observation:'||id
             FROM range(100000,150001) ids(id)"""
         )
@@ -43,9 +46,11 @@ def scale_release(tmp_path_factory):
             (venue,market_id,condition_id,outcome_index,outcome_label,asset_kind,
                 asset_id,clob_token_id,position_id)
             SELECT 'polymarket',id::VARCHAR,
-                CASE WHEN id=100003 THEN NULL ELSE 'condition:'||id END,
-                idx,CASE WHEN idx=0 THEN 'Yes α' WHEN id=100003 THEN NULL ELSE 'No' END,
-                'clob_token',asset,asset,NULL
+                CASE WHEN id=100003 THEN NULL ELSE '0x'||lpad(lower(to_hex(id)),64,'0') END,
+                idx+1,CASE WHEN idx=0 THEN 'Yes α' ELSE 'No' END,
+                CASE WHEN id=100003 THEN 'poly_v2_position' ELSE 'ctf_token' END,
+                asset,CASE WHEN id=100003 THEN NULL ELSE asset END,
+                CASE WHEN id=100003 THEN asset ELSE NULL END
             FROM (SELECT id,idx,
                 CASE WHEN id IN (100000,150000) AND idx=0 THEN ?
                 ELSE (id*10+idx)::VARCHAR END asset
@@ -107,17 +112,19 @@ def expected_map(key):
         {
             "venue": "polymarket",
             "market_id": str(key),
-            "condition_id": None if key == 100003 else f"condition:{key}",
-            "outcome_index": index,
-            "outcome_label": "Yes α" if index == 0 else None if key == 100003 else "No",
-            "asset_kind": "clob_token",
+            "condition_id": None if key == 100003 else f"0x{key:064x}",
+            "outcome_index": index + 1,
+            "outcome_label": "Yes α" if index == 0 else "No",
+            "asset_kind": "poly_v2_position" if key == 100003 else "ctf_token",
             "asset_id": SHARED_ASSET
             if key in (100000, 150000) and index == 0
             else str(key * 10 + index),
-            "clob_token_id": SHARED_ASSET
+            "clob_token_id": None
+            if key == 100003
+            else SHARED_ASSET
             if key in (100000, 150000) and index == 0
             else str(key * 10 + index),
-            "position_id": None,
+            "position_id": str(key * 10 + index) if key == 100003 else None,
         }
         for index in range(2)
     ]
@@ -129,9 +136,7 @@ def test_identity_seed_crosses_range_boundary_without_losing_maps_or_conflicts(
     settings, conn = target
     release, checksum, raw = scale_release
     batches = IdentityBatches(conn)
-    result = importer.import_release(
-        settings, batches, release, manifest_sha256=checksum, raw_root=raw
-    )
+    result = import_release(settings, batches, release, manifest_sha256=checksum, raw_root=raw)
     assert result["valid"]
     assert batches.rows_per_batch == [50_000, 1]
     assert conn.execute("SELECT count(*) FROM _identity").fetchone() == (MARKETS,)
@@ -185,13 +190,11 @@ def test_later_identity_batch_failure_rolls_back_whole_seed_and_allows_retry(tar
     settings, conn = target
     release, checksum, raw = scale_release
     batches = IdentityBatches(conn, fail_second=True)
-    with pytest.raises(CurrentError, match="identity state failed: second identity range failed"):
-        importer.import_release(settings, batches, release, manifest_sha256=checksum, raw_root=raw)
+    with pytest.raises(CurrentError, match="baseline failed: second identity range failed"):
+        import_release(settings, batches, release, manifest_sha256=checksum, raw_root=raw)
     assert batches.rows_per_batch == [50_000]
     assert_pristine(conn)
-    assert importer.import_release(settings, conn, release, manifest_sha256=checksum, raw_root=raw)[
-        "valid"
-    ]
+    assert import_release(settings, conn, release, manifest_sha256=checksum, raw_root=raw)["valid"]
     assert conn.execute("SELECT count(*) FROM _identity").fetchone() == (MARKETS,)
 
 
@@ -208,10 +211,12 @@ def test_consumed_seed_source_mutation_before_commit_rolls_back(tmp_path, monkey
 
     monkeypatch.setattr(importer, "_event_pages", mutate_after_pages)
     try:
-        with pytest.raises(CurrentError, match="seed event evidence failed"):
-            importer.import_release(
+        with pytest.raises(CurrentError, match="seed evidence failed"):
+            import_release(
                 settings, conn, release, manifest_sha256=checksum, raw_root=tmp_path / "raw"
             )
-        assert_pristine(conn)
+        assert store.get_state(conn, "seed_pending")["stage"] == "evidence"
+        assert store.generation(conn) == 0
+        assert conn.execute("SELECT count(*) FROM events").fetchone() == (1,)
     finally:
         conn.close()

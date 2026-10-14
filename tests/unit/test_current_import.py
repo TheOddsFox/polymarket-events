@@ -10,10 +10,17 @@ from oddsfox_catalogue import current_store as store
 from oddsfox_catalogue.contract import CONTRACT, NORMALIZATION_REVISION, projection_schemas
 from oddsfox_catalogue.current_config import CurrentSettings, validate_root
 from oddsfox_catalogue.current_contract import CurrentError
-from oddsfox_catalogue.current_import import _overlay, import_release
-from oddsfox_catalogue.current_rows import project_response
+from oddsfox_catalogue.current_import import _membership_response
+from oddsfox_catalogue.current_import import import_release as import_phase
 from oddsfox_catalogue.fingerprints import semantic_fingerprint
 from oddsfox_catalogue.legacy_release import verify_legacy_release
+
+
+def import_release(*args, **kwargs):
+    while True:
+        result = import_phase(*args, **kwargs)
+        if result["complete"]:
+            return result
 
 
 def release_fixture(tmp_path, *, usable=False):
@@ -38,11 +45,11 @@ def release_fixture(tmp_path, *, usable=False):
             )
         if usable and name == "markets":
             conn.execute(
-                "UPDATE fixture SET usable=true,condition_id='condition',identity_error=NULL"
+                "UPDATE fixture SET usable=true,source_market_version='v1',protocol='ctf',condition_id='0x1111111111111111111111111111111111111111111111111111111111111111',identity_error=NULL"
             )
         if usable and name == "outcomes":
             conn.execute(
-                "INSERT INTO fixture (venue,market_id,condition_id,outcome_index,outcome_label,asset_kind,asset_id,clob_token_id,observation_id) VALUES ('polymarket','2','condition',0,'Yes','clob_token','123','123','obs')"
+                "INSERT INTO fixture (venue,market_id,condition_id,outcome_index,outcome_label,asset_kind,asset_id,clob_token_id,observation_id) VALUES ('polymarket','2','0x1111111111111111111111111111111111111111111111111111111111111111',1,'Yes','ctf_token','123','123','obs')"
             )
         p = root / f"{name}.parquet"
         conn.execute("COPY fixture TO ? (FORMAT PARQUET)", [str(p)])
@@ -131,27 +138,6 @@ def test_corrupt_release_rejected(tmp_path):
         verify_legacy_release(release, manifest_sha256=checksum, connection=conn)
 
 
-def test_membership_unknown_preserves_latest_complete():
-    conn = duckdb.connect()
-    store.initialize(conn)
-
-    def overlay(day, event):
-        _overlay(
-            conn,
-            project_response(
-                [event], "events", received_at=f"2026-10-{day}T00:00:00Z", response_id=str(day)
-            ),
-        )
-
-    overlay("13", {"id": "1"})
-    overlay("12", {"id": "1", "markets": [{"id": "2", "question": "nested"}]})
-    assert conn.execute("SELECT event_id,market_id FROM event_markets").fetchall() == [("1", "2")]
-    assert conn.execute("SELECT unresolved FROM _membership").fetchone() == (True,)
-    overlay("14", {"id": "1", "markets": []})
-    assert conn.execute("SELECT * FROM event_markets").fetchall() == []
-    assert conn.execute("SELECT unresolved FROM _membership").fetchone() == (False,)
-
-
 def add_event_page(release, raw_root, records, *, day="13"):
     from oddsfox_catalogue.capture.writer import write_page
     from oddsfox_catalogue.ids import ids_hash
@@ -230,7 +216,7 @@ def add_event_page(release, raw_root, records, *, day="13"):
     return hashlib.sha256((release / "release.json").read_bytes()).hexdigest()
 
 
-def test_verified_event_pass_overlays_newer_metadata(tmp_path):
+def test_verified_event_pass_preserves_parquet_metadata(tmp_path):
     release, _, conn = release_fixture(tmp_path)
     raw_root = tmp_path / "raw"
     checksum = add_event_page(
@@ -251,13 +237,13 @@ def test_verified_event_pass_overlays_newer_metadata(tmp_path):
         manifest_sha256=checksum,
         raw_root=raw_root,
     )
-    assert conn.execute("SELECT title FROM events").fetchone() == ("recovered",)
-    assert conn.execute("SELECT question FROM markets").fetchone() == ("new nested",)
+    assert conn.execute("SELECT title FROM events").fetchone() == ("seed",)
+    assert conn.execute("SELECT question FROM markets").fetchone() == ("seed market",)
     assert conn.execute("SELECT unresolved FROM _membership").fetchone() == (True,)
     assert conn.execute("SELECT * FROM event_markets").fetchall() == []
 
 
-def test_raw_corruption_rolls_back_seed(tmp_path):
+def test_raw_corruption_retains_private_baseline(tmp_path):
     release, _, conn = release_fixture(tmp_path)
     raw_root = tmp_path / "raw"
     checksum = add_event_page(release, raw_root, [{"id": "1", "markets": []}])
@@ -270,7 +256,8 @@ def test_raw_corruption_rolls_back_seed(tmp_path):
             manifest_sha256=checksum,
             raw_root=raw_root,
         )
-    assert conn.execute("SELECT count(*) FROM events").fetchone() == (0,)
+    assert conn.execute("SELECT count(*) FROM events").fetchone() == (1,)
+    assert store.get_state(conn, "seed_pending")["stage"] == "evidence"
     assert store.get_state(conn, "seed") is None
 
 
@@ -288,109 +275,106 @@ def test_usable_seed_preserves_labels_and_identity(tmp_path):
     assert store.validate_store(conn)["valid"]
 
 
-def identity_response(conn, market_id, asset, day, *, native=False):
-    from oddsfox_catalogue.current_contract import ResponseRows, columns
+@pytest.mark.parametrize("children", [None, "bad", [{"id": "bad"}], [None]])
+def test_membership_parser_incomplete(children):
+    response = _membership_response(
+        [{"id": "1", "markets": children}], received_at="2026-10-13T00:00:00Z", response_id="a"
+    )
+    assert response.memberships == {"1": None}
 
-    row = dict(
-        zip(
-            columns("markets"),
-            conn.execute("SELECT * FROM markets WHERE market_id='2'").fetchone(),
-            strict=True,
+
+def test_membership_parser_ignores_metadata_and_rejects_conflicting_memberships():
+    response = _membership_response(
+        [{"id": "1", "title": 123, "markets": [{"id": "2", "conditionId": {}, "volume": "bad"}]}],
+        received_at="2026-10-13T00:00:00Z",
+        response_id="a",
+    )
+    assert response.memberships == {"1": ["2"]}
+    assert not response.events and not response.markets and not response.outcomes
+    with pytest.raises(CurrentError, match="conflicting event membership"):
+        _membership_response(
+            [{"id": "1", "markets": []}, {"id": "1", "markets": [{"id": "2"}]}],
+            received_at=response.received_at,
+            response_id="a",
         )
-    )
-    row.update(market_id=market_id, usable=asset is not None, identity_error=None)
-    outcomes = (
-        []
-        if asset is None
-        else [
-            dict(
-                venue="polymarket",
-                market_id=market_id,
-                condition_id="condition",
-                outcome_index=0,
-                outcome_label="Yes",
-                asset_kind="clob_token",
-                asset_id=asset,
-                clob_token_id=asset,
-                position_id=None,
+
+
+@pytest.mark.parametrize(
+    "latest",
+    [{}, {"markets": None}, {"markets": "bad"}, {"markets": [{"id": "2"}], "hasMore": True}],
+)
+def test_seed_latest_incomplete_preserves_complete_and_baseline(tmp_path, monkeypatch, latest):
+    from oddsfox_catalogue import current_import as importer
+
+    release, checksum, conn = release_fixture(tmp_path, usable=True)
+    settings = CurrentSettings(tmp_path / "current")
+    args = dict(manifest_sha256=checksum, raw_root=tmp_path / "raw")
+    import_phase(settings, conn, release, **args)
+    tables = ("events", "markets", "outcomes", "_receipts", "_identity", "_identity_claims")
+    before = {
+        name: conn.execute(f"SELECT * FROM {name} ORDER BY ALL").fetchall() for name in tables
+    }
+
+    def pages(*_):
+        for day, rid, raw in [
+            ("14", "z", {"id": "1", **latest}),
+            ("13", "z", {"id": "1", "markets": [{"id": "2"}]}),
+            ("13", "a", {"id": "1", "markets": []}),
+        ]:
+            yield _membership_response(
+                [raw], received_at=f"2026-10-{day}T00:00:00Z", response_id=rid
             )
-        ]
-    )
-    return ResponseRows(
-        received_at=f"2026-10-{day}T00:00:00Z",
-        response_id=f"response-{day}",
-        markets=[row],
-        outcomes=outcomes,
-        native_market_ids={market_id} if native else set(),
-    )
 
-
-def test_invalid_embedded_map_retains_native_ownership(tmp_path):
-    release, checksum, conn = release_fixture(tmp_path, usable=True)
-    import_release(
-        CurrentSettings(tmp_path / "current"),
-        conn,
-        release,
-        manifest_sha256=checksum,
-        raw_root=tmp_path / "raw",
-    )
-    _overlay(conn, identity_response(conn, "2", None, "14"))
+    monkeypatch.setattr(importer, "_event_pages", pages)
+    assert import_release(settings, conn, release, **args)["valid"]
+    assert conn.execute("SELECT event_id,market_id FROM event_markets").fetchall() == [("1", "2")]
     assert conn.execute(
-        "SELECT count(*) FROM _identity_claims WHERE market_id='2' AND role='accepted' AND asset_id='123'"
-    ).fetchone() == (1,)
-    assert (
-        json.loads(
-            conn.execute("SELECT accepted FROM _identity WHERE market_id='2'").fetchone()[0]
-        )[0]["asset_id"]
-        == "123"
+        "SELECT response,unresolved,latest_response FROM _membership"
+    ).fetchone() == ("z", True, "z")
+    assert conn.execute("SELECT receipt < latest_receipt FROM _membership").fetchone() == (True,)
+    assert before == {
+        name: conn.execute(f"SELECT * FROM {name} ORDER BY ALL").fetchall() for name in tables
+    }
+
+
+def test_seed_empty_authoritative_and_unknown_parents_fail_closed(tmp_path, monkeypatch):
+    from oddsfox_catalogue import current_import as importer
+
+    release, checksum, conn = release_fixture(tmp_path)
+    settings = CurrentSettings(tmp_path / "current")
+    args = dict(manifest_sha256=checksum, raw_root=tmp_path / "raw")
+
+    def pages(*_):
+        for rid, members in [("a", [{"id": "2"}]), ("z", [])]:
+            yield _membership_response(
+                [{"id": "1", "markets": members}],
+                received_at="2026-10-13T00:00:00Z",
+                response_id=rid,
+            )
+
+    monkeypatch.setattr(importer, "_event_pages", pages)
+    assert import_release(settings, conn, release, **args)["valid"]
+    assert conn.execute("SELECT * FROM event_markets").fetchall() == []
+    assert conn.execute("SELECT response,unresolved FROM _membership").fetchone() == ("z", False)
+
+
+@pytest.mark.parametrize("event,markets", [("9", []), ("1", [{"id": "9"}])])
+def test_seed_unknown_parent_rejected(tmp_path, monkeypatch, event, markets):
+    from oddsfox_catalogue import current_import as importer
+
+    release, checksum, conn = release_fixture(tmp_path)
+    response = _membership_response(
+        [{"id": event, "markets": markets}], received_at="2026-10-13T00:00:00Z", response_id="a"
     )
-    store.apply(conn, identity_response(conn, "3", "123", "15", native=True))
-    assert conn.execute("SELECT usable FROM markets WHERE market_id='3'").fetchone() == (False,)
-    store.apply(conn, identity_response(conn, "2", "456", "16", native=True))
-    store.apply(conn, identity_response(conn, "3", "123", "17", native=True))
-    assert conn.execute("SELECT usable FROM markets ORDER BY market_id").fetchall() == [
-        (True,),
-        (True,),
-    ]
-    assert store.validate_store(conn)["valid"]
-
-
-def test_changed_embedded_map_preserves_candidate_and_latch(tmp_path):
-    release, checksum, conn = release_fixture(tmp_path, usable=True)
-    import_release(
-        CurrentSettings(tmp_path / "current"),
-        conn,
-        release,
-        manifest_sha256=checksum,
-        raw_root=tmp_path / "raw",
-    )
-    _overlay(conn, identity_response(conn, "2", "456", "14"))
-    candidate, accepted, latch = conn.execute(
-        "SELECT candidate,accepted,invalidated_at FROM _identity WHERE market_id='2'"
-    ).fetchone()
-    assert json.loads(candidate)[0]["asset_id"] == "456"
-    assert json.loads(accepted)[0]["asset_id"] == "123"
-    assert latch is not None
-    assert conn.execute("SELECT * FROM outcomes").fetchall() == []
-    assert conn.execute("SELECT role,asset_id FROM _identity_claims ORDER BY role").fetchall() == [
-        ("accepted", "123"),
-        ("candidate", "456"),
-    ]
-    assert store.validate_store(conn)["valid"]
-
-
-def test_embedded_conflict_marks_both_owners(tmp_path):
-    release, checksum, conn = release_fixture(tmp_path, usable=True)
-    import_release(
-        CurrentSettings(tmp_path / "current"),
-        conn,
-        release,
-        manifest_sha256=checksum,
-        raw_root=tmp_path / "raw",
-    )
-    _overlay(conn, identity_response(conn, "3", "123", "14"))
-    assert conn.execute(
-        "SELECT usable,identity_error FROM markets ORDER BY market_id"
-    ).fetchall() == [(False, "asset_ownership_conflict"), (False, "asset_ownership_conflict")]
-    assert conn.execute("SELECT * FROM outcomes").fetchall() == []
-    assert store.validate_store(conn)["valid"]
+    monkeypatch.setattr(importer, "_event_pages", lambda *_: iter([response]))
+    with pytest.raises(CurrentError):
+        import_release(
+            CurrentSettings(tmp_path / "current"),
+            conn,
+            release,
+            manifest_sha256=checksum,
+            raw_root=tmp_path / "raw",
+        )
+    assert store.generation(conn) == 0
+    assert conn.execute("SELECT count(*) FROM events").fetchone() == (1,)
+    assert conn.execute("SELECT count(*) FROM markets").fetchone() == (1,)

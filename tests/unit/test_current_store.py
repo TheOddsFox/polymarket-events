@@ -12,27 +12,38 @@ from oddsfox_catalogue.current_store import (
 )
 
 
-def packet(day=1, market="m", assets=("a", "b"), native=False, usable=True):
+def packet(day=1, market="2", assets=("101", "102"), native=False, usable=True):
     return ResponseRows(
         received_at=f"2026-01-{day:02d}T00:00:00Z",
         response_id=str(day),
-        events=[dict(venue="polymarket", event_id="e", title="Event")],
-        markets=[dict(venue="polymarket", market_id=market, question="Q", usable=usable)],
+        events=[dict(venue="polymarket", event_id="1", title="Event")],
+        markets=[
+            dict(
+                venue="polymarket",
+                market_id=market,
+                question="Q",
+                usable=usable,
+                source_market_version="v1",
+                protocol="ctf",
+                condition_id="0x" + "1" * 64,
+            )
+        ],
         outcomes=[
             dict(
                 venue="polymarket",
                 market_id=market,
+                condition_id="0x" + "1" * 64,
                 outcome_index=i,
-                asset_kind="clob_token",
+                asset_kind="ctf_token",
                 asset_id=a,
                 clob_token_id=a,
                 outcome_label=str(i),
             )
-            for i, a in enumerate(assets)
+            for i, a in enumerate(assets, start=1)
         ]
         if usable
         else [],
-        memberships={"e": [market]},
+        memberships={"1": [market]},
         native_market_ids={market} if native else set(),
     )
 
@@ -53,11 +64,11 @@ def test_noop_late_and_empty_membership(db):
     apply(db, packet())
     assert get_state(db, "cursor") == "one"
     empty = packet(3)
-    empty.memberships = {"e": []}
+    empty.memberships = {"1": []}
     apply(db, empty)
     assert db.execute("SELECT count(*) FROM event_markets").fetchone()[0] == 0
     unknown = packet(4)
-    unknown.memberships = {"e": None}
+    unknown.memberships = {"1": None}
     apply(db, unknown)
     assert db.execute("SELECT count(*) FROM event_markets").fetchone()[0] == 0
     assert validate_store(db)["valid"]
@@ -65,13 +76,13 @@ def test_noop_late_and_empty_membership(db):
 
 def test_embedded_change_requires_new_native(db):
     apply(db, packet())
-    apply(db, packet(3, assets=("c", "d")))
+    apply(db, packet(3, assets=("103", "104")))
     assert db.execute("SELECT usable FROM markets").fetchone() == (False,)
-    apply(db, packet(2, assets=("a", "b"), native=True))
+    apply(db, packet(2, assets=("101", "102"), native=True))
     assert db.execute("SELECT count(*) FROM outcomes").fetchone() == (0,)
-    apply(db, packet(4, assets=("c", "d")))
+    apply(db, packet(4, assets=("103", "104")))
     assert db.execute("SELECT count(*) FROM outcomes").fetchone() == (0,)
-    apply(db, packet(5, assets=("c", "d"), native=True))
+    apply(db, packet(5, assets=("103", "104"), native=True))
     assert db.execute("SELECT usable FROM markets").fetchone() == (True,)
     assert validate_store(db)["valid"]
 
@@ -79,23 +90,23 @@ def test_embedded_change_requires_new_native(db):
 def test_invalid_incumbent_keeps_ownership(db):
     apply(db, packet())
     apply(db, packet(2, usable=False))
-    apply(db, packet(3, market="other"))
+    apply(db, packet(3, market="3"))
     assert db.execute("SELECT count(*) FROM markets WHERE usable").fetchone() == (0,)
     assert db.execute("SELECT count(*) FROM outcomes").fetchone() == (0,)
-    apply(db, packet(4, market="other", assets=("c", "d"), native=True))
-    assert db.execute("SELECT usable FROM markets WHERE market_id='m'").fetchone() == (False,)
-    assert db.execute("SELECT usable FROM markets WHERE market_id='other'").fetchone() == (True,)
+    apply(db, packet(4, market="3", assets=("103", "104"), native=True))
+    assert db.execute("SELECT usable FROM markets WHERE market_id='2'").fetchone() == (False,)
+    assert db.execute("SELECT usable FROM markets WHERE market_id='3'").fetchone() == (True,)
 
 
 def test_progress_failure_rolls_back_domain_and_generation(db):
     apply(db, packet(), {"cursor": 1})
     with pytest.raises(TypeError):
-        apply(db, packet(2, assets=("c", "d"), native=True), {"cursor": object()})
+        apply(db, packet(2, assets=("103", "104"), native=True), {"cursor": object()})
     assert generation(db) == 1
     assert get_state(db, "cursor") == 1
     assert db.execute("SELECT asset_id FROM outcomes ORDER BY asset_id").fetchall() == [
-        ("a",),
-        ("b",),
+        ("101",),
+        ("102",),
     ]
 
 
@@ -115,10 +126,10 @@ def test_response_tie_and_labels_are_public_changes(db):
 
 def test_conflicting_candidates_all_require_new_native(db):
     apply(db, packet())
-    apply(db, packet(2, market="other"))
+    apply(db, packet(2, market="3"))
     assert db.execute("SELECT count(*) FROM outcomes").fetchone() == (0,)
-    apply(db, packet(3, market="other", assets=("c", "d"), native=True))
-    assert db.execute("SELECT usable FROM markets WHERE market_id='m'").fetchone() == (False,)
+    apply(db, packet(3, market="3", assets=("103", "104"), native=True))
+    assert db.execute("SELECT usable FROM markets WHERE market_id='2'").fetchone() == (False,)
     apply(db, packet(4, native=True))
     assert db.execute("SELECT count(*) FROM markets WHERE usable").fetchone() == (2,)
     assert validate_store(db)["valid"]
@@ -126,7 +137,7 @@ def test_conflicting_candidates_all_require_new_native(db):
 
 def test_unknown_membership_does_not_hide_late_complete(db):
     unknown = packet(3)
-    unknown.memberships = {"e": None}
+    unknown.memberships = {"1": None}
     apply(db, unknown)
     apply(db, packet(2))
     assert db.execute("SELECT count(*) FROM event_markets").fetchone() == (1,)
@@ -135,7 +146,7 @@ def test_unknown_membership_does_not_hide_late_complete(db):
 def test_unknown_after_complete_and_old_unknown(db):
     apply(db, packet())
     unknown = packet(3)
-    unknown.memberships = {"e": None}
+    unknown.memberships = {"1": None}
     apply(db, unknown)
     assert summary(db)["unresolved_memberships"] == 1
     complete = packet(4)
@@ -177,8 +188,8 @@ def test_apply_and_reopen_do_not_run_full_store_scans(db, monkeypatch):
 
 def test_summary_limits_repairs_and_reports_totals(db):
     for i in range(4):
-        response = packet(i + 1, market=str(i), usable=False)
-        response.parent_event_ids = {f"parent-{i}"}
+        response = packet(i + 1, market=str(i + 1), usable=False)
+        response.parent_event_ids = {str(100 + i)}
         apply(db, response)
     result = summary(db, repair_limit=2)
     assert result["identity_repair_count"] == 4
@@ -212,7 +223,7 @@ def test_claim_scans_are_batched_per_response(db):
     response.markets = []
     response.outcomes = []
     for i in range(10):
-        item = packet(market=str(i), assets=(f"a-{i}", f"b-{i}"))
+        item = packet(market=str(i + 1), assets=(str(1000 + 2 * i), str(1001 + 2 * i)))
         response.markets.extend(item.markets)
         response.outcomes.extend(item.outcomes)
     counted = CountingConnection(db)

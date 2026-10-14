@@ -15,7 +15,15 @@ import duckdb
 
 from .capture.writer import _fsync_dir, atomic_write_bytes, read_regular_bytes
 from .current_config import CurrentSettings, admit, memory_connection, safe_path, validate_root
-from .current_contract import CONTRACT, KEYS, PROJECTION_VERSION, SCHEMAS, CurrentError, projection
+from .current_contract import (
+    CONTRACT,
+    KEYS,
+    PROJECTION_VERSION,
+    SCHEMAS,
+    CurrentError,
+    native_integrity_queries,
+    projection,
+)
 from .current_store import generation, summary, validate_store
 from .fingerprints import semantic_fingerprint
 from .limits import directory_bytes
@@ -59,7 +67,7 @@ def _integrity(conn, sources):
         ).fetchone():
             raise CurrentError(f"duplicate {table} key")
     events, markets, links, outcomes = (sources[t] for t in SCHEMAS)
-    checks = [
+    checks = native_integrity_queries(events, markets, outcomes) + [
         f"SELECT 1 FROM {links} l LEFT JOIN {events} e USING(venue,event_id) LEFT JOIN {markets} m USING(venue,market_id) WHERE e.event_id IS NULL OR m.market_id IS NULL",
         f"SELECT 1 FROM {outcomes} o LEFT JOIN {markets} m USING(venue,market_id) WHERE m.market_id IS NULL OR m.usable IS DISTINCT FROM true",
         f"SELECT 1 FROM {outcomes} GROUP BY venue,asset_kind,asset_id HAVING count(DISTINCT market_id)>1",

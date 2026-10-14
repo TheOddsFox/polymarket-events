@@ -185,7 +185,7 @@ def test_unknown_lifecycle_is_due_and_native_404_preserves_market(setup):
         project_response(
             [market],
             "markets",
-            received_at=(NOW - timedelta(hours=7)).isoformat(),
+            received_at=(NOW - timedelta(days=30)).isoformat(),
             response_id="market",
         ),
     )
@@ -222,3 +222,54 @@ def test_missing_parent_omission_is_bounded_and_empty_windows_leave_no_id_state(
     assert len(calls) == 2
     assert conn.execute("SELECT kind,id FROM _reconcile_attempts").fetchall() == [("events", "99")]
     assert conn.execute("SELECT event_id FROM _parent_repairs").fetchall() == [("99",)]
+
+
+@pytest.mark.parametrize("closed", [False, True, None])
+@pytest.mark.parametrize(
+    "age_days,due", [(0, False), (5 / 24, False), (28, False), (29, True), (31, True)]
+)
+def test_all_known_markets_use_monthly_cold_lane(setup, closed, age_days, due):
+    settings, conn = setup
+    market = {"id": "7", "closed": closed}
+    current_store.apply(
+        conn,
+        project_response(
+            [market],
+            "markets",
+            received_at=(NOW - timedelta(days=age_days)).isoformat(),
+            response_id="market",
+        ),
+    )
+    calls = []
+    run(
+        settings,
+        conn,
+        lambda r: (
+            calls.append(r)
+            or (httpx.Response(404) if r.url.path == "/markets/7" else httpx.Response(200, json=[]))
+        ),
+    )
+    assert [r.url.path for r in calls] == (["/markets", "/markets/7"] if due else [])
+    status = reconcile.freshness(conn, now=NOW)
+    assert status["active_count"] == status["active_overdue_count"] == 0
+    assert status["cold_count"] == 1
+    assert status["cold_overdue_count"] == int(age_days >= 30)
+
+
+def test_active_event_rechecks_before_six_hour_target(setup):
+    settings, conn = setup
+    seed(conn, [event(1)], age=4.5 * 3600)
+    calls = []
+    run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
+    assert [r.url.params.get_list("id") for r in calls] == [["1"]]
+
+
+def test_urgent_event_overrides_persisted_cold_turn(setup):
+    settings, conn = setup
+    seed(conn, [event(1)], age=5 * 3600)
+    seed(conn, [event(999, True)], age=31 * 86400)
+    current_store.set_state(conn, "reconcile", {"turn": 3, "cold_slot": 0, "windows": {}})
+    calls = []
+    run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
+    assert [r.url.params.get_list("id") for r in calls] == [["1"], ["999"]]
+    assert current_store.get_state(conn, "reconcile")["turn"] == 0

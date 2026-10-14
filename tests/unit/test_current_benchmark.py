@@ -1,5 +1,6 @@
 """Small independent tests; never copy an operator seed or access live Gamma."""
 
+import hashlib
 import importlib.util
 from pathlib import Path
 
@@ -63,7 +64,8 @@ def test_failed_envelope_does_not_raise_limits(tmp_path, monkeypatch):
         benchmark.capacity(tmp_path / "seed", tmp_path / "output", 199)
 
 
-def test_delta_preserves_ten_old_memberships_and_uses_seed_frontiers(tmp_path):
+@pytest.mark.parametrize("count", [12, 1000])
+def test_delta_preserves_ten_old_memberships_and_uses_seed_frontiers(tmp_path, count):
     import duckdb
 
     from fakes.world import make_event, make_market
@@ -82,31 +84,68 @@ def test_delta_preserves_ten_old_memberships_and_uses_seed_frontiers(tmp_path):
                 originals, "events", received_at="2026-10-14T00:00:00Z", response_id="seed"
             ),
         )
-        suppressed_asset = str(10**90)
-        conn.execute(
-            "INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)",
-            ["polymarket", "suppressed", "accepted", "poly_v2_position", suppressed_asset],
-        )
-        events, markets, controls, new_events, new_markets = benchmark.build_source(
-            conn, {"events": 10, "markets": 10}, 12
-        )
-        assert min(
-            int(asset)
+        reservations = [str(2**256 - 1)] + [
+            str(
+                int.from_bytes(
+                    hashlib.sha256(f"benchmark-current-v1:{mid}:0:0".encode()).digest(), "big"
+                )
+            )
+            for mid in ("11", "12")
+        ]
+        for index, asset in enumerate(reservations):
+            conn.execute(
+                "INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)",
+                [
+                    "polymarket",
+                    "suppressed",
+                    "candidate" if index == 1 else "accepted",
+                    "poly_v2_position",
+                    asset,
+                ],
+            )
+        source = benchmark.build_source(conn, {"events": 10, "markets": 10}, count)
+        assert source == benchmark.build_source(conn, {"events": 10, "markets": 10}, count)
+        events, markets, controls, new_events, new_markets = source
+        assets = [
+            asset
             for mid in new_markets
             for asset in (markets[mid]["positionIds"] or markets[mid]["clobTokenIds"])
-        ) > int(suppressed_asset)
-        assert len(new_events) == 3
-        assert new_markets == [str(i) for i in range(11, 23)]
+        ]
+        assert len(assets) == len(set(assets))
+        assert all(0 < int(asset) < 2**256 for asset in assets)
+        assert set(assets).isdisjoint(reservations)
+        assert min(map(int, assets)) < 2**254
+        assert max(map(int, assets)) > 3 * 2**254
+        assert [len(markets[mid]["outcomes"]) for mid in new_markets[:3]] == [8, 16, 32]
+        assert markets["11"]["positionIds"] is not None
+        assert assets[0] == str(
+            int.from_bytes(hashlib.sha256(b"benchmark-current-v1:11:0:1").digest(), "big")
+        )
+        if count >= 1000:
+            assert len(events[new_events[0]]["markets"]) > 100
+        assert len(new_events) == benchmark.math.ceil(count / 4)
+        assert new_markets == [str(i) for i in range(11, 11 + count)]
         assert all(len(events[str(i)]["markets"]) == 2 for i in range(1, 11))
         assert all(any(m["id"] == str(i) for m in events[str(i)]["markets"]) for i in range(1, 11))
-        assert max(map(int, events)) == 13
-        assert max(map(int, markets)) == 22
+        assert max(map(int, events)) == 10 + len(new_events)
+        assert max(map(int, markets)) == 10 + count
         assert controls["absent-event"] not in events
         fixture = CurrentGammaServer(events, markets)
         assert fixture.stats["http_attempts"] == 0
         for table in benchmark.SCHEMAS:
             conn.execute(f"COPY {table} TO '{tmp_path / (table + '.parquet')}' (FORMAT PARQUET)")
         delta = benchmark.expected_delta(events, markets, new_events, new_markets)
+        projected = project_response(
+            list(events.values()), "events", received_at="2026-10-14T00:00:00Z", response_id="delta"
+        )
+        for table in ("markets", "outcomes"):
+            actual = [row for row in getattr(projected, table) if row["market_id"] in new_markets]
+            assert sorted(actual, key=str) == sorted(delta[table], key=str)
+        assert all(
+            sorted(projected.memberships[eid], key=int)
+            == sorted([m["id"] for m in events[eid]["markets"]], key=int)
+            for eid in events
+        )
         for table, rows in delta.items():
             names = benchmark.columns(table)
             if rows:
@@ -114,7 +153,7 @@ def test_delta_preserves_ten_old_memberships_and_uses_seed_frontiers(tmp_path):
                     f"INSERT INTO {table} VALUES ({','.join('?' for _ in names)})",
                     [[r[n] for n in names] for r in rows],
                 )
-        assert benchmark.verify_expected(conn, tmp_path, delta)["event_markets"] == 22
+        assert benchmark.verify_expected(conn, tmp_path, delta)["event_markets"] == 10 + count
         conn.execute("DROP TABLE expected_events")
         conn.execute("UPDATE events SET title='wrong' WHERE event_id='11'")
         with pytest.raises(ValueError, match="exact seed-plus-delta mismatch"):

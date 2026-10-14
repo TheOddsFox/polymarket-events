@@ -23,7 +23,7 @@ def store(tmp_path):
         ResponseRows(
             "2026-01-01T00:00:00Z",
             "1",
-            events=[dict(venue="polymarket", event_id="e", title="hello")],
+            events=[dict(venue="polymarket", event_id="1", title="hello")],
         ),
     )
     yield settings, conn
@@ -43,7 +43,7 @@ def test_roundtrip_noop_and_independent_current(store):
         ResponseRows(
             "2026-01-02T00:00:00Z",
             "2",
-            events=[dict(venue="polymarket", event_id="e", title="changed")],
+            events=[dict(venue="polymarket", event_id="1", title="changed")],
         ),
     )
     assert publisher.verify_current(settings)["generation"] == 1
@@ -99,7 +99,7 @@ def test_failure_preserves_previous_pointer(store, monkeypatch, failure):
         ResponseRows(
             "2026-01-02T00:00:00Z",
             "2",
-            events=[dict(venue="polymarket", event_id="e", title="changed")],
+            events=[dict(venue="polymarket", event_id="1", title="changed")],
         ),
     )
     original_replace = publisher.os.replace

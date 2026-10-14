@@ -32,14 +32,36 @@ def execute(settings, operation, options, deadline):
     from .current_publish import verify_current
 
     started = time.monotonic()
-    if operation == "backup":
-        result = create_backup(settings, deadline=deadline)
-        result["retention"] = prune(settings)
-        return result
     if operation == "verify-backup":
         return verify_backup(options["backup"], deadline=deadline)
     if operation == "restore":
         return restore_backup(options["backup"], options["destination"], deadline=deadline)
+    if operation == "import-release":
+        from .current_import import import_release
+
+        while True:
+            with connect_store(settings) as conn:
+                result = import_release(settings, conn, deadline=deadline, **options)
+            if result["complete"]:
+                break
+        with connect_store(settings) as conn:
+            result["publication"], result["publish_verify_s"] = _publish(settings, conn, deadline)
+        return result
+    if settings.store_path.exists():
+        with connect_store(settings) as guard:
+            tables = {row[0] for row in guard.execute("SHOW TABLES").fetchall()}
+            pending = (
+                "sync_state" in tables
+                and guard.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone()
+            )
+        if pending and operation != "status":
+            raise CurrentError(
+                "seed import incomplete; resume import-release with its frozen source"
+            )
+    if operation == "backup":
+        result = create_backup(settings, deadline=deadline)
+        result["retention"] = prune(settings)
+        return result
     retention = None
     if operation in {"refresh", "reconcile"}:
         retention = prune(settings, raw_only=True)
@@ -50,7 +72,15 @@ def execute(settings, operation, options, deadline):
         if operation == "status":
             from .current_reconcile import freshness
 
-            result = {"status": "ready", **summary(conn), **freshness(conn)}
+            pending = get_state(conn, "seed_pending")
+            result = {
+                "status": "seeding"
+                if conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone()
+                else "ready",
+                **summary(conn),
+                **freshness(conn),
+            }
+            result["seed_pending"] = pending
             result["discovery"] = get_state(conn, "discovery")
             result["last_run"] = get_state(conn, "last_run")
             result["last_backup"] = get_state(conn, "last_backup")
@@ -65,27 +95,6 @@ def execute(settings, operation, options, deadline):
             return result
         if operation in {"verify", "current"}:
             return verify_current(settings, connection=conn)
-        if operation == "import-release":
-            from .current_import import import_release
-
-            result = import_release(settings, conn, deadline=deadline, **options)
-            if get_state(conn, "discovery") is None:
-                frontiers = get_state(conn, "seed")["frontiers"]
-                set_state(
-                    conn,
-                    "discovery",
-                    {
-                        "version": 2,
-                        "next_lane": 0,
-                        "pending": None,
-                        "lanes": {
-                            lane: {"frontier": frontiers[lane], "highwater": None, "phase": "tail"}
-                            for lane in ("events", "markets")
-                        },
-                    },
-                )
-            result["publication"], result["publish_verify_s"] = _publish(settings, conn, deadline)
-            return result
         if operation == "publish":
             return _publish(settings, conn, deadline)[0]
         from .current_sync import discover, probe_policy, resume_pending
