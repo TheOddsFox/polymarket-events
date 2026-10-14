@@ -125,6 +125,11 @@ Admission limits: 64 GiB retained root, 8 GiB raw, raw age at most seven days,
 backup creation retains one verified backup per day. Pending responses are protected
 from pruning, so an exhausted allowance blocks progress rather than discarding needed
 recovery data. These are ceilings, not a promise that any corpus fits.
+Backup verification uses a fresh temporary directory outside every catalogue and
+legacy root. Seven retained backups plus the next staging copy must fit the retained
+ceiling; one verification copy plus its SQL spill must fit the separate temporary
+ceiling. A full root fails explicitly rather than deleting verified recovery points
+before their replacement is ready.
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 backup create

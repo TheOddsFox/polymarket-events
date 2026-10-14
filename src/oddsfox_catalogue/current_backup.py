@@ -36,6 +36,19 @@ def _deadline(deadline):
         raise CurrentError("backup deadline exhausted")
 
 
+def _verification_temp():
+    temporary = safe_path(Path(tempfile.gettempdir()).resolve())
+    if not temporary.is_dir() or any(
+        (ancestor / marker).exists()
+        for ancestor in (temporary, *temporary.parents)
+        for marker in ("catalogue.json", "ledger.sqlite", "warehouse", ".state/ledger.sqlite")
+    ):
+        raise CurrentError(
+            "backup verification temporary directory must be outside catalogue and legacy roots"
+        )
+    return temporary
+
+
 def _relative(value):
     if not isinstance(value, str):
         raise CurrentError("invalid inventory path")
@@ -228,18 +241,16 @@ def _inventory(path, deadline):
 
 def verify_backup(path, *, deadline=None):
     path = safe_path(Path(path))
+    temporary = _verification_temp()
     value = _inventory(path, deadline)
     size = sum(item["bytes"] for item in value["files"].values())
     limits = CurrentSettings(path).limits
     if size >= limits.max_temp_bytes:
         raise CurrentError("backup verification temporary allowance exhausted")
-    if (
-        shutil.disk_usage(Path(tempfile.gettempdir()).resolve()).free - limits.max_temp_bytes
-        < limits.free_reserve_bytes
-    ):
+    if shutil.disk_usage(temporary).free - limits.max_temp_bytes < limits.free_reserve_bytes:
         raise CurrentError("backup verification free-space reserve exhausted")
     # A fresh private restore proves recovery without trusting ambient configuration.
-    with tempfile.TemporaryDirectory(prefix="catalogue-verify-") as directory:
+    with tempfile.TemporaryDirectory(prefix="catalogue-verify-", dir=temporary) as directory:
         root = Path(directory).resolve() / "root"
         root.mkdir()
         _copy(path, root, value["files"], deadline)
@@ -256,6 +267,7 @@ def verify_backup(path, *, deadline=None):
 
 def create_backup(settings, *, deadline=None):
     validate_root(settings.root)
+    _verification_temp()
     _deadline(deadline)
     with connect_store(settings) as conn:
         validate_store(conn)
@@ -265,7 +277,7 @@ def create_backup(settings, *, deadline=None):
     size = sum(item["bytes"] for item in inventory.values())
     if size > settings.limits.max_temp_bytes:
         raise CurrentError("backup verification temporary allowance exhausted")
-    admit(settings, additional_bytes=2 * size + 65536)
+    admit(settings, additional_bytes=size + 65536)
     backups = safe_path(settings.backups_dir)
     backups.mkdir(exist_ok=True)
     identifier = datetime.now(UTC).strftime("%Y%m%d") + "-" + uuid4().hex
