@@ -111,13 +111,18 @@ cycle's start; status reports range ages separately from entity receipt ages.
 `status` reports progress, backlog/freshness, unstarted or overdue historical ranges,
 last run, verified backup age, and a
 `recovery_point_overdue` flag when no backup exists or the last success exceeds 24 hours.
+Its `ready` status means seed initialization is complete; inspect freshness and
+recovery fields separately before deployment.
 
 One supervised HTTP worker, one root writer lock, and at most 10 requests/second are
-allowed. Default per-invocation ceilings are 300 seconds, 25,000 HTTP attempts,
+allowed. The worker holds that lock through database and filesystem changes, so
+killing its CLI parent cannot admit a second canonical writer while it finishes.
+Default per-invocation ceilings are 300 seconds, 25,000 HTTP attempts,
 4 GiB downloaded, and 16 MiB per response. Publication time is reserved inside the
 refresh deadline (at least 60 seconds). Import and backup operations have separate
-four-hour supervision. Normal refresh below 300 seconds remains a target, unproven
-until representative benchmark evidence exists. A deadline can stop work before a new
+four-hour supervision. The full-store five-minute acceptance gate has not passed;
+the measured publication alone exceeds that deadline on the tested connection.
+See the [acceptance record](current-catalogue-acceptance.md). A deadline can stop work before a new
 publication; inspect the result and verify the existing pointer.
 
 Active/unknown event membership freshness within six hours, and closed events and all
@@ -145,7 +150,22 @@ only the database and root stamp into a fresh directory outside every catalogue 
 legacy root, reopens that database, and checks the inventoried publication and pending
 evidence through the same bounded connection. Those copied bytes plus SQL spill must
 fit the separate 8 GiB temporary ceiling. Restore admits the full expanded bundle.
+Verification uses a private owned directory below the external system temporary
+directory and a shared fail-fast verification lock. Surviving workspace bytes reduce
+the next copy/spill allowance. Keep the selected system temporary directory consistent
+across invocations and count this private base in host storage accounting.
+The supervisor cleans only its own invocation directory
+after its worker has stopped. A whole-process crash can leave charged artifacts;
+the private base is `oddsfox-catalogue-verification-<uid>` below that temporary
+directory, containing `invocation-<id>` directories. Stop canonical and recovery jobs,
+inspect ownership and contents, and confirm no verifier is active before operator recovery.
+Legacy flat `catalogue-verify-*` directories block verification until explicitly
+recovered when owned by the current user. Foreign-owned entries are ignored.
+No automatic prefix cleanup is performed.
 Seven retained backups plus the next staging copy must fit the retained ceiling.
+They must also leave the normal changed-publication admission reserve available;
+fitting the backups alone does not establish an operable root. The measured
+mixed-codec checkpoint fails that combined gate; see the acceptance record.
 A full root fails explicitly rather than deleting verified recovery points before
 their replacement is ready.
 
@@ -203,14 +223,17 @@ with `uv run python scripts/verify-distribution.py dist/*.whl dist/*.tar.gz`. Us
 benchmark interface. For example:
 
 ```sh
-uv run python scripts/benchmark-current.py --seed-root /srv/catalogue-v3-seed \
+/opt/catalogue/venv/bin/python scripts/benchmark-current.py --seed-root /srv/catalogue-v3-seed \
   --output /srv/catalogue-v3-benchmark --runs 3 --delta-markets 1000 --delay-s 0.1 \
+  --executable /opt/catalogue/venv/bin/catalogue \
   --account-root /archive/legacy-catalogue
 ```
 
 Use a fresh output directory and an idle, checkpointed, verified seed with no pending
-work. Repeat `--account-root` for every external legacy/operator root; repository data
-is counted automatically. The harness freezes a controlled real-network provider,
+work. Use the same installed-wheel Python for the harness and CLI; `--executable`
+alone pins only the CLI children. Repeat `--account-root` for every external
+legacy/operator root; repository data
+is counted automatically. The harness freezes a controlled loopback HTTP provider,
 includes new memberships on existing events, checks exact content independently, and
 measures verified publication plus unchanged refreshes. It does not reproduce historical
 network delays or prove six-hour/monthly reconciliation capacity. Measure sustained

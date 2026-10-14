@@ -182,8 +182,7 @@ def _current(args):
             if operation in {"import-release", "backup"}
             else settings.limits.max_duration_s
         )
-        with run_lock(settings.run_lock_path):
-            success, result = supervise(settings, operation, options, duration=duration)
+        success, result = supervise(settings, operation, options, duration=duration)
     print(json.dumps(result, default=str, indent=2))
     return 0 if success else 3
 

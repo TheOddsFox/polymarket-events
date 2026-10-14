@@ -10,11 +10,14 @@ import stat
 import tempfile
 import time
 import zlib
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
+
+from filelock import FileLock, Timeout
 
 from .capture.writer import _fsync_dir, atomic_write_bytes, read_body, read_regular_bytes
 from .current_config import CurrentSettings, admit, connect_store, safe_path, validate_root
@@ -35,6 +38,7 @@ from .current_sync import (
 )
 from .legacy_release import _unique_pairs
 from .limits import directory_bytes
+from .runlock import RunBusy
 
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _BACKUP = re.compile(r"\d{8}-[0-9a-f]{32}\Z")
@@ -70,6 +74,76 @@ def _verification_temp():
             "backup verification temporary directory must be outside catalogue and legacy roots"
         )
     return temporary
+
+
+def _private_directory(path):
+    safe_path(path)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise CurrentError(f"unsafe backup verification directory: {path}")
+    return path
+
+
+def _verification_base():
+    temporary = _verification_temp()
+    leftovers = sorted(
+        child
+        for child in temporary.glob("catalogue-verify-*")
+        if child.lstat().st_uid == os.getuid()
+    )
+    if leftovers:
+        raise CurrentError(
+            "legacy backup verification artifacts require operator recovery: "
+            + ", ".join(map(str, leftovers))
+        )
+    base = temporary / f"oddsfox-catalogue-verification-{os.getuid()}"
+    base.mkdir(mode=0o700, exist_ok=True)
+    return _private_directory(base)
+
+
+def _verification_workspace_path(workspace, base):
+    workspace = safe_path(Path(workspace))
+    if workspace.parent != base or not re.fullmatch(r"invocation-[0-9a-f]{32}", workspace.name):
+        raise CurrentError("unrecognized backup verification workspace")
+    return _private_directory(workspace)
+
+
+@contextmanager
+def _verification_workspace():
+    base = _verification_base()
+    workspace = base / ("invocation-" + uuid4().hex)
+    workspace.mkdir(mode=0o700)
+    identity = workspace.stat()
+    try:
+        yield workspace
+    finally:
+        # Delete only the invocation we allocated, never a prefix match or replacement.
+        _verification_workspace_path(workspace, base)
+        current = workspace.stat()
+        if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
+            raise CurrentError("backup verification workspace changed before cleanup")
+        shutil.rmtree(workspace)
+
+
+def _verification_bytes(base):
+    total = 0
+    for child in base.iterdir():
+        if child.name == "admission.lock":
+            info = child.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise CurrentError("unsafe backup verification lock")
+            continue
+        _verification_workspace_path(child, base)
+        for entry in child.rglob("*"):
+            safe_path(entry)
+            info = entry.lstat()
+            if info.st_uid != os.getuid() or not (
+                stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+            ):
+                raise CurrentError(f"unsafe backup verification contents: {entry}")
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total
 
 
 def _relative(value):
@@ -385,46 +459,64 @@ def _inventory(path, deadline):
     return value
 
 
-def verify_backup(path, *, deadline=None):
+def verify_backup(path, *, deadline=None, _workspace=None):
+    if _workspace is None:
+        with _verification_workspace() as workspace:
+            return verify_backup(path, deadline=deadline, _workspace=workspace)
     path = safe_path(Path(path))
-    temporary = _verification_temp()
-    value = _inventory(path, deadline)
-    limits = CurrentSettings(path).limits
-    size = sum(
-        value["files"][name]["bytes"]
-        for name in ("catalogue.duckdb", "catalogue.json")
-        if name in value["files"]
-    )
-    if size >= limits.max_temp_bytes:
-        raise CurrentError("backup verification temporary allowance exhausted")
-    if sum(item["bytes"] for item in value["files"].values()) > limits.max_retained_bytes:
-        raise CurrentError("backup expanded retained allowance exhausted")
-    if shutil.disk_usage(temporary).free - limits.max_temp_bytes < limits.free_reserve_bytes:
-        raise CurrentError("backup verification free-space reserve exhausted")
-    with tempfile.TemporaryDirectory(prefix="catalogue-verify-", dir=temporary) as directory:
-        root = Path(directory).resolve() / "root"
-        root.mkdir()
-        _copy(
-            path,
-            root,
-            {name: value["files"][name] for name in ("catalogue.duckdb", "catalogue.json")},
-            deadline,
+    base = _verification_base()
+    workspace = _verification_workspace_path(_workspace, base)
+    lock_path = base / "admission.lock"
+    if lock_path.exists() or lock_path.is_symlink():
+        safe_path(lock_path)
+        info = lock_path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise CurrentError("unsafe backup verification lock")
+    lock = FileLock(str(base / "admission.lock"), mode=0o600)
+    try:
+        lock.acquire(timeout=0)
+    except Timeout as exc:
+        raise RunBusy(f"another backup verification holds {base / 'admission.lock'}") from exc
+    try:
+        stale_bytes = _verification_bytes(base)
+        value = _inventory(path, deadline)
+        limits = CurrentSettings(path).limits
+        size = sum(
+            value["files"][name]["bytes"]
+            for name in ("catalogue.duckdb", "catalogue.json")
+            if name in value["files"]
         )
-        result, expected = _validate(
-            CurrentSettings(
-                root, limits=replace(limits, max_temp_bytes=limits.max_temp_bytes - size)
-            ),
-            deadline,
-            evidence_root=path,
-        )
-        if set(expected) != set(value["files"]):
-            raise CurrentError("backup inventory does not match recovery state")
-    if _inventory(path, deadline) != value:
-        raise CurrentError("backup changed during verification")
-    return {**value, **result, "path": str(path)}
+        remaining = limits.max_temp_bytes - stale_bytes - size
+        if remaining <= 0:
+            raise CurrentError("backup verification temporary allowance exhausted")
+        if sum(item["bytes"] for item in value["files"].values()) > limits.max_retained_bytes:
+            raise CurrentError("backup expanded retained allowance exhausted")
+        if shutil.disk_usage(base).free - limits.max_temp_bytes < limits.free_reserve_bytes:
+            raise CurrentError("backup verification free-space reserve exhausted")
+        with tempfile.TemporaryDirectory(prefix="copy-", dir=workspace) as directory:
+            root = Path(directory) / "root"
+            root.mkdir()
+            _copy(
+                path,
+                root,
+                {name: value["files"][name] for name in ("catalogue.duckdb", "catalogue.json")},
+                deadline,
+            )
+            result, expected = _validate(
+                CurrentSettings(root, limits=replace(limits, max_temp_bytes=remaining)),
+                deadline,
+                evidence_root=path,
+            )
+            if set(expected) != set(value["files"]):
+                raise CurrentError("backup inventory does not match recovery state")
+        if _inventory(path, deadline) != value:
+            raise CurrentError("backup changed during verification")
+        return {**value, **result, "path": str(path)}
+    finally:
+        lock.release()
 
 
-def create_backup(settings, *, deadline=None):
+def create_backup(settings, *, deadline=None, _workspace=None):
     validate_root(settings.root)
     _verification_temp()
     _deadline(deadline)
@@ -463,7 +555,7 @@ def create_backup(settings, *, deadline=None):
             stage / "backup.json",
             json.dumps({"contract": BACKUP_CONTRACT, "files": inventory}, sort_keys=True).encode(),
         )
-        verify_backup(stage, deadline=deadline)
+        verify_backup(stage, deadline=deadline, _workspace=_workspace)
         _deadline(deadline)
         _fsync_dir(stage)
         final = backups / identifier
@@ -484,9 +576,9 @@ def create_backup(settings, *, deadline=None):
     return result
 
 
-def restore_backup(path, destination, *, deadline=None):
+def restore_backup(path, destination, *, deadline=None, _workspace=None):
     path = safe_path(Path(path))
-    verified = verify_backup(path, deadline=deadline)
+    verified = verify_backup(path, deadline=deadline, _workspace=_workspace)
     destination = safe_path(Path(destination))
     if destination.exists():
         raise CurrentError("restore destination must not exist")
@@ -524,7 +616,7 @@ def restore_backup(path, destination, *, deadline=None):
     return {"valid": True, "path": str(destination)}
 
 
-def prune(settings, *, now=None, raw_only=False):
+def prune(settings, *, now=None, raw_only=False, _workspace=None):
     root = validate_root(settings.root)
     backups = None if raw_only else safe_path(settings.backups_dir)
     now = time.time() if now is None else now
@@ -619,7 +711,9 @@ def prune(settings, *, now=None, raw_only=False):
             safe_path(child)
             if child.is_dir() and _BACKUP.fullmatch(child.name):
                 try:
-                    verify_backup(child)
+                    verify_backup(
+                        child, **({"_workspace": _workspace} if _workspace is not None else {})
+                    )
                 except (CurrentError, ValueError, OSError):
                     continue
                 verified.append(child)

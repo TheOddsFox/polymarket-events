@@ -1,5 +1,8 @@
 """Canonical backup capacity excludes a confined off-root verification copy."""
 
+import os
+import re
+import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -83,13 +86,22 @@ def test_eighth_daily_backup_fits_one_stage_budget_and_restores_verified_copy(
     constrained = replace(settings, limits=replace(settings.limits, max_retained_bytes=ceiling))
     original_validate, original_temporary = backup._validate, backup.tempfile.TemporaryDirectory
     validations, allocations = [], []
+    private_base = temporary.resolve() / f"oddsfox-catalogue-verification-{os.getuid()}"
 
     def validate(private, deadline, **kwargs):
         validations.append(private)
         return original_validate(private, deadline, **kwargs)
 
     def allocate(*args, **kwargs):
-        allocations.append(kwargs.get("dir"))
+        workspace = Path(kwargs["dir"])
+        assert workspace.parent == private_base
+        assert re.fullmatch(r"invocation-[0-9a-f]{32}", workspace.name)
+        for directory in (private_base, workspace):
+            metadata = directory.lstat()
+            assert stat.S_ISDIR(metadata.st_mode)
+            assert stat.S_IMODE(metadata.st_mode) == 0o700
+            assert metadata.st_uid == os.getuid()
+        allocations.append(workspace)
         return original_temporary(*args, **kwargs)
 
     monkeypatch.setattr(backup, "_validate", validate)
@@ -108,8 +120,12 @@ def test_eighth_daily_backup_fits_one_stage_budget_and_restores_verified_copy(
         assert conn.execute("SELECT event_id,title FROM events").fetchall() == [("1", "capacity")]
         assert current_publish.verify_current(restored)["counts"]["events"] == 1
     assert len(validations) == len(allocations) == 3
-    assert all(Path(directory) == temporary.resolve() for directory in allocations)
-    assert all(private.root.is_relative_to(temporary.resolve()) for private in validations)
+    assert all(directory.parent == private_base for directory in allocations)
+    assert all(
+        private.root.is_relative_to(workspace)
+        for private, workspace in zip(validations, allocations, strict=True)
+    )
+    assert all(not directory.exists() for directory in allocations)
     assert all(
         private.limits.max_temp_bytes + private_size == CurrentLimits().max_temp_bytes
         for private in validations
@@ -192,6 +208,8 @@ def test_offroot_verification_free_space_reserve_is_checked_on_temporary_base(
 ):
     settings, temporary = setup
     good = backup.create_backup(settings)
+    private_base = backup._verification_base()
+    assert private_base.parent == temporary.resolve()
     limits = CurrentLimits()
     free = limits.free_reserve_bytes + limits.max_temp_bytes + headroom
     checked = []
@@ -199,7 +217,7 @@ def test_offroot_verification_free_space_reserve_is_checked_on_temporary_base(
     def usage(path):
         path = Path(path).resolve()
         checked.append(path)
-        on_temporary = path.is_relative_to(temporary.resolve())
+        on_temporary = path.is_relative_to(private_base)
         return SimpleNamespace(
             free=free if on_temporary or topology == "same-filesystem" else 2 * free
         )
@@ -214,7 +232,8 @@ def test_offroot_verification_free_space_reserve_is_checked_on_temporary_base(
                 backup.verify_backup(good["path"])
     else:
         assert backup.verify_backup(good["path"])["valid"]
-    assert temporary.resolve() in checked
+    assert private_base in checked
+    assert temporary.resolve() not in checked
 
 
 @pytest.mark.parametrize("headroom", [-1, 0], ids=["one-byte-short", "at-reserve"])

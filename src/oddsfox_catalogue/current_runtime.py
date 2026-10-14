@@ -6,12 +6,14 @@ import multiprocessing
 import resource
 import sys
 import time
+from contextlib import nullcontext
 from datetime import UTC, datetime
 
 from .current_config import admit, connect_store
 from .current_contract import CurrentError
 from .current_store import get_state, initialize, set_state, summary
 from .gamma.http import CaptureStopped, GammaClient, RequestBudgetExceeded
+from .runlock import RunBusy, run_lock
 from .signals import SIGNALS, Terminated
 
 
@@ -32,10 +34,17 @@ def execute(settings, operation, options, deadline):
     from .current_publish import verify_current
 
     started = time.monotonic()
+    verification_options = (
+        {"_workspace": options["_verification_workspace"]}
+        if "_verification_workspace" in options
+        else {}
+    )
     if operation == "verify-backup":
-        return verify_backup(options["backup"], deadline=deadline)
+        return verify_backup(options["backup"], deadline=deadline, **verification_options)
     if operation == "restore":
-        return restore_backup(options["backup"], options["destination"], deadline=deadline)
+        return restore_backup(
+            options["backup"], options["destination"], deadline=deadline, **verification_options
+        )
     if operation == "import-release":
         from .current_import import import_release
 
@@ -59,8 +68,8 @@ def execute(settings, operation, options, deadline):
                 "seed import incomplete; resume import-release with its frozen source"
             )
     if operation == "backup":
-        result = create_backup(settings, deadline=deadline)
-        result["retention"] = prune(settings)
+        result = create_backup(settings, deadline=deadline, **verification_options)
+        result["retention"] = prune(settings, **verification_options)
         return result
     retention = None
     if operation in {"refresh", "reconcile"}:
@@ -180,13 +189,21 @@ def execute(settings, operation, options, deadline):
 
 def _child(pipe, settings, operation, options, deadline):
     try:
-        pipe.send((True, execute(settings, operation, options, deadline)))
+        # The worker can outlive its parent, including while no database is open.
+        lock = (
+            nullcontext()
+            if operation in {"verify-backup", "restore"}
+            else run_lock(settings.run_lock_path)
+        )
+        with lock:
+            result = execute(settings, operation, options, deadline)
+        pipe.send((True, result))
     except Exception as exc:
         pipe.send(
             (
                 False,
                 {
-                    "status": "blocked",
+                    "status": "busy" if isinstance(exc, RunBusy) else "blocked",
                     "message": str(exc),
                     "http_attempts": getattr(exc, "http_attempts", 0),
                     "downloaded_bytes": getattr(exc, "downloaded_bytes", 0),
@@ -198,38 +215,48 @@ def _child(pipe, settings, operation, options, deadline):
 
 
 def supervise(settings, operation, options, *, duration):
-    """Caller retains the writer lock until the worker has actually terminated."""
+    """The worker owns the writer lock; the parent drains it before spill cleanup."""
     context = multiprocessing.get_context("spawn")
-    receive, send = context.Pipe(duplex=False)
     deadline = time.monotonic() + duration
-    process = context.Process(target=_child, args=(send, settings, operation, options, deadline))
-    try:
-        with SIGNALS.hold() as started:
-            process.start()
-        send.close()
-        if started.signum is not None:
-            raise Terminated(started.signum)
-        if not receive.poll(max(0, deadline - time.monotonic())):
-            raise CurrentError(
-                "invocation deadline exhausted; verify the current pointer before retrying"
-            )
+    workspace_context = nullcontext()
+    if operation in {"backup", "verify-backup", "restore"}:
+        from .current_backup import _verification_workspace
+
+        workspace_context = _verification_workspace()
+    with workspace_context as workspace:
+        if workspace is not None:
+            options = {**options, "_verification_workspace": str(workspace)}
+        receive, send = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_child, args=(send, settings, operation, options, deadline)
+        )
         try:
-            success, result = receive.recv()
-        except EOFError as exc:
-            raise CurrentError("worker stopped; committed progress can be resumed") from exc
-        process.join(timeout=max(0, deadline - time.monotonic()))
-        if process.is_alive():
-            raise CurrentError("worker did not finish within the invocation deadline")
-        return success, result
-    finally:
-        with SIGNALS.hold() as stopped:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=2)
-            if process.is_alive():
-                process.kill()
-                process.join()
+            with SIGNALS.hold() as started:
+                process.start()
             send.close()
-            receive.close()
-        if stopped.signum is not None:
-            raise Terminated(stopped.signum)
+            if started.signum is not None:
+                raise Terminated(started.signum)
+            if not receive.poll(max(0, deadline - time.monotonic())):
+                raise CurrentError(
+                    "invocation deadline exhausted; verify the current pointer before retrying"
+                )
+            try:
+                success, result = receive.recv()
+            except EOFError as exc:
+                raise CurrentError("worker stopped; committed progress can be resumed") from exc
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            if process.is_alive():
+                raise CurrentError("worker did not finish within the invocation deadline")
+            return success, result
+        finally:
+            with SIGNALS.hold() as stopped:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                send.close()
+                receive.close()
+            if stopped.signum is not None:
+                raise Terminated(stopped.signum)

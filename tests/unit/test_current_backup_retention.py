@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,9 +70,9 @@ def test_latest_same_day_backup_survives_lower_random_uuid(catalogue, monkeypatc
         def now(cls, tz=None):
             return datetime(2026, 10, 14, tzinfo=UTC)
 
-    identifiers = iter(["f" * 32, "b" * 32, "1" * 32, "c" * 32])
+    identifiers = count(2**128 - 1, -1)
     monkeypatch.setattr(backup, "datetime", Clock)
-    monkeypatch.setattr(backup, "uuid4", lambda: SimpleNamespace(hex=next(identifiers)))
+    monkeypatch.setattr(backup, "uuid4", lambda: SimpleNamespace(hex=f"{next(identifiers):032x}"))
     first = backup.create_backup(settings)
     latest = backup.create_backup(settings)
     assert Path(latest["path"]).name < Path(first["path"]).name
