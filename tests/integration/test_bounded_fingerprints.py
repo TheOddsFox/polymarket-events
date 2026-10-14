@@ -271,10 +271,11 @@ def test_fingerprinting_does_not_commit_the_callers_transaction():
         connection.execute("CREATE TABLE source_rows (id INTEGER)")
         connection.execute("BEGIN TRANSACTION")
         connection.execute("INSERT INTO source_rows VALUES (7)")
-        assert semantic_fingerprint(connection, "SELECT * FROM source_rows") == _golden(
-            [{"name": "id", "type": "INTEGER"}], ['{"id":7}']
-        )
-        assert not _temporary_tables(connection)
+        for _ in range(4):
+            assert semantic_fingerprint(connection, "SELECT * FROM source_rows") == _golden(
+                [{"name": "id", "type": "INTEGER"}], ['{"id":7}']
+            )
+            assert not _temporary_tables(connection)
         connection.execute("ROLLBACK")
         assert connection.execute("SELECT * FROM source_rows").fetchall() == []
 
@@ -312,3 +313,26 @@ def test_readonly_file_fingerprint_keeps_source_order_and_database_bytes(tmp_pat
         assert not _temporary_tables(connection)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == original
     assert not Path(str(path) + ".wal").exists()
+
+
+def test_hash_materialization_uses_32_byte_blobs_without_changing_golden_digest():
+    class ObservedConnection(FaultConnection):
+        def __init__(self, connection):
+            super().__init__(connection, None)
+            self.hash_storage = None
+
+        def execute(self, sql, parameters=None):
+            result = super().execute(sql, parameters)
+            if sql.strip().upper().startswith("CREATE TEMP TABLE "):
+                self.hash_storage = self.connection.execute(
+                    f"SELECT typeof(row), octet_length(row) FROM {self.created_name}"
+                ).fetchall()
+            return result
+
+    with duckdb.connect(":memory:") as connection:
+        observed = ObservedConnection(connection)
+        assert semantic_fingerprint(observed, SMALL_QUERY) == _golden(
+            SMALL_SCHEMA, [FIRST_ROW, FIRST_ROW, SECOND_ROW]
+        )
+        assert observed.hash_storage == [("BLOB", 32)] * 3
+        assert not _temporary_tables(connection)

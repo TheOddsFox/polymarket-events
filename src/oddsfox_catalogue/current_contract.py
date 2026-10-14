@@ -5,7 +5,7 @@ from typing import Any
 
 CONTRACT = "oddsfox.polymarket.catalogue.v3"
 STORE_CONTRACT = "oddsfox.polymarket.catalogue_store.v4"
-BACKUP_CONTRACT = "oddsfox.polymarket.catalogue_backup.v3"
+BACKUP_CONTRACT = "oddsfox.polymarket.catalogue_backup.v4"
 PROJECTION_VERSION = 1
 
 SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {

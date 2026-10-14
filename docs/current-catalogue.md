@@ -135,11 +135,16 @@ Admission limits: 64 GiB retained root, 8 GiB raw, raw age at most seven days,
 backup creation retains one verified backup per day. Pending responses are protected
 from pruning, so an exhausted allowance blocks progress rather than discarding needed
 recovery data. These are ceilings, not a promise that any corpus fits.
-Backup verification uses a fresh temporary directory outside every catalogue and
-legacy root. Seven retained backups plus the next staging copy must fit the retained
-ceiling; one verification copy plus its SQL spill must fit the separate temporary
-ceiling. A full root fails explicitly rather than deleting verified recovery points
-before their replacement is ready.
+Backups use `catalogue_backup.v4`: the checkpointed database is gzip-compressed;
+publication and pending-evidence files retain their original bytes. The inventory
+binds both compressed and expanded database sizes and hashes. Verification expands
+only the database and root stamp into a fresh directory outside every catalogue and
+legacy root, reopens that database, and checks the inventoried publication and pending
+evidence through the same bounded connection. Those copied bytes plus SQL spill must
+fit the separate 8 GiB temporary ceiling. Restore admits the full expanded bundle.
+Seven retained backups plus the next staging copy must fit the retained ceiling.
+A full root fails explicitly rather than deleting verified recovery points before
+their replacement is ready.
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 backup create
@@ -181,6 +186,9 @@ use an isolated producer root. A v3 root is rejected and refresh rejects an exis
 legacy warehouse/ledger producer root. Export is offline; refresh calls Gamma.
 
 ## Verification and deployment evidence
+
+The [acceptance record](current-catalogue-acceptance.md) distinguishes measured
+results from outstanding performance, freshness and recovery gates.
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion.
 Tests and installed-workflow checks use synthetic loopback fixtures, never live Gamma.

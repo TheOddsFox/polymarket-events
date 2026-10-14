@@ -9,6 +9,7 @@ copies. This measures normal refresh, not six-hour/monthly reconciliation.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.metadata
 import json
@@ -17,13 +18,16 @@ import os
 import platform
 import resource
 import shutil
+import stat
 import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+from filelock import FileLock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
@@ -36,7 +40,10 @@ from oddsfox_catalogue.current_config import (  # noqa: E402
 )
 from oddsfox_catalogue.current_contract import SCHEMAS, columns  # noqa: E402
 from oddsfox_catalogue.current_publish import verify_current  # noqa: E402
-from oddsfox_catalogue.current_store import get_state, validate_store  # noqa: E402
+from oddsfox_catalogue.current_runtime import _publish  # noqa: E402
+from oddsfox_catalogue.current_store import get_state  # noqa: E402
+from oddsfox_catalogue.current_sync import fetch_apply  # noqa: E402
+from oddsfox_catalogue.gamma.http import CaptureStopped, GammaClient  # noqa: E402
 from oddsfox_catalogue.limits import directory_bytes  # noqa: E402
 
 
@@ -221,6 +228,164 @@ def build_source(conn, frontiers, count):
     return events, markets, controls, new_events, new_markets
 
 
+def repair_fixture(conn, markets, new_markets):
+    for mid in sorted(set(markets) - set(new_markets), key=int):
+        rows = records(conn, "markets", "venue='polymarket' AND market_id=? AND usable", [mid])
+        if not rows:
+            continue
+        payload = market_payload(conn, rows[0])
+        if any(markets[mid].get(key) != value for key, value in payload.items()):
+            continue
+        mapping = records(
+            conn, "outcomes", "venue='polymarket' AND market_id=? ORDER BY outcome_index", [mid]
+        )
+        return {
+            "market_id": mid,
+            "protocol": rows[0]["protocol"],
+            "native_alias": "positionIds"
+            if rows[0]["protocol"] == "polymarket_v2"
+            else "clobTokenIds",
+            "mapping": mapping,
+            "mapping_sha256": hashlib.sha256(
+                json.dumps(mapping, sort_keys=True).encode()
+            ).hexdigest(),
+        }
+    raise ValueError(
+        "seed needs an existing usable reconstructable market for resumed identity repair"
+    )
+
+
+def prepare_identity_repair(settings, conn, source, events, markets, fixture):
+    """Invalidate one old mapping and freeze a native repair before any repair HTTP."""
+    started = time.monotonic()
+    mid = fixture["market_id"]
+    bad_events, bad_markets = copy.deepcopy((events, markets))
+    bad_markets[mid][fixture["native_alias"]] = None
+    for event in bad_events.values():
+        for market in event["markets"]:
+            if market["id"] == mid:
+                market[fixture["native_alias"]] = None
+    source.replace(events=bad_events, markets=bad_markets)
+    before = source.stats["http_attempts"]
+    generation_before = get_state(conn, "generation")
+    copied_publish_seconds = get_state(conn, "previous_publish_seconds")
+    publication_deadline = started + 14400
+    accepted = conn.execute(
+        "SELECT asset_kind,asset_id FROM _identity_claims "
+        "WHERE venue='polymarket' AND market_id=? AND role='accepted' ORDER BY 1,2",
+        [mid],
+    ).fetchall()
+    local = replace(
+        settings, gamma=replace(settings.gamma, base_url=source.url, allow_loopback=True)
+    )
+    with GammaClient(
+        local.gamma,
+        max_body_bytes=local.limits.max_response_bytes,
+        max_requests=local.limits.max_requests,
+        max_download_bytes=local.limits.max_download_bytes,
+        max_duration_s=local.limits.max_duration_s,
+        deadline=started + local.limits.max_duration_s,
+    ) as client:
+        fetch_apply(local, conn, client, "markets", [mid])
+        unusable = conn.execute(
+            "SELECT usable,identity_error FROM markets WHERE venue='polymarket' AND market_id=?",
+            [mid],
+        ).fetchone()
+        require(
+            unusable and not unusable[0] and unusable[1],
+            "bulk invalidation did not hide unsafe identity",
+        )
+        require(
+            not records(conn, "outcomes", "venue='polymarket' AND market_id=?", [mid]),
+            "invalidated outcomes remain served",
+        )
+        require(
+            accepted
+            and accepted
+            == conn.execute(
+                "SELECT asset_kind,asset_id FROM _identity_claims "
+                "WHERE venue='polymarket' AND market_id=? AND role='accepted' ORDER BY 1,2",
+                [mid],
+            ).fetchall(),
+            "invalidation lost accepted ownership reservations",
+        )
+        invalidated, publication_seconds = _publish(local, conn, deadline=publication_deadline)
+        verify_started = time.monotonic()
+        invalidated_verified = verify_current(local, connection=conn)
+        extra_verify_seconds = time.monotonic() - verify_started
+        source.replace(events=events, markets=markets)
+        before_fault = source.stats["http_attempts"]
+        requests_before_fault = client.stats.requests
+
+        def stop_before_http(*args, **kwargs):
+            raise CaptureStopped("benchmark frozen native repair before HTTP")
+
+        client.get = stop_before_http
+        try:
+            fetch_apply(local, conn, client, "markets", [mid], native=True)
+        except CaptureStopped as exc:
+            require(
+                str(exc) == "benchmark frozen native repair before HTTP",
+                "unexpected preparation fault",
+            )
+        else:
+            raise ValueError("native repair was not interrupted before HTTP")
+        pending = get_state(conn, "fetch_pending")
+        require(
+            pending
+            and pending["identity"]["native"]
+            and pending["identity"]["ids"] == [int(mid)]
+            and pending["remaining"] == [{"endpoint": f"/markets/{mid}", "params": {}}],
+            "native repair was not frozen",
+        )
+        require(
+            not (local.raw_dir / pending["raw_id"]).exists(),
+            "frozen native repair already has raw evidence",
+        )
+        require(
+            source.stats["http_attempts"] == before_fault
+            and client.stats.requests == requests_before_fault,
+            "preparation fault made a native HTTP request",
+        )
+    return {
+        "market_id": mid,
+        "protocol": fixture["protocol"],
+        "mapping_sha256": fixture["mapping_sha256"],
+        "generation_before": generation_before,
+        "generation_invalidated": get_state(conn, "generation"),
+        "invalidated_publication": invalidated,
+        "invalidated_verify": invalidated_verified,
+        "invalidation_publication_s": publication_seconds,
+        "invalidation_extra_verify_s": extra_verify_seconds,
+        "copied_previous_publish_seconds": copied_publish_seconds,
+        "resulting_previous_publish_seconds": get_state(conn, "previous_publish_seconds"),
+        "preparation_publication_deadline_monotonic": publication_deadline,
+        "elapsed_s": time.monotonic() - started,
+        "http": source.stats["responses"][before:],
+        "fetch_pending": pending,
+        "scope": "one resumed native identity repair; preparation publication has a cooperative four-hour deadline outside the unchanged 300-second refresh budget; automatic scheduling capacity remains unmeasured",
+        "invalid_source_sha256": hashlib.sha256(
+            json.dumps([bad_events, bad_markets], sort_keys=True).encode()
+        ).hexdigest(),
+        "source_sha256": hashlib.sha256(
+            json.dumps([source.events, source.markets], sort_keys=True).encode()
+        ).hexdigest(),
+    }
+
+
+def verify_repair_requests(responses, market_id):
+    paths = [urlsplit(response["path"]).path for response in responses]
+    native = [path for path in paths if len(path.strip("/").split("/")) == 2]
+    require(
+        paths and paths[0] == f"/markets/{market_id}",
+        "refresh did not resume native repair as its first HTTP request",
+    )
+    require(
+        native == [f"/markets/{market_id}"], "refresh must make exactly one native repair request"
+    )
+    return {"native_http_attempts": len(native), "first_http": paths[0]}
+
+
 def expected_delta(events, markets, new_events, new_markets):
     """Independent expected projection; does not call the production projector."""
     result = {table: [] for table in SCHEMAS}
@@ -387,14 +552,121 @@ def accounting_roots(paths):
     return roots
 
 
+def aggregate_usage(path):
+    """Count owned entries through pinned directory descriptors, never symlink targets."""
+    path = safe_path(Path(path))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def open_root():
+        descriptor = os.open(path.anchor, flags)
+        try:
+            for part in path.parts[1:]:
+                child = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def identity(info):
+        return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns
+
+    def walk(descriptor):
+        total = symlinks = 0
+        for name in os.listdir(descriptor):
+            before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode):
+                total += before.st_size
+                symlinks += 1
+            elif stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode):
+                require(before.st_mode & 0o444, "aggregate storage contains an unreadable entry")
+                entry_flags = (
+                    flags
+                    if stat.S_ISDIR(before.st_mode)
+                    else os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                )
+                child = os.open(name, entry_flags, dir_fd=descriptor)
+                try:
+                    require(
+                        identity(os.fstat(child)) == identity(before),
+                        "aggregate storage entry changed during descent",
+                    )
+                    if stat.S_ISDIR(before.st_mode):
+                        require(
+                            before.st_mode & 0o111,
+                            "aggregate storage contains an unsearchable directory",
+                        )
+                        child_total, child_symlinks = walk(child)
+                        total += child_total
+                        symlinks += child_symlinks
+                    else:
+                        total += before.st_size
+                finally:
+                    os.close(child)
+            else:
+                raise ValueError("aggregate storage contains a special file")
+            require(
+                identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False))
+                == identity(before),
+                "aggregate storage entry changed during accounting",
+            )
+        return total, symlinks
+
+    descriptor = open_root()
+    try:
+        root_identity = identity(os.fstat(descriptor))
+        require(
+            root_identity[2] & 0o444 and root_identity[2] & 0o111,
+            "aggregate storage root is unreadable",
+        )
+        total, symlinks = walk(descriptor)
+        check = open_root()
+        try:
+            require(
+                identity(os.fstat(check)) == root_identity,
+                "aggregate storage root changed during accounting",
+            )
+        finally:
+            os.close(check)
+    finally:
+        os.close(descriptor)
+    return {
+        "logical_owned_bytes": total,
+        "symlink_count": symlinks,
+        "policy": "regular logical bytes plus symlink lstat.st_size; symlink targets never followed or read",
+    }
+
+
 def capacity(seed, output, limit, additional=0, *, account_roots=()):
-    roots = accounting_roots([seed, output, *account_roots])
-    sizes = {str(path): directory_bytes(path) for path in roots}
+    seed, output = safe_path(Path(seed)), safe_path(Path(output))
+    # Canonical validation remains strict even when an aggregate ancestor owns the count.
+    strict = {path: directory_bytes(path) for path in {seed, output}}
+    declared = {safe_path(Path(path)) for path in account_roots}
+    roots = accounting_roots([seed, output, *declared])
+    usage = {
+        str(path): aggregate_usage(path)
+        if path in declared and path not in strict
+        else {
+            "logical_owned_bytes": strict[path],
+            "symlink_count": 0,
+            "policy": "strict canonical directory_bytes; symlinks rejected",
+        }
+        for path in roots
+    }
+    sizes = {path: value["logical_owned_bytes"] for path, value in usage.items()}
     retained = sum(sizes.values())
     require(retained + additional <= limit, "combined accounted storage envelope exhausted")
     free = shutil.disk_usage(output).free
     require(free - additional >= 32 * 1024**3, "32 GiB free-space reserve would be exhausted")
-    return {"combined_bytes": retained, "free_bytes": free, "accounted_roots": sizes}
+    return {
+        "combined_bytes": retained,
+        "free_bytes": free,
+        "accounted_roots": sizes,
+        "accounted_root_usage": usage,
+        "symlink_count": sum(value["symlink_count"] for value in usage.values()),
+        "strict_root_bytes": {str(path): size for path, size in strict.items()},
+    }
 
 
 def parser():
@@ -494,7 +766,6 @@ def run(args):
                         safe_path(child)
         require(not (seed / "catalogue.duckdb.wal").exists(), "seed must be checkpointed and idle")
         with connect_store(settings, read_only=True) as conn:
-            validate_store(conn)
             verified = verify_current(settings, connection=conn)
             discovery = get_state(conn, "discovery")
             require(
@@ -520,6 +791,7 @@ def run(args):
                 conn, frontiers, args.delta_markets
             )
             delta = expected_delta(events, markets, new_events, new_markets)
+            repair = repair_fixture(conn, markets, new_markets)
             report["source_preparation_s"] = time.monotonic() - started
             report["seed_field_distributions"] = {
                 field: conn.execute(
@@ -540,6 +812,7 @@ def run(args):
             (output / "source.json").write_text(frozen_source)
             report["source"] = {
                 "payload_file": "source.json",
+                "identity_repair": repair,
                 "new_events": len(new_events),
                 "new_markets": len(new_markets),
                 "selected_existing_events": len(events) - len(new_events),
@@ -577,6 +850,21 @@ def run(args):
                 row["probe"] = cli(root, source.url, args.executable, "probe", *options)
                 certificate = successful(row["probe"])
                 row["frozen_provider_policy"] = certificate["lanes"]
+                with (
+                    FileLock(str(CurrentSettings(root).run_lock_path)),
+                    connect_store(CurrentSettings(root)) as conn,
+                ):
+                    row["identity_repair_preparation"] = prepare_identity_repair(
+                        CurrentSettings(root), conn, source, events, markets, repair
+                    )
+                require(
+                    row["identity_repair_preparation"]["source_sha256"]
+                    == report["source"]["sha256"],
+                    "prepared source differs from frozen source",
+                )
+                (output / f"run-{index + 1}-preparation.json").write_text(
+                    json.dumps(row["identity_repair_preparation"], indent=2, default=str)
+                )
                 before = source.stats["http_attempts"]
                 row["refresh"] = cli(root, source.url, args.executable, "refresh")
                 row["refresh_http"] = source.stats["responses"][before:]
@@ -584,6 +872,9 @@ def run(args):
                     row["refresh_http"], frontiers, retained, row["refresh"]["elapsed_wall_s"]
                 )
                 result = successful(row["refresh"])
+                row["identity_repair_requests"] = verify_repair_requests(
+                    row["refresh_http"], repair["market_id"]
+                )
                 require(
                     row["refresh"]["elapsed_wall_s"] < 300, "normal refresh exceeded 300 seconds"
                 )
@@ -599,6 +890,20 @@ def run(args):
                 successful(row["verify"])
                 with connect_store(CurrentSettings(root)) as conn:
                     row["exact_counts"] = verify_expected(conn, Path(verified["path"]), delta)
+                    require(
+                        get_state(conn, "fetch_pending") is None, "native repair remains pending"
+                    )
+                    require(
+                        records(
+                            conn,
+                            "outcomes",
+                            "venue='polymarket' AND market_id=? ORDER BY outcome_index",
+                            [repair["market_id"]],
+                        )
+                        == repair["mapping"],
+                        "native repair did not restore exact original mapping",
+                    )
+                    row["identity_repair_restored_generation"] = get_state(conn, "generation")
                     row["sql_generation"] = get_state(conn, "generation")
                 before = source.stats["http_attempts"]
                 row["unchanged"] = cli(root, source.url, args.executable, "refresh")
@@ -615,6 +920,7 @@ def run(args):
                 )
                 row["unchanged_http"] = source.stats["responses"][before:]
                 verify_highwater_only(row["unchanged_http"], certificate)
+                row["unchanged_native_http_attempts"] = 0
                 row["final_verify"] = cli(root, source.url, args.executable, "verify")
                 successful(row["final_verify"])
                 row["http"] = source.stats

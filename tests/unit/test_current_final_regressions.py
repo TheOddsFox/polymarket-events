@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -509,24 +509,42 @@ def test_backup_private_restore_and_old_release_share_remaining_spill_budget(
     apply(conn, [{"id": "1", "title": "new"}], day=2)
     conn.close()
     backup = current_backup.create_backup(settings)
-    validated, independent = [], []
-    validate, memory = current_backup._validate, current_publish.memory_connection
+    validated, connections, borrowed = [], [], []
+    validate = current_backup._validate
+    connect = current_backup.connect_store
+    verify = current_backup._verify_release_on_connection
 
-    def validate_private(private, deadline):
+    def validate_private(private, deadline, **kwargs):
         validated.append(private)
-        return validate(private, deadline)
+        assert str(kwargs["evidence_root"]) == backup["path"]
+        return validate(private, deadline, **kwargs)
 
-    def independent_connection(private):
-        independent.append(private)
-        return memory(private)
+    @contextmanager
+    def private_connection(private, **kwargs):
+        with connect(private, **kwargs) as connection:
+            connections.append((private, connection))
+            yield connection
+
+    def same_connection(path, connection, **kwargs):
+        borrowed.append(connection)
+        return verify(path, connection, **kwargs)
 
     monkeypatch.setattr(current_backup, "_validate", validate_private)
-    monkeypatch.setattr(current_publish, "memory_connection", independent_connection)
+    monkeypatch.setattr(current_backup, "connect_store", private_connection)
+    monkeypatch.setattr(current_backup, "_verify_release_on_connection", same_connection)
+    monkeypatch.setattr(
+        current_publish,
+        "memory_connection",
+        lambda *args: pytest.fail("old release opened a second spill allowance"),
+    )
     verified = current_backup.verify_backup(backup["path"])
     assert verified["valid"]
-    assert len(validated) == 1
-    assert independent and all(private == validated[0] for private in independent)
-    assert validated[0].limits.max_temp_bytes + backup["bytes"] == CurrentLimits().max_temp_bytes
+    assert len(validated) == len(connections) == len(borrowed) == 1
+    assert connections[0] == (validated[0], borrowed[0])
+    private_bytes = sum(
+        verified["files"][name]["bytes"] for name in ("catalogue.duckdb", "catalogue.json")
+    )
+    assert validated[0].limits.max_temp_bytes + private_bytes == CurrentLimits().max_temp_bytes
 
 
 @pytest.mark.parametrize("excess", [0, 1])

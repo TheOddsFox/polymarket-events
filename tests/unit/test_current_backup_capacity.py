@@ -74,16 +74,19 @@ def test_eighth_daily_backup_fits_one_stage_budget_and_restores_verified_copy(
         clock[0] += timedelta(days=1)
     assert len(list(settings.backups_dir.iterdir())) == 7
     size = source_size(settings)
+    database_size = settings.store_path.stat().st_size
+    private_size = database_size + (settings.root / "catalogue.json").stat().st_size
     retained = directory_bytes(settings.root)
-    ceiling = retained + size + 65536
+    # One compressed staging bundle fits; a second expanded copy in this root does not.
+    ceiling = retained + previous[-1]["stored_bytes"] + 2 * 65536
     assert retained + 2 * size + 65536 > ceiling
     constrained = replace(settings, limits=replace(settings.limits, max_retained_bytes=ceiling))
     original_validate, original_temporary = backup._validate, backup.tempfile.TemporaryDirectory
     validations, allocations = [], []
 
-    def validate(private, deadline):
+    def validate(private, deadline, **kwargs):
         validations.append(private)
-        return original_validate(private, deadline)
+        return original_validate(private, deadline, **kwargs)
 
     def allocate(*args, **kwargs):
         allocations.append(kwargs.get("dir"))
@@ -108,7 +111,7 @@ def test_eighth_daily_backup_fits_one_stage_budget_and_restores_verified_copy(
     assert all(Path(directory) == temporary.resolve() for directory in allocations)
     assert all(private.root.is_relative_to(temporary.resolve()) for private in validations)
     assert all(
-        private.limits.max_temp_bytes + size == CurrentLimits().max_temp_bytes
+        private.limits.max_temp_bytes + private_size == CurrentLimits().max_temp_bytes
         for private in validations
     )
     backup.prune(constrained)
@@ -215,17 +218,20 @@ def test_offroot_verification_free_space_reserve_is_checked_on_temporary_base(
 
 
 @pytest.mark.parametrize("headroom", [-1, 0], ids=["one-byte-short", "at-reserve"])
-def test_canonical_stage_free_space_reserve_remains_enforced(setup, monkeypatch, headroom):
+def test_initial_canonical_stage_free_space_reserve_remains_enforced(setup, monkeypatch, headroom):
     settings, temporary = setup
     good = backup.create_backup(settings)
     size = source_size(settings)
-    free = settings.limits.free_reserve_bytes + size + 65536 + headroom
+    reservation = size - settings.store_path.stat().st_size + 65536
+    free = settings.limits.free_reserve_bytes + reservation + headroom
 
     def usage(path):
         private = Path(path).resolve().is_relative_to(temporary.resolve())
+        # Isolate initial admission; compressed output has its own per-write admission tests.
+        staged = any(settings.backups_dir.glob(".staging-*"))
         return SimpleNamespace(
             free=2 * (CurrentLimits().free_reserve_bytes + CurrentLimits().max_temp_bytes)
-            if private
+            if private or staged
             else free
         )
 

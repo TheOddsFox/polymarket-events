@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from fakes.current_gamma import CurrentGammaServer
+from oddsfox_catalogue.current_publish import publish as publish_release
 
 SPEC = importlib.util.spec_from_file_location(
     "benchmark_current", Path(__file__).parents[2] / "scripts/benchmark-current.py"
@@ -253,14 +254,23 @@ def test_accounting_deduplicates_ancestor_overlap_and_counts_legacy(tmp_path, mo
 
     monkeypatch.setattr(benchmark, "directory_bytes", size)
     monkeypatch.setattr(
+        benchmark,
+        "aggregate_usage",
+        lambda path: {
+            "logical_owned_bytes": sizes[path],
+            "symlink_count": 0,
+            "policy": "fixture aggregate",
+        },
+    )
+    monkeypatch.setattr(
         benchmark.shutil, "disk_usage", lambda _: type("Usage", (), {"free": 128 * 1024**3})()
     )
     legacy = tmp_path / "legacy"
     roots = [legacy / "raw", legacy, legacy / "raw", tmp_path / "seed" / "published"]
     result = benchmark.capacity(tmp_path / "seed", tmp_path / "output", 100, account_roots=roots)
     assert result["combined_bytes"] == 100
-    assert set(walks) == set(sizes)
-    assert len(walks) == 3
+    assert set(walks) == {tmp_path / "seed", tmp_path / "output"}
+    assert len(walks) == 2
     with pytest.raises(ValueError, match="envelope"):
         benchmark.capacity(tmp_path / "seed", tmp_path / "output", 99, account_roots=roots)
 
@@ -360,7 +370,9 @@ def test_preflight_uses_bounded_readonly_connection_before_validation(
     before = benchmark.digest(settings.store_path)
     visited = []
 
-    def validate(conn):
+    def verify(given_settings, *, connection):
+        assert given_settings == settings
+        conn = connection
         visited.append(True)
         assert conn.execute("SELECT * FROM evidence").fetchall() == [(42,)]
         assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == 2
@@ -376,7 +388,7 @@ def test_preflight_uses_bounded_readonly_connection_before_validation(
             conn.execute("INSERT INTO evidence VALUES (43)")
         raise ValueError("preflight resource probe complete")
 
-    monkeypatch.setattr(benchmark, "validate_store", validate)
+    monkeypatch.setattr(benchmark, "verify_current", verify)
     if temporary_full:
         original_size = current_config.directory_bytes
         monkeypatch.setattr(
@@ -399,3 +411,513 @@ def test_preflight_uses_bounded_readonly_connection_before_validation(
         assert (seed / "tmp").is_dir()
     assert benchmark.digest(settings.store_path) == before
     assert not (seed / "catalogue.duckdb.wal").exists()
+
+
+@pytest.mark.parametrize("seed_state", ["valid", "publication-behind", "private-corrupt"])
+def test_real_seed_preflight_validates_private_store_once_before_build_or_copy(
+    tmp_path, monkeypatch, seed_state
+):
+    from fakes.world import make_event, make_market
+    from oddsfox_catalogue import current_publish, current_store
+    from oddsfox_catalogue.current_rows import project_response
+
+    root = benchmark.validate_root(tmp_path / "seed", initialize=True)
+    settings = benchmark.CurrentSettings(root)
+    with benchmark.connect_store(settings) as conn:
+        current_store.initialize(conn)
+        current_store.apply(
+            conn,
+            project_response(
+                [make_event("1", "retained", markets=[make_market("2", "native")])],
+                "events",
+                received_at="2026-10-14T00:00:00Z",
+                response_id="seed",
+                native_market_ids=["2"],
+            ),
+        )
+        current_store.set_state(
+            conn,
+            "discovery",
+            {
+                "version": 2,
+                "next_lane": 0,
+                "pending": None,
+                "lanes": {
+                    lane: {"frontier": 2, "highwater": None, "phase": "tail"}
+                    for lane in ("events", "markets")
+                },
+            },
+        )
+        assert conn.execute("SELECT count(*) FROM outcomes").fetchone()[0] == 2
+        publish_release(settings, conn)
+        if seed_state == "publication-behind":
+            current_store.set_state(conn, "generation", 2)
+        elif seed_state == "private-corrupt":
+            conn.execute("DELETE FROM _identity_claims WHERE role='accepted'")
+    source_hash = benchmark.digest(settings.store_path)
+    pointer = (settings.published_dir / "current.json").read_bytes()
+    original_validate = current_store._validate_store
+    validated, built = [], []
+
+    def validate(connection, **kwargs):
+        validated.append(connection)
+        return original_validate(connection, **kwargs)
+
+    def build(connection, frontiers, count):
+        assert len(validated) == 1
+        assert connection is validated[0]
+        built.append(True)
+        raise ValueError("stopped after verified preflight")
+
+    def forbidden_copy(*args, **kwargs):
+        pytest.fail("preflight reached seed copying")
+
+    monkeypatch.setattr(current_store, "_validate_store", validate)
+    monkeypatch.setattr(current_publish, "_validate_store", validate)
+    monkeypatch.setattr(benchmark, "build_source", build)
+    monkeypatch.setattr(benchmark.shutil, "copytree", forbidden_copy)
+    monkeypatch.setattr(benchmark.shutil, "copy2", forbidden_copy)
+    output = tmp_path / "output"
+    args = benchmark.parser().parse_args(["--seed-root", str(root), "--output", str(output)])
+    assert benchmark.run(args) == 1
+    report = benchmark.json.loads((output / "report.json").read_text())
+    assert len(validated) == (0 if seed_state == "publication-behind" else 1)
+    assert built == ([True] if seed_state == "valid" else [])
+    expected = {
+        "valid": "stopped after verified preflight",
+        "publication-behind": "seed publication is behind its store",
+        "private-corrupt": "current store integrity violation",
+    }[seed_state]
+    assert expected in report["error"]
+    assert benchmark.digest(settings.store_path) == source_hash
+    assert (settings.published_dir / "current.json").read_bytes() == pointer
+    assert not list(output.glob("run-*"))
+
+
+@pytest.mark.parametrize(
+    ("version", "unexpected_fault"), [("v1", False), ("v2", False), ("v2", True)]
+)
+def test_representative_resumed_repair_real_http_and_exact_oracle(
+    tmp_path, monkeypatch, version, unexpected_fault
+):
+    from fakes.world import make_event, make_market
+    from oddsfox_catalogue import current_store
+    from oddsfox_catalogue.current_rows import project_response
+
+    root = benchmark.validate_root(tmp_path / "seed", initialize=True)
+    settings = benchmark.CurrentSettings(root)
+    with benchmark.connect_store(settings) as conn:
+        current_store.initialize(conn)
+        originals = [
+            make_event(
+                str(i), f"Event {i}", markets=[make_market(str(i), "original", version=version)]
+            )
+            for i in range(1, 11)
+        ]
+        current_store.apply(
+            conn,
+            project_response(
+                originals, "events", received_at="2000-01-01T00:00:00Z", response_id="seed"
+            ),
+        )
+        current_store.set_state(
+            conn,
+            "discovery",
+            {
+                "version": 2,
+                "next_lane": 0,
+                "pending": None,
+                "lanes": {
+                    lane: {"frontier": 10, "highwater": None, "phase": "tail"}
+                    for lane in ("events", "markets")
+                },
+            },
+        )
+        seed_release = publish_release(settings, conn)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        for table in benchmark.SCHEMAS:
+            benchmark.shutil.copy2(Path(seed_release["path"]) / f"{table}.parquet", baseline)
+        events, markets, controls, new_events, new_markets = benchmark.build_source(
+            conn, {"events": 10, "markets": 10}, 12
+        )
+        fixture = benchmark.repair_fixture(conn, markets, new_markets)
+        assert fixture["market_id"] == "1"
+        delta = benchmark.expected_delta(events, markets, new_events, new_markets)
+    with CurrentGammaServer(events, markets, market_default_open=True) as source:
+        options = [part for key, value in controls.items() for part in (f"--{key}-id", value)]
+        certificate = benchmark.successful(benchmark.cli(root, source.url, None, "probe", *options))
+        original_fetch = benchmark.fetch_apply
+        if unexpected_fault:
+
+            def fail_native(*args, **kwargs):
+                if kwargs.get("native"):
+                    raise RuntimeError("unrelated preparation fault")
+                return original_fetch(*args, **kwargs)
+
+            monkeypatch.setattr(benchmark, "fetch_apply", fail_native)
+        with (
+            benchmark.FileLock(str(settings.run_lock_path)),
+            benchmark.connect_store(settings) as conn,
+        ):
+            if unexpected_fault:
+                with pytest.raises(RuntimeError, match="unrelated preparation fault"):
+                    benchmark.prepare_identity_repair(
+                        settings, conn, source, events, markets, fixture
+                    )
+                return
+            prepared = benchmark.prepare_identity_repair(
+                settings, conn, source, events, markets, fixture
+            )
+            assert (
+                prepared["source_sha256"]
+                == hashlib.sha256(
+                    benchmark.json.dumps([events, markets], sort_keys=True).encode()
+                ).hexdigest()
+            )
+            assert prepared["fetch_pending"]["identity"]["native"] is True
+            assert all(
+                benchmark.urlsplit(row["path"]).path != "/markets/1" for row in prepared["http"]
+            )
+            assert conn.execute("SELECT usable FROM markets WHERE market_id='1'").fetchone() == (
+                False,
+            )
+            publication = benchmark.verify_current(settings, connection=conn)
+            assert conn.execute(
+                "SELECT count(*) FROM read_parquet(?) WHERE market_id='1'",
+                [str(Path(publication["path"]) / "outcomes.parquet")],
+            ).fetchone() == (0,)
+        before = source.stats["http_attempts"]
+        refreshed = benchmark.successful(benchmark.cli(root, source.url, None, "refresh"))
+        requests = source.stats["responses"][before:]
+        assert (
+            benchmark.verify_repair_requests(requests, fixture["market_id"])["native_http_attempts"]
+            == 1
+        )
+        assert refreshed["http_attempts"] == len(requests)
+        with benchmark.connect_store(settings) as conn:
+            assert benchmark.get_state(conn, "fetch_pending") is None
+            assert (
+                benchmark.records(
+                    conn, "outcomes", "market_id=? ORDER BY outcome_index", [fixture["market_id"]]
+                )
+                == fixture["mapping"]
+            )
+            benchmark.verify_expected(conn, baseline, delta)
+        before = source.stats["http_attempts"]
+        unchanged = benchmark.successful(benchmark.cli(root, source.url, None, "refresh"))
+        assert unchanged["publication"]["noop"]
+        assert unchanged["publication"]["release_id"] == refreshed["publication"]["release_id"]
+        benchmark.verify_highwater_only(source.stats["responses"][before:], certificate)
+
+
+def test_repair_fixture_requires_existing_usable_reconstructable_market():
+    import duckdb
+
+    from oddsfox_catalogue.current_store import initialize
+
+    with duckdb.connect(":memory:") as conn:
+        initialize(conn)
+        with pytest.raises(ValueError, match="existing usable reconstructable"):
+            benchmark.repair_fixture(conn, {}, [])
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        [],
+        ["/events", "/markets/1"],
+        ["/markets/2"],
+        ["/markets/1", "/markets/1"],
+        ["/markets/1", "/events/1"],
+    ],
+)
+def test_repair_request_assertions_reject_wrong_order_identity_and_extra_native(paths):
+    with pytest.raises(ValueError, match="native repair"):
+        benchmark.verify_repair_requests([{"path": path} for path in paths], "1")
+
+
+def test_aggregate_usage_counts_link_text_without_opening_targets(tmp_path, monkeypatch):
+    account = tmp_path / "account"
+    account.mkdir()
+    (account / "owned").write_bytes(b"abc")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_bytes(b"x" * 10000)
+    links = [account / name for name in ("file", "directory", "cycle", "dangling")]
+    links[0].symlink_to(outside / "secret")
+    links[1].symlink_to(outside, target_is_directory=True)
+    links[2].symlink_to(".", target_is_directory=True)
+    links[3].symlink_to(outside / "missing")
+    expected = 3 + sum(link.lstat().st_size for link in links)
+    original_open = benchmark.os.open
+
+    def checked_open(path, flags, *args, **kwargs):
+        assert str(path) not in {"outside", "secret", str(outside), str(outside / "secret")}
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.os, "open", checked_open)
+    usage = benchmark.aggregate_usage(account)
+    assert usage["logical_owned_bytes"] == expected
+    assert usage["symlink_count"] == 4
+    assert "never followed or read" in usage["policy"]
+
+
+def test_aggregate_usage_rejects_special_files(tmp_path):
+    benchmark.os.mkfifo(tmp_path / "fifo")
+    with pytest.raises(ValueError, match="special file"):
+        benchmark.aggregate_usage(tmp_path)
+
+
+@pytest.mark.parametrize("entry_type", ["file", "directory"])
+def test_aggregate_usage_rejects_unreadable_entries(tmp_path, entry_type):
+    entry = tmp_path / "unreadable"
+    entry.mkdir() if entry_type == "directory" else entry.write_bytes(b"data")
+    entry.chmod(0)
+    try:
+        with pytest.raises((ValueError, PermissionError), match="unreadable|Permission"):
+            benchmark.aggregate_usage(tmp_path)
+    finally:
+        entry.chmod(0o700 if entry_type == "directory" else 0o600)
+
+
+def test_aggregate_usage_does_not_skip_directory_listing_failures(tmp_path, monkeypatch):
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    inode = blocked.stat().st_ino
+    original_listdir = benchmark.os.listdir
+
+    def fail_listing(descriptor):
+        if isinstance(descriptor, int) and benchmark.os.fstat(descriptor).st_ino == inode:
+            raise PermissionError("injected unreadable directory")
+        return original_listdir(descriptor)
+
+    monkeypatch.setattr(benchmark.os, "listdir", fail_listing)
+    with pytest.raises(PermissionError, match="injected unreadable directory"):
+        benchmark.aggregate_usage(tmp_path)
+
+
+def test_aggregate_usage_rejects_directory_swapped_to_symlink_before_descent(tmp_path, monkeypatch):
+    account = tmp_path / "account"
+    account.mkdir()
+    child = account / "child"
+    child.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "unowned").write_bytes(b"must not follow")
+    original_open = benchmark.os.open
+    swapped = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if path == "child" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped.append(True)
+            child.rename(account / "moved")
+            child.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.os, "open", swap_then_open)
+    with pytest.raises(OSError):
+        benchmark.aggregate_usage(account)
+    assert swapped == [True]
+
+
+@pytest.mark.parametrize("strict_name", ["seed", "output"])
+def test_capacity_keeps_nested_canonical_roots_strict_under_aggregate_ancestor(
+    tmp_path, strict_name
+):
+    from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
+
+    seed, output = tmp_path / "seed", tmp_path / "output"
+    seed.mkdir()
+    output.mkdir()
+    (tmp_path / strict_name / "forbidden").symlink_to(tmp_path / "missing")
+    with pytest.raises(RequestBudgetExceeded, match="symlink"):
+        benchmark.capacity(seed, output, 1024, account_roots=[tmp_path])
+
+
+def test_capacity_deduplicates_aggregate_ancestor_but_validates_strict_children(
+    tmp_path, monkeypatch
+):
+    seed, output, legacy = (tmp_path / name for name in ("seed", "output", "legacy"))
+    for path in (seed, output, legacy):
+        path.mkdir()
+    (seed / "owned").write_bytes(b"abc")
+    (output / "owned").write_bytes(b"defgh")
+    link = legacy / "python"
+    link.symlink_to("/outside/not-read/python")
+    expected = 8 + link.lstat().st_size
+    monkeypatch.setattr(
+        benchmark.shutil, "disk_usage", lambda _: type("Usage", (), {"free": 128 * 1024**3})()
+    )
+    result = benchmark.capacity(
+        seed, output, expected, account_roots=[legacy, tmp_path, seed, legacy]
+    )
+    assert result["combined_bytes"] == expected
+    assert result["accounted_roots"] == {str(tmp_path): expected}
+    assert result["symlink_count"] == 1
+    assert result["strict_root_bytes"] == {str(seed): 3, str(output): 5}
+    assert result["accounted_root_usage"][str(tmp_path)]["symlink_count"] == 1
+    with pytest.raises(ValueError, match="envelope"):
+        benchmark.capacity(seed, output, expected - 1, account_roots=[tmp_path])
+
+
+def test_aggregate_usage_rejects_symlink_root_and_symlink_ancestors(tmp_path):
+    from oddsfox_catalogue.current_contract import CurrentError
+
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    (actual / "child").mkdir()
+    link = tmp_path / "linked"
+    link.symlink_to(actual, target_is_directory=True)
+    for root in (link, link / "child"):
+        with pytest.raises(CurrentError, match="symlink"):
+            benchmark.aggregate_usage(root)
+
+
+@pytest.mark.parametrize(
+    ("publication_seconds", "fail_publication"),
+    [(40, False), (200, False), (299, False), (400, False), (40, True)],
+)
+def test_preparation_calibrates_changed_publication_without_relaxing_refresh_budget(
+    tmp_path, monkeypatch, publication_seconds, fail_publication
+):
+    from types import SimpleNamespace
+
+    from fakes.world import make_event, make_market
+    from oddsfox_catalogue import current_publish, current_runtime, current_store, current_sync
+    from oddsfox_catalogue.current_rows import project_response
+
+    root = benchmark.validate_root(tmp_path / "seed", initialize=True)
+    settings = benchmark.CurrentSettings(root)
+    with benchmark.connect_store(settings) as conn:
+        current_store.initialize(conn)
+        original = make_event("1", "retained", markets=[make_market("1", "retained")])
+        current_store.apply(
+            conn,
+            project_response(
+                [original], "events", received_at="2000-01-01T00:00:00Z", response_id="seed"
+            ),
+        )
+        publish_release(settings, conn)
+        current_store.set_state(conn, "previous_publish_seconds", 915)
+        market = benchmark.market_payload(conn, benchmark.records(conn, "markets")[0])
+        events = {"1": {**original, "markets": [market]}}
+        markets = {"1": market}
+        fixture = benchmark.repair_fixture(conn, markets, [])
+    with CurrentGammaServer(events, markets) as source:
+        clock = [benchmark.time.monotonic()]
+        started = clock[0]
+        monkeypatch.setattr(benchmark, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(current_runtime, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        original_publish = current_publish.publish
+        original_verify = benchmark.verify_current
+        original_client = benchmark.GammaClient
+        client_calls = []
+
+        def client(gamma, **kwargs):
+            client_calls.append(kwargs)
+            assert kwargs["max_duration_s"] == 300
+            assert kwargs["deadline"] == started + 300
+            return original_client(gamma, **kwargs)
+
+        def publish(given_settings, given_conn, *, deadline):
+            assert given_settings.limits == settings.limits
+            assert given_settings.limits.max_duration_s == 300
+            assert deadline == started + 14400
+            if fail_publication:
+                clock[0] += publication_seconds
+                raise RuntimeError("preparation publication failed")
+            result = original_publish(given_settings, given_conn, deadline=deadline)
+            assert not result["noop"]
+            clock[0] += publication_seconds
+            return result
+
+        def verify(*args, **kwargs):
+            result = original_verify(*args, **kwargs)
+            clock[0] += 7
+            return result
+
+        monkeypatch.setattr(benchmark, "GammaClient", client)
+        monkeypatch.setattr(current_publish, "publish", publish)
+        monkeypatch.setattr(benchmark, "verify_current", verify)
+        with benchmark.connect_store(settings) as conn:
+            current_store.set_state(
+                conn,
+                "bulk_policy",
+                {
+                    **current_sync.POLICY,
+                    "origin": source.url,
+                    "lanes": {
+                        lane: {"supported": True, "passes": [None]}
+                        for lane in ("events", "markets")
+                    },
+                },
+            )
+            if fail_publication:
+                with pytest.raises(RuntimeError, match="preparation publication failed"):
+                    benchmark.prepare_identity_repair(
+                        settings, conn, source, events, markets, fixture
+                    )
+                assert current_store.get_state(conn, "previous_publish_seconds") == 915
+                assert current_store.get_state(conn, "fetch_pending") is None
+                assert source.stats["http_attempts"] == 1
+                assert all(
+                    benchmark.urlsplit(row["path"]).path == "/markets"
+                    for row in source.stats["responses"]
+                )
+                return
+            prepared = benchmark.prepare_identity_repair(
+                settings, conn, source, events, markets, fixture
+            )
+            assert prepared["copied_previous_publish_seconds"] == 915
+            assert prepared["resulting_previous_publish_seconds"] == publication_seconds
+            assert prepared["invalidation_publication_s"] == publication_seconds
+            assert prepared["invalidation_extra_verify_s"] == 7
+            assert prepared["elapsed_s"] == publication_seconds + 7
+            assert prepared["preparation_publication_deadline_monotonic"] == started + 14400
+            assert current_store.get_state(conn, "previous_publish_seconds") == publication_seconds
+            assert current_store.get_state(conn, "fetch_pending") == prepared["fetch_pending"]
+            assert source.stats["http_attempts"] == 1
+            assert all(
+                benchmark.urlsplit(row["path"]).path == "/markets"
+                for row in source.stats["responses"]
+            )
+            assert len(client_calls) == 1
+        if publication_seconds >= 200:
+            monkeypatch.setattr(current_publish, "publish", original_publish)
+            normal_deadline = clock[0] + 300
+            reserve = max(settings.limits.publication_reserve_s, 1.5 * publication_seconds)
+            assert reserve >= 300
+            if publication_seconds == 299:
+                assert reserve == 448.5
+            normal_requests = []
+
+            def normal_client(gamma, **kwargs):
+                assert kwargs["max_duration_s"] == 300
+                assert kwargs["deadline"] == normal_deadline - reserve
+                assert kwargs["deadline"] <= clock[0]
+                return original_client(
+                    gamma,
+                    **kwargs,
+                    clock=lambda: clock[0],
+                    transport=httpx.MockTransport(
+                        lambda request: (
+                            normal_requests.append(request) or pytest.fail("no acquisition budget")
+                        )
+                    ),
+                )
+
+            monkeypatch.setattr(current_runtime, "GammaClient", normal_client)
+            local = benchmark.replace(
+                settings,
+                gamma=benchmark.replace(settings.gamma, base_url=source.url, allow_loopback=True),
+            )
+            result = current_runtime.execute(local, "refresh", {}, normal_deadline)
+            assert result["budget_exhausted"] and result["pending"]
+            assert result["http_attempts"] == 0
+            assert normal_requests == []
+            with benchmark.connect_store(settings) as conn:
+                assert (
+                    current_store.get_state(conn, "previous_publish_seconds") == publication_seconds
+                )
+                assert current_store.get_state(conn, "fetch_pending") == prepared["fetch_pending"]

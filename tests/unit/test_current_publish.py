@@ -57,14 +57,14 @@ def test_each_publication_validates_source_once_and_external_verify_remains_fres
     store, monkeypatch
 ):
     settings, conn = store
-    original = publisher.validate_store
+    original = publisher._validate_store
     calls = []
 
     def checked(connection):
         calls.append(connection)
         return original(connection)
 
-    monkeypatch.setattr(publisher, "validate_store", checked)
+    monkeypatch.setattr(publisher, "_validate_store", checked)
     result = publisher.publish(settings, conn)
     assert calls == [conn]
     calls.clear()

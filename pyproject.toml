@@ -30,6 +30,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
+skip-excluded-dirs = true
 exclude = [
     "**/__pycache__/**", "**/dbt/target/**", "**/dbt/logs/**",
     "**/dbt/dbt_packages/**", "**/dbt/.user.yml", "**/data/**", "**/.state/**",

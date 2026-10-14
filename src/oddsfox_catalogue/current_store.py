@@ -366,7 +366,7 @@ def _validate_schema(conn):
         or get_state(conn, "projection_version") != PROJECTION_VERSION
     ):
         raise CurrentError("incompatible current store")
-    if not isinstance(generation(conn), int) or generation(conn) < 0:
+    if type(generation(conn)) is not int or generation(conn) < 0:
         raise CurrentError("invalid generation")
     for table, schema in SCHEMAS.items():
         actual = {r[0]: r[1] for r in conn.execute(f"DESCRIBE {table}").fetchall()}
@@ -374,25 +374,52 @@ def _validate_schema(conn):
             raise CurrentError(f"invalid {table} types")
 
 
+def validate_public(conn, sources):
+    for table, source in sources.items():
+        keys = ", ".join(KEYS[table])
+        nulls = " OR ".join(f'"{key}" IS NULL' for key in KEYS[table])
+        if conn.execute(f"SELECT 1 FROM {source} WHERE {nulls} LIMIT 1").fetchone():
+            raise CurrentError(f"null {table} key")
+        if conn.execute(
+            f"SELECT 1 FROM {source} GROUP BY {keys} HAVING count(*)>1 LIMIT 1"
+        ).fetchone():
+            raise CurrentError(f"duplicate {table} key")
+    events, markets, links, outcomes = (sources[t] for t in SCHEMAS)
+    checks = native_integrity_queries(events, markets, outcomes) + [
+        f"SELECT 1 FROM {links} l LEFT JOIN {events} e USING(venue,event_id) LEFT JOIN {markets} m USING(venue,market_id) WHERE e.event_id IS NULL OR m.market_id IS NULL",
+        f"SELECT 1 FROM {outcomes} o LEFT JOIN {markets} m USING(venue,market_id) WHERE m.market_id IS NULL OR m.usable IS DISTINCT FROM true",
+        f"SELECT 1 FROM {outcomes} WHERE asset_kind IS NULL OR asset_id IS NULL",
+    ]
+    for query in checks:
+        if conn.execute(query + " LIMIT 1").fetchone():
+            raise CurrentError("release relational integrity violation")
+
+
 def validate_store(conn, *, allow_seeding=False):
+    return _validate_store(conn, allow_seeding=allow_seeding)[0]
+
+
+def _validate_store(conn, *, allow_seeding=False):
+    """Return validation and freshly compared source evidence, never accept a proof."""
     _validate_schema(conn)
     if (
         not allow_seeding
         and conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone()
     ):
         raise CurrentError("seed import incomplete; resume import-release with its frozen source")
-    for query in native_integrity_queries("events", "markets", "outcomes") + [
-        "SELECT 1 FROM event_markets GROUP BY venue,event_id,market_id HAVING count(*)>1",
+    validate_public(conn, {table: table for table in SCHEMAS})
+    for query in [
         "SELECT 1 FROM _identity_claims GROUP BY venue,market_id,asset_kind,asset_id "
         "HAVING count(*) FILTER (WHERE role='candidate')>1 OR count(*) FILTER (WHERE role='accepted')>1",
-        "SELECT 1 FROM markets m LEFT JOIN _identity i USING(venue,market_id) WHERE m.usable AND (i.accepted IS NULL OR i.invalidated_at IS NOT NULL)",
+        "SELECT 1 FROM markets m LEFT JOIN (SELECT venue,market_id, "
+        "accepted IS NULL AS missing,invalidated_at IS NOT NULL AS invalid "
+        "FROM _identity) i USING(venue,market_id) "
+        "WHERE m.usable AND (i.market_id IS NULL OR i.missing OR i.invalid)",
         "SELECT 1 FROM outcomes o ANTI JOIN _identity_claims c ON c.venue=o.venue AND c.market_id=o.market_id AND c.role='accepted' AND c.asset_kind=o.asset_kind AND c.asset_id=o.asset_id",
         "WITH disputed AS (SELECT venue,asset_kind,asset_id FROM _identity_claims "
         "GROUP BY venue,asset_kind,asset_id HAVING min(market_id)<>max(market_id)) "
         "SELECT 1 FROM _identity_claims a JOIN disputed USING(venue,asset_kind,asset_id) "
         "JOIN markets m ON m.venue=a.venue AND m.market_id=a.market_id WHERE m.usable",
-        "SELECT 1 FROM outcomes o LEFT JOIN markets m USING(venue,market_id) WHERE m.market_id IS NULL OR NOT m.usable",
-        "SELECT 1 FROM event_markets e LEFT JOIN events p USING(venue,event_id) LEFT JOIN markets m USING(venue,market_id) WHERE p.event_id IS NULL OR m.market_id IS NULL",
     ]:
         if conn.execute(query + " LIMIT 1").fetchone():
             raise CurrentError("current store integrity violation")
@@ -403,16 +430,20 @@ def validate_store(conn, *, allow_seeding=False):
         + "FROM _identity i JOIN markets m USING(venue,market_id) WHERE m.usable) maps"
     )
     accepted = (
-        "SELECT owner_venue,owner_market_id, "
-        + ", ".join(f'mapping."{name}" AS "{name}"' for name in columns("outcomes"))
+        "SELECT "
+        + "CASE WHEN owner_venue IS NOT DISTINCT FROM mapping.venue "
+        + "AND owner_market_id IS NOT DISTINCT FROM mapping.market_id "
+        + "THEN mapping.venue ELSE NULL END AS venue, "
+        + ", ".join(f'mapping."{name}" AS "{name}"' for name in columns("outcomes")[1:])
         + mapped
     )
-    if semantic_fingerprint(conn, accepted) != semantic_fingerprint(
-        conn,
-        f"SELECT venue AS owner_venue,market_id AS owner_market_id,{projection('outcomes')} FROM outcomes",
-    ):
+    accepted_fingerprint = semantic_fingerprint(conn, accepted)
+    source_fingerprint = semantic_fingerprint(
+        conn, f"SELECT {projection('outcomes')} FROM outcomes"
+    )
+    if accepted_fingerprint != source_fingerprint:
         raise CurrentError("current outcomes differ from accepted native mappings")
-    return {"valid": True, "generation": generation(conn)}
+    return {"valid": True, "generation": generation(conn)}, source_fingerprint
 
 
 def summary(conn, now=None, repair_limit=100):

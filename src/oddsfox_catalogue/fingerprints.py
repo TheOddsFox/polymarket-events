@@ -18,14 +18,14 @@ def semantic_fingerprint(connection, query, parameters=None):
     # Finish source operators before sorting the compact hashes within the memory cap.
     hashes_table = f'"temp"."main"."_oddsfox_fingerprint_{uuid4().hex}"'
     connection.execute(
-        f"CREATE TEMP TABLE {hashes_table} AS SELECT sha256(to_json(r)) AS row FROM ({query}) AS r",
+        f"CREATE TEMP TABLE {hashes_table} AS SELECT unhex(sha256(to_json(r))) AS row FROM ({query}) AS r",
         parameters,
     )
     try:
         cursor = connection.execute(f"SELECT row FROM {hashes_table} ORDER BY row")
         count = 0
         while rows := cursor.fetchmany(8192):
-            digest.update(b"".join(row[0].encode() + b"\n" for row in rows))
+            digest.update(b"".join(row[0].hex().encode() + b"\n" for row in rows))
             count += len(rows)
         return {
             "rows": count,

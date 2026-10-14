@@ -17,14 +17,13 @@ from .capture.writer import _fsync_dir, atomic_write_bytes, read_regular_bytes
 from .current_config import CurrentSettings, admit, memory_connection, safe_path, validate_root
 from .current_contract import (
     CONTRACT,
-    KEYS,
     PROJECTION_VERSION,
     SCHEMAS,
     CurrentError,
-    native_integrity_queries,
     projection,
 )
-from .current_store import generation, summary, validate_store
+from .current_store import _validate_store, generation, summary
+from .current_store import validate_public as _integrity
 from .fingerprints import semantic_fingerprint
 from .limits import directory_bytes
 
@@ -35,7 +34,10 @@ def _check_deadline(deadline):
 
 
 def _json(path):
-    return json.loads(read_regular_bytes(path, max_bytes=4 * 1024**2))
+    value = json.loads(read_regular_bytes(path, max_bytes=4 * 1024**2))
+    if not isinstance(value, dict):
+        raise CurrentError("release metadata must be an object")
+    return value
 
 
 def _physical(path):
@@ -56,29 +58,21 @@ def _parquet(path):
     return "read_parquet('" + str(path).replace("'", "''") + "')"
 
 
-def _integrity(conn, sources):
-    for table, source in sources.items():
-        keys = ", ".join(KEYS[table])
-        nulls = " OR ".join(f'"{key}" IS NULL' for key in KEYS[table])
-        if conn.execute(f"SELECT 1 FROM {source} WHERE {nulls} LIMIT 1").fetchone():
-            raise CurrentError(f"null {table} key")
-        if conn.execute(
-            f"SELECT 1 FROM {source} GROUP BY {keys} HAVING count(*)>1 LIMIT 1"
-        ).fetchone():
-            raise CurrentError(f"duplicate {table} key")
-    events, markets, links, outcomes = (sources[t] for t in SCHEMAS)
-    checks = native_integrity_queries(events, markets, outcomes) + [
-        f"SELECT 1 FROM {links} l LEFT JOIN {events} e USING(venue,event_id) LEFT JOIN {markets} m USING(venue,market_id) WHERE e.event_id IS NULL OR m.market_id IS NULL",
-        f"SELECT 1 FROM {outcomes} o LEFT JOIN {markets} m USING(venue,market_id) WHERE m.market_id IS NULL OR m.usable IS DISTINCT FROM true",
-        f"SELECT 1 FROM {outcomes} WHERE asset_kind IS NULL OR asset_id IS NULL",
-    ]
-    for query in checks:
-        if conn.execute(query + " LIMIT 1").fetchone():
-            raise CurrentError("release relational integrity violation")
-
-
 def verify_release(path, *, connection=None, settings=None):
     """Recompute content and hashes; optionally prove equality to the source store."""
+    path = safe_path(Path(path))
+    with ExitStack() as stack:
+        if connection is None:
+            root = next((p for p in path.parents if (p / "catalogue.json").exists()), None)
+            if root is None:
+                raise CurrentError("verification requires a confined catalogue root")
+            connection = stack.enter_context(memory_connection(settings or CurrentSettings(root)))
+            return _verify_release_on_connection(path, connection, bind_store=False)
+        return _verify_release_on_connection(path, connection, bind_store=True)
+
+
+def _verify_release_on_connection(path, conn, *, bind_store):
+    """Reuse one bounded recovery connection for current or older release evidence."""
     path = safe_path(Path(path))
     manifest = _json(path / "manifest.json")
     if (
@@ -89,48 +83,54 @@ def verify_release(path, *, connection=None, settings=None):
     expected = {f"{table}.parquet" for table in SCHEMAS} | {"manifest.json"}
     if {child.name for child in path.iterdir()} != expected:
         raise CurrentError("release must contain exactly four Parquets and its manifest")
-    if set(manifest.get("relations", {})) != set(SCHEMAS):
+    relations = manifest.get("relations")
+    if (
+        not isinstance(relations, dict)
+        or set(relations) != set(SCHEMAS)
+        or any(not isinstance(value, dict) for value in relations.values())
+        or not isinstance(manifest.get("counts"), dict)
+    ):
         raise CurrentError("invalid release relations")
-    owned = connection is None
-    stack = ExitStack()
-    if owned:
-        root = next((p for p in path.parents if (p / "catalogue.json").exists()), None)
-        if root is None:
-            raise CurrentError("verification requires a confined catalogue root")
-        conn = stack.enter_context(memory_connection(settings or CurrentSettings(root)))
-    else:
-        conn = connection
-    try:
-        sources = {}
-        for table, schema in SCHEMAS.items():
-            file = path / f"{table}.parquet"
-            recorded = manifest["relations"][table]
-            if _physical(file) != {key: recorded.get(key) for key in ("sha256", "bytes")}:
-                raise CurrentError(f"corrupt {table} Parquet")
-            source = _parquet(file)
-            actual = conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
-            if tuple((row[0], row[1]) for row in actual) != schema:
-                raise CurrentError(f"invalid {table} schema")
-            fingerprint = semantic_fingerprint(conn, f"SELECT {projection(table)} FROM {source}")
+    _inspect_relations(path, conn, bind_store=bind_store, expected=manifest)
+    if bind_store and manifest.get("generation") != generation(conn):
+        raise CurrentError("release generation differs from source store")
+    return {**manifest, "valid": True, "path": str(path)}
+
+
+def _inspect_relations(path, conn, *, bind_store, expected=None):
+    """Measure actual files and source rows; no proof survives this inspection call."""
+    sources, relations = {}, {}
+    for table, schema in SCHEMAS.items():
+        file = path / f"{table}.parquet"
+        physical = _physical(file)
+        recorded = expected["relations"][table] if expected is not None else None
+        if recorded is not None and physical != {
+            key: recorded.get(key) for key in ("sha256", "bytes")
+        }:
+            raise CurrentError(f"corrupt {table} Parquet")
+        source = _parquet(file)
+        actual = conn.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+        if tuple((row[0], row[1]) for row in actual) != schema:
+            raise CurrentError(f"invalid {table} schema")
+        fingerprint = semantic_fingerprint(conn, f"SELECT {projection(table)} FROM {source}")
+        if recorded is not None:
             if any(recorded.get(key) != value for key, value in fingerprint.items()):
                 raise CurrentError(f"invalid {table} semantic digest")
-            if manifest.get("counts", {}).get(table) != fingerprint["rows"]:
+            if expected.get("counts", {}).get(table) != fingerprint["rows"]:
                 raise CurrentError(f"invalid {table} count")
-            if not owned:
-                source_digest = semantic_fingerprint(
-                    conn, f"SELECT {projection(table)} FROM {table}"
-                )
-                if source_digest != fingerprint:
-                    raise CurrentError(f"{table} export differs from source store")
-            sources[table] = source
+        if bind_store and table != "outcomes":
+            source_digest = semantic_fingerprint(conn, f"SELECT {projection(table)} FROM {table}")
+            if source_digest != fingerprint:
+                raise CurrentError(f"{table} export differs from source store")
+        sources[table] = source
+        relations[table] = {**fingerprint, **physical}
+    if bind_store:
+        _, source_outcomes = _validate_store(conn)
+        if any(relations["outcomes"].get(key) != value for key, value in source_outcomes.items()):
+            raise CurrentError("outcomes export differs from source store")
+    else:
         _integrity(conn, sources)
-        if not owned:
-            validate_store(conn)
-            if manifest.get("generation") != generation(conn):
-                raise CurrentError("release generation differs from source store")
-        return {**manifest, "valid": True, "path": str(path)}
-    finally:
-        stack.close()
+    return relations
 
 
 def _pointer(settings):
@@ -145,6 +145,15 @@ def _pointer(settings):
         or len(release_id) != 32
     ):
         raise CurrentError("invalid current release pointer")
+    previous = pointer.get("previous_release_id")
+    if previous is not None and (
+        not isinstance(previous, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", previous)
+        or previous == release_id
+    ):
+        raise CurrentError(
+            "invalid previous release identity; preserve this root and restore a verified backup"
+        )
     return pointer
 
 
@@ -161,8 +170,10 @@ def verify_current(settings, *, connection=None):
     same_generation = connection is not None and manifest.get("generation") == generation(
         connection
     )
-    result = verify_release(
-        path, connection=connection if same_generation else None, settings=settings
+    result = (
+        _verify_release_on_connection(path, connection, bind_store=same_generation)
+        if connection is not None
+        else verify_release(path, settings=settings)
     )
     result["published_generation"] = result["generation"]
     if connection is not None:
@@ -209,7 +220,6 @@ def publish(settings, conn, *, deadline=None):
     current = safe_path(published / "current.json")
     previous = None
     pinned = _pointer(settings) if current.exists() else {}
-    _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
     conn.execute("BEGIN TRANSACTION")
     try:
         if conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone():
@@ -221,13 +231,38 @@ def publish(settings, conn, *, deadline=None):
             try:
                 verified = verify_current(settings, connection=conn)
             except (CurrentError, OSError, ValueError, duckdb.Error):
-                pass
+                fallback = pointer.get("previous_release_id")
+                if fallback is not None:
+                    try:
+                        if not isinstance(fallback, str) or not re.fullmatch(
+                            r"[0-9a-f]{32}", fallback
+                        ):
+                            raise CurrentError("invalid previous release identity")
+                        verified = _verify_release_on_connection(
+                            releases / fallback, conn, bind_store=False
+                        )
+                        if (
+                            verified.get("release_id") != fallback
+                            or type(verified.get("generation")) is not int
+                            or not 0 <= verified["generation"] <= generation(conn)
+                        ):
+                            raise CurrentError("invalid previous release binding")
+                    except (CurrentError, OSError, ValueError, duckdb.Error) as exc:
+                        raise CurrentError(
+                            "current and previous releases could not be verified; "
+                            "preserve this root and restore a verified backup into a fresh root"
+                        ) from exc
+                    previous = fallback
             else:
                 previous = pointer["release_id"]
                 if verified["generation"] == generation(conn):
+                    _cleanup(
+                        settings, {pinned.get("release_id"), pinned.get("previous_release_id")}
+                    )
                     _check_deadline(deadline)
                     conn.execute("COMMIT")
                     return {**verified, "noop": True}
+        _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
         # Existing failed staging and orphan releases are counted by admit as retained bytes.
         estimate = 2 * (settings.store_path.stat().st_size if settings.store_path.exists() else 0)
         wal = safe_path(Path(str(settings.store_path) + ".wal"))
@@ -261,14 +296,30 @@ def publish(settings, conn, *, deadline=None):
             file = stage / f"{table}.parquet"
             _export(conn, table, file)
             _check_deadline(deadline)
-            manifest["relations"][table] = {
-                **semantic_fingerprint(conn, f"SELECT {projection(table)} FROM {_parquet(file)}"),
-                **_physical(file),
-            }
             with file.open("rb") as handle:
                 os.fsync(handle.fileno())
-        atomic_write_bytes(stage / "manifest.json", json.dumps(manifest, sort_keys=True).encode())
-        verify_release(stage, connection=conn)
+        manifest["relations"] = _inspect_relations(stage, conn, bind_store=True)
+        if any(
+            manifest["counts"][table] != value["rows"]
+            for table, value in manifest["relations"].items()
+        ):
+            raise CurrentError("publication counts differ from verified rows")
+        manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
+        atomic_write_bytes(stage / "manifest.json", manifest_bytes)
+        if read_regular_bytes(stage / "manifest.json", max_bytes=4 * 1024**2) != manifest_bytes:
+            raise CurrentError("candidate manifest changed after verification")
+        if {child.name for child in stage.iterdir()} != {
+            "manifest.json",
+            *(f"{table}.parquet" for table in SCHEMAS),
+        }:
+            raise CurrentError("candidate inventory changed after verification")
+        for table, descriptor in manifest["relations"].items():
+            if _physical(stage / f"{table}.parquet") != {
+                key: descriptor[key] for key in ("sha256", "bytes")
+            }:
+                raise CurrentError(f"candidate {table} changed after verification")
+        if manifest["generation"] != generation(conn):
+            raise CurrentError("candidate source generation changed after verification")
         _check_deadline(deadline)
         admit(settings)
         _fsync_dir(stage)
