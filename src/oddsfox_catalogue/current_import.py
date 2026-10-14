@@ -380,7 +380,10 @@ def import_release(settings, conn, release_path, *, manifest_sha256, raw_root, d
             }
         return {"complete": False, "phase": next_stage}
     except BaseException as exc:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as rollback_error:
+            exc.add_note(f"rollback also failed: {rollback_error}")
         if isinstance(exc, Exception):
             raise CurrentError(f"seed {phase} failed: {exc}") from exc
         raise

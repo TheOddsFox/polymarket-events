@@ -6,7 +6,7 @@ Use AGENTS.md and the local pad-engineering skill. Git owns code, CI verificatio
 
 ## Runtime
 
-Python3.12, DuckDB, HTTPX and filelock. catalogue.v3 is a breaking replacement for catalogue.v2; metadata.v1 stays compatible. Current roots have a catalogue_store.v3 stamp and must never reuse, nest beneath, migrate or mutate legacy roots. Preserve a matching baseline runtime for rollback. No dlt/dbt/Dagster runtime or scheduler activation.
+Python3.12, DuckDB, HTTPX and filelock. catalogue.v3 is a breaking replacement for catalogue.v2; metadata.v1 stays compatible. Current roots have a catalogue_store.v4 stamp and must never reuse, nest beneath, migrate or mutate legacy roots. Preserve a matching baseline runtime for rollback. No dlt/dbt/Dagster runtime or scheduler activation.
 
 Complete event membership arrays replace links, including empty arrays. Missing/incomplete arrays preserve prior links and remain unresolved. List omissions never establish absence or source completeness. Retain closed/unlinked entities. Native IDs are exact decimal strings; unsafe/conflicting ownership is unavailable until native confirmation.
 

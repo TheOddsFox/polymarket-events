@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 CONTRACT = "oddsfox.polymarket.catalogue.v3"
-STORE_CONTRACT = "oddsfox.polymarket.catalogue_store.v3"
+STORE_CONTRACT = "oddsfox.polymarket.catalogue_store.v4"
 BACKUP_CONTRACT = "oddsfox.polymarket.catalogue_backup.v3"
 PROJECTION_VERSION = 1
 

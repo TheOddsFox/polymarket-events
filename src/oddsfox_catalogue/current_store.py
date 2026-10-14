@@ -35,9 +35,13 @@ def initialize(conn):
     conn.execute("BEGIN TRANSACTION")
     try:
         for table, schema in SCHEMAS.items():
-            fields = ", ".join(f'"{name}" {kind}' for name, kind in schema)
+            fields = ", ".join(
+                f'"{name}" {kind}' + (" NOT NULL" if name in KEYS[table] else "")
+                for name, kind in schema
+            )
             key = ", ".join(KEYS[table])
-            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({fields}, PRIMARY KEY ({key}))")
+            constraint = "" if table == "event_markets" else f", PRIMARY KEY ({key})"
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({fields}{constraint})")
         conn.execute("CREATE TABLE IF NOT EXISTS sync_state (key VARCHAR PRIMARY KEY, value JSON)")
         conn.execute("""CREATE TABLE IF NOT EXISTS _receipts (
             kind VARCHAR, venue VARCHAR, id VARCHAR, receipt TIMESTAMPTZ, response VARCHAR,
@@ -82,8 +86,9 @@ def generation(conn):
 
 def _put(conn, table, row):
     names = columns(table)
+    insert = "INSERT" if table == "event_markets" else "INSERT OR REPLACE"
     conn.execute(
-        f"INSERT OR REPLACE INTO {table} ({projection(table)}) VALUES ({', '.join('?' for _ in names)})",
+        f"{insert} INTO {table} ({projection(table)}) VALUES ({', '.join('?' for _ in names)})",
         [row.get(k) for k in names],
     )
 
@@ -377,6 +382,7 @@ def validate_store(conn, *, allow_seeding=False):
     ):
         raise CurrentError("seed import incomplete; resume import-release with its frozen source")
     for query in native_integrity_queries("events", "markets", "outcomes") + [
+        "SELECT 1 FROM event_markets GROUP BY venue,event_id,market_id HAVING count(*)>1",
         "SELECT 1 FROM _identity_claims GROUP BY venue,market_id,role,asset_kind,asset_id HAVING count(*)>1",
         "SELECT 1 FROM markets m LEFT JOIN _identity i USING(venue,market_id) WHERE m.usable AND (i.accepted IS NULL OR i.invalidated_at IS NOT NULL)",
         "SELECT 1 FROM markets m JOIN _identity i USING(venue,market_id) WHERE m.usable AND (SELECT count(*) FROM outcomes o WHERE o.venue=m.venue AND o.market_id=m.market_id) <> json_array_length(i.accepted)",

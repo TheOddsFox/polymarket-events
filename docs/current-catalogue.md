@@ -35,7 +35,7 @@ uv run catalogue --root /srv/catalogue-v3 import-release /archive/releases/RELEA
 ```
 
 `init` writes `catalogue.json` with store contract
-`oddsfox.polymarket.catalogue_store.v3`. It rejects legacy roots, nonempty unstamped
+`oddsfox.polymarket.catalogue_store.v4`. It rejects legacy roots, nonempty unstamped
 roots, and roots nested inside legacy or current roots. There is no in-place migration.
 Import requires a pristine current store and verifies the pinned v2 release plus
 original event raw pages. It preserves original observation ages; it does not refresh
@@ -82,8 +82,11 @@ Known entities remain retained and historical ranges are revisited.
 events, then rotates closed events, all known markets, and historical ID windows monthly.
 Event responses also update their embedded markets. Unlinked market corrections may
 wait for monthly reconciliation. Work survives between invocations.
+Historical rotations pin their ID bounds and measure the next cycle from the prior
+cycle's start; status reports range ages separately from entity receipt ages.
 `publish` explicitly builds a verified release; `current` and `verify` verify the pointer.
-`status` reports progress, backlog/freshness, last run, verified backup age, and a
+`status` reports progress, backlog/freshness, unstarted or overdue historical ranges,
+last run, verified backup age, and a
 `recovery_point_overdue` flag when no backup exists or the last success exceeds 24 hours.
 
 One supervised HTTP worker, one root writer lock, and at most 10 requests/second are
@@ -125,6 +128,9 @@ uv run catalogue --root /srv/catalogue-v3-restored status
 Copy a completed backup to offline storage, verify that copy, and restore only to a
 fresh destination. Backup verification checks its inventory and checksums; recovery
 includes the store, pending progress/raw dependencies, and last publication pointer.
+The 24-hour disk-loss target requires a daily verified copy on an independent device.
+The backup-age status measures local verified backups; operator monitoring must also
+track the independent copy and alert on a failed or overdue transfer.
 Verify the restored pointer before redirecting consumers or scheduling. Interrupted
 work resumes from committed progress and pending responses; a failed publication keeps
 the last verified pointer. Raw retention is bounded: there is no permanent replay

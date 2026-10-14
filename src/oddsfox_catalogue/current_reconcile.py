@@ -82,18 +82,27 @@ def _cold(conn, settings, now, state):
         else:
             window = state["windows"].get(lane, {"next": 1, "cycle": None})
             if (
-                window["cycle"]
+                window.get("started_at") is None
+                and window["cycle"] is not None
                 and now.timestamp() - window["cycle"] < settings.limits.cold_recheck_s
             ):
                 continue
-            high = discovery.get(lane, {}).get("frontier", 0)
+            high = window.get("high")
+            if high is None:
+                high = discovery.get(lane, {}).get("frontier", 0)
             if high < 1:
                 continue
+            started_at = window.get("started_at", now.timestamp())
             lo = min(window["next"], high)
             ids = list(range(lo, min(lo + 99, high) + 1))
-            next_window = {"next": ids[-1] + 1, "cycle": None}
+            next_window = {
+                "next": ids[-1] + 1,
+                "cycle": None,
+                "started_at": started_at,
+                "high": high,
+            }
             if ids[-1] == high:
-                next_window = {"next": 1, "cycle": now.timestamp()}
+                next_window = {"next": 1, "cycle": started_at}
             return lane, ids, slot, next_window
     return None
 
@@ -234,4 +243,15 @@ def freshness(conn, *, now=None):
         )
     result["overdue_count"] = result["active_overdue_count"]
     result["cold_cycle"] = current_store.get_state(conn, "reconcile", {}).get("windows", {})
+    frontiers = current_store.get_state(conn, "discovery", {}).get("lanes", {})
+    result["cold_ranges"] = {}
+    for lane in ("events", "markets"):
+        window = result["cold_cycle"].get(lane, {})
+        started = window.get("started_at", window.get("cycle"))
+        age = None if started is None else max(0, now.timestamp() - started)
+        result["cold_ranges"][lane] = {
+            "age_s": age,
+            "overdue": None if age is None else age >= 30 * 86400,
+            "unstarted": started is None and frontiers.get(lane, {}).get("frontier", 0) > 0,
+        }
     return result

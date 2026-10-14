@@ -273,3 +273,109 @@ def test_urgent_event_overrides_persisted_cold_turn(setup):
     run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
     assert [r.url.params.get_list("id") for r in calls] == [["1"], ["999"]]
     assert current_store.get_state(conn, "reconcile")["turn"] == 0
+
+
+def test_historical_cycle_freezes_frontier_and_restarts_from_start_time(setup):
+    settings, conn = setup
+    state = {"cold_slot": 2, "windows": {}}
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 200}}})
+    reconcile._initialize(conn)
+    lane, ids, slot, window = reconcile._cold(conn, settings, start, state)
+    assert (lane, ids, slot) == ("events", list(range(1, 101)), 2)
+    assert window == {"next": 101, "cycle": None, "started_at": start.timestamp(), "high": 200}
+    state["windows"][lane] = window
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 400}}})
+    lane, ids, _, window = reconcile._cold(conn, settings, start + timedelta(days=2), state)
+    assert ids == list(range(101, 201))
+    assert window == {"next": 1, "cycle": start.timestamp()}
+    state["windows"][lane] = window
+    assert reconcile._cold(conn, settings, start + timedelta(days=28), state) is None
+    _, ids, _, window = reconcile._cold(conn, settings, start + timedelta(days=29), state)
+    assert ids == list(range(1, 101))
+    assert window["high"] == 400
+    assert window["started_at"] == (start + timedelta(days=29)).timestamp()
+
+
+@pytest.mark.parametrize("frontier", [0, 100])
+def test_historical_empty_frontier_and_exact_batch_boundary(setup, frontier):
+    settings, conn = setup
+    reconcile._initialize(conn)
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": frontier}}})
+    result = reconcile._cold(conn, settings, NOW, {"cold_slot": 2, "windows": {}})
+    if frontier == 0:
+        assert result is None
+    else:
+        assert result == ("events", list(range(1, 101)), 2, {"next": 1, "cycle": NOW.timestamp()})
+
+
+def test_legacy_partial_historical_cycle_pins_frontier_on_resume(setup):
+    settings, conn = setup
+    reconcile._initialize(conn)
+    state = {"cold_slot": 2, "windows": {"events": {"next": 101, "cycle": None}}}
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 300}}})
+    lane, ids, _, window = reconcile._cold(conn, settings, NOW, state)
+    assert ids == list(range(101, 201))
+    assert window["high"] == 300
+    state["windows"][lane] = window
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 500}}})
+    _, ids, _, window = reconcile._cold(conn, settings, NOW + timedelta(days=1), state)
+    assert ids == list(range(201, 301))
+    assert window == {"next": 1, "cycle": NOW.timestamp()}
+
+
+def test_historical_long_cycle_is_due_immediately_after_completion(setup):
+    settings, conn = setup
+    reconcile._initialize(conn)
+    started = NOW - timedelta(days=31)
+    state = {
+        "cold_slot": 2,
+        "windows": {
+            "events": {"next": 101, "cycle": None, "started_at": started.timestamp(), "high": 200}
+        },
+    }
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 200}}})
+    _, ids, _, window = reconcile._cold(conn, settings, NOW, state)
+    assert ids == list(range(101, 201))
+    state["windows"]["events"] = window
+    _, ids, _, window = reconcile._cold(conn, settings, NOW, state)
+    assert ids == list(range(1, 101))
+    assert window["started_at"] == NOW.timestamp()
+
+
+def test_historical_market_progress_commits_only_after_all_passes(setup):
+    settings, conn = setup
+    reconcile._initialize(conn)
+    policy = current_store.get_state(conn, "bulk_policy")
+    policy["lanes"]["markets"]["passes"] = [False, True]
+    current_store.set_state(conn, "bulk_policy", policy)
+    state = {"turn": 0, "cold_slot": 3, "windows": {}}
+    current_store.set_state(conn, "reconcile", state)
+    current_store.set_state(conn, "discovery", {"lanes": {"markets": {"frontier": 200}}})
+    lane, ids, slot, window = reconcile._cold(conn, settings, NOW, state)
+    progress = {**state, "cold_slot": (slot + 1) % 4, "windows": {lane: window}}
+    calls = []
+
+    def interrupted(request):
+        calls.append(request)
+        if len(calls) == 2:
+            raise reconcile.CaptureStopped("stop between passes")
+        return httpx.Response(200, json=[])
+
+    with (
+        GammaClient(settings.gamma, transport=httpx.MockTransport(interrupted)) as client,
+        pytest.raises(reconcile.CaptureStopped),
+    ):
+        current_sync.fetch_apply(
+            settings, conn, client, lane, ids, progress={"reconcile": progress}
+        )
+    assert current_store.get_state(conn, "reconcile") == state
+    pending = current_store.get_state(conn, "fetch_pending")
+    assert pending["identity"]["progress"]["reconcile"] == progress
+    assert len(pending["remaining"]) == 1
+    with GammaClient(
+        settings.gamma, transport=httpx.MockTransport(lambda _: httpx.Response(200, json=[]))
+    ) as client:
+        current_sync.resume_pending(settings, conn, client)
+    assert current_store.get_state(conn, "reconcile") == progress
+    assert current_store.get_state(conn, "fetch_pending") is None
