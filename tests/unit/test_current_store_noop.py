@@ -1,5 +1,6 @@
 """Exact outcome no-ops must preserve receipt, ownership and transaction behavior."""
 
+import json
 import re
 from datetime import UTC, datetime
 
@@ -16,34 +17,50 @@ class RecordedConnection:
         self.connection = connection
         self.queries = []
         self.fail_commit = fail_commit
+        self.updated_market_rows = []
 
     def execute(self, query, parameters=None):
         self.queries.append(query)
         if self.fail_commit and query.strip().upper() == "COMMIT":
             self.fail_commit = False
             raise duckdb.OutOfMemoryException("synthetic late SQL allocation failure")
-        return (
+        result = (
             self.connection.execute(query, parameters)
             if parameters is not None
             else self.connection.execute(query)
         )
+        if re.match(r"\s*UPDATE\s+markets\b", query, re.IGNORECASE):
+            self.updated_market_rows.append(result.fetchone()[0])
+        return result
 
     def executemany(self, query, parameters):
         self.queries.append(query)
         return self.connection.executemany(query, parameters)
 
     @property
-    def written_tables(self):
-        writes = set()
+    def mutations(self):
+        writes = []
         for query in self.queries:
             match = re.match(
-                r'\s*(?:INSERT(?:\s+OR\s+(?:REPLACE|IGNORE))?\s+INTO|UPDATE|DELETE\s+FROM)\s+"?(\w+)',
+                r'\s*(INSERT(?:\s+OR\s+(?:REPLACE|IGNORE))?\s+INTO|UPDATE|DELETE\s+FROM)\s+"?(\w+)',
                 query,
                 re.IGNORECASE,
             )
             if match:
-                writes.add(match[1].lower())
+                writes.append((match[1].upper(), match[2].lower()))
         return writes
+
+    @property
+    def written_tables(self):
+        return {table for _, table in self.mutations}
+
+
+def assert_no_wide_rewrites(recorded):
+    protected = {"events", "markets", "event_markets", "outcomes", "_identity", "_identity_claims"}
+    for operation, table in recorded.mutations:
+        if table in protected:
+            assert (operation, table) == ("UPDATE", "markets")
+    assert all(count == 0 for count in recorded.updated_market_rows)
 
 
 def snapshot(connection):
@@ -60,7 +77,7 @@ def test_exact_outcome_noop_renews_receipts_progress_and_membership(db, native):
     db.execute("INSERT INTO _parent_repairs VALUES ('1')")
     recorded = RecordedConnection(db)
     result = store.apply(recorded, packet(2, native=native), {"cursor": "new"})
-    assert "outcomes" not in recorded.written_tables
+    assert_no_wide_rewrites(recorded)
     assert result["changed"] is False
     assert result["generation"] == 1
     assert db.execute("SELECT * FROM outcomes ORDER BY outcome_index").fetchall() == original
@@ -90,6 +107,9 @@ def test_outcome_label_change_rewrites_served_mapping(db):
         ('Yes "雪"\n',),
         ("2",),
     ]
+    for candidate, accepted in db.execute("SELECT candidate,accepted FROM _identity").fetchall():
+        assert json.loads(candidate) == changed.outcomes
+        assert json.loads(accepted) == changed.outcomes
     assert store.validate_store(db)["valid"]
 
 
@@ -107,6 +127,9 @@ def test_optional_native_id_null_transitions_are_not_skipped(db):
         assert db.execute("SELECT position_id FROM outcomes ORDER BY outcome_index").fetchall() == [
             (position,) for position in positions
         ]
+        candidate, accepted = db.execute("SELECT candidate,accepted FROM _identity").fetchone()
+        assert json.loads(candidate) == changed.outcomes
+        assert json.loads(accepted) == changed.outcomes
         assert store.validate_store(db)["valid"]
 
 
@@ -164,6 +187,7 @@ def test_late_sql_oom_rolls_back_every_table_and_retry_matches_clean_apply(db):
     before = snapshot(db)
     changed = packet(2, assets=("103", "104"), native=True)
     changed.events[0]["title"] = "Changed"
+    changed.markets[0]["question"] = "Changed question"
     changed.memberships = {"1": []}
     changed.parent_event_ids = {"77"}
     renewed = {"cursor": "new", "fetch_pending": None, "new_progress": {"done": True}}
@@ -192,3 +216,129 @@ def test_late_sql_oom_rolls_back_every_table_and_retry_matches_clean_apply(db):
         assert store.apply(clean, changed, renewed) == retried
         assert snapshot(db) == snapshot(clean)
     assert store.validate_store(db)["valid"]
+
+
+def test_explicit_null_in_full_identity_json_is_preserved_without_domain_change(db):
+    store.apply(db, packet())
+    refreshed = packet(2)
+    for outcome in refreshed.outcomes:
+        outcome["position_id"] = None
+    recorded = RecordedConnection(db)
+    result = store.apply(recorded, refreshed)
+    assert "_identity" in recorded.written_tables
+    assert "outcomes" not in recorded.written_tables
+    assert result["changed"] is False
+    candidate, accepted = db.execute("SELECT candidate,accepted FROM _identity").fetchone()
+    assert json.loads(candidate) == refreshed.outcomes
+    assert json.loads(accepted) == refreshed.outcomes
+    assert store.validate_store(db)["valid"]
+
+
+def test_owner_claim_repair_preserves_other_market_and_other_venue(db):
+    store.apply(db, packet())
+    store.apply(db, packet(market="3", assets=("201", "202")))
+    foreign = packet()
+    for row in [*foreign.events, *foreign.markets, *foreign.outcomes]:
+        row["venue"] = "other-venue"
+    store.apply(db, foreign)
+    protected_claims = db.execute(
+        "SELECT * FROM _identity_claims WHERE venue<>'polymarket' OR market_id<>'2' ORDER BY ALL"
+    ).fetchall()
+    protected_identities = db.execute(
+        "SELECT * FROM _identity WHERE venue<>'polymarket' OR market_id<>'2' ORDER BY ALL"
+    ).fetchall()
+    expected = db.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall()
+    db.execute(
+        "INSERT INTO _identity_claims VALUES ('polymarket','2','candidate','ctf_token','999')"
+    )
+    store.apply(db, packet(2))
+    assert db.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall() == expected
+    assert (
+        db.execute(
+            "SELECT * FROM _identity_claims WHERE venue<>'polymarket' OR market_id<>'2' ORDER BY ALL"
+        ).fetchall()
+        == protected_claims
+    )
+    assert (
+        db.execute(
+            "SELECT * FROM _identity WHERE venue<>'polymarket' OR market_id<>'2' ORDER BY ALL"
+        ).fetchall()
+        == protected_identities
+    )
+    assert store.validate_store(db)["valid"]
+
+
+@pytest.mark.parametrize("order", ["older-time", "equal", "earlier-id", "later-id"])
+def test_response_timestamp_and_id_order_survives_write_suppression(db, order):
+    current = packet(2)
+    current.response_id = "b"
+    store.apply(db, current)
+    before = snapshot(db)
+    incoming = packet(1 if order == "older-time" else 2)
+    incoming.response_id = {"older-time": "z", "equal": "b", "earlier-id": "a", "later-id": "c"}[
+        order
+    ]
+    incoming.events[0]["title"] = None
+    incoming.markets[0]["question"] = None
+    incoming.outcomes[0]["outcome_label"] = "Changed label"
+    incoming.memberships = {"1": []}
+    recorded = RecordedConnection(db)
+    result = store.apply(recorded, incoming)
+    if order == "later-id":
+        assert result["changed"] is True
+        assert result["generation"] == 2
+        assert db.execute("SELECT title FROM events").fetchone() == (None,)
+        assert db.execute("SELECT question FROM markets").fetchone() == (None,)
+        assert db.execute("SELECT * FROM event_markets").fetchall() == []
+        assert db.execute(
+            "SELECT outcome_label FROM outcomes WHERE outcome_index=1"
+        ).fetchone() == ("Changed label",)
+        assert db.execute("SELECT DISTINCT response FROM _receipts").fetchall() == [("c",)]
+    else:
+        assert result["changed"] is False
+        assert_no_wide_rewrites(recorded)
+        assert snapshot(db) == before
+    assert store.validate_store(db)["valid"]
+
+
+@pytest.mark.parametrize("shape", ["absent", "unknown", "empty"])
+def test_membership_omission_remains_distinct_from_complete_empty_response(db, shape):
+    store.apply(db, packet())
+    db.execute("INSERT INTO _parent_repairs VALUES ('1')")
+    refreshed = packet(2)
+    refreshed.memberships = {"absent": {}, "unknown": {"1": None}, "empty": {"1": []}}[shape]
+    recorded = RecordedConnection(db)
+    result = store.apply(recorded, refreshed)
+    assert ("event_markets" in recorded.written_tables) == (shape == "empty")
+    assert "outcomes" not in recorded.written_tables
+    assert result["changed"] == (shape == "empty")
+    assert db.execute("SELECT market_id FROM event_markets").fetchall() == (
+        [] if shape == "empty" else [("2",)]
+    )
+    stamp = datetime(2026, 1, 2 if shape == "empty" else 1, tzinfo=UTC)
+    latest = datetime(2026, 1, 1 if shape == "absent" else 2, tzinfo=UTC)
+    assert db.execute("SELECT receipt,latest_receipt,unresolved FROM _membership").fetchone() == (
+        stamp,
+        latest,
+        shape == "unknown",
+    )
+    assert db.execute("SELECT * FROM _parent_repairs").fetchall() == (
+        [] if shape == "empty" else [("1",)]
+    )
+
+
+def test_complete_empty_membership_noop_still_renews_receipt_and_clears_repair(db):
+    first, second = packet(), packet(2)
+    first.memberships = second.memberships = {"1": []}
+    store.apply(db, first)
+    db.execute("INSERT INTO _parent_repairs VALUES ('1')")
+    recorded = RecordedConnection(db)
+    result = store.apply(recorded, second)
+    assert_no_wide_rewrites(recorded)
+    assert result["changed"] is False
+    assert db.execute("SELECT receipt,latest_receipt,unresolved FROM _membership").fetchone() == (
+        datetime(2026, 1, 2, tzinfo=UTC),
+        datetime(2026, 1, 2, tzinfo=UTC),
+        False,
+    )
+    assert db.execute("SELECT * FROM _parent_repairs").fetchall() == []

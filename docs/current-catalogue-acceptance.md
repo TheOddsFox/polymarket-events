@@ -42,6 +42,16 @@ committed it in 51.708 seconds with zero provider requests, cleared pending work
 and preserved generation and the published pointer. This is response recovery
 evidence, not a completed sustained-capacity measurement.
 
+Further full-source reconciliation exposed checkpoint write amplification. A
+one-second CPU sample of the running worker found both SQL threads checkpointing
+and recompressing columns after an unchanged response. The current implementation
+also compares exact event, market, membership and identity values before replacing
+them. Claims are compared against the complete stored owner multiset, so duplicate,
+missing and stray claims still require repair. Existing receipts update their
+non-key fields. Receipt renewal, conflict processing, progress and checkpoint
+durability remain mandatory. Committed full-scale measurements are required to
+qualify the resulting throughput; rollback-only tests exclude checkpoint cost.
+
 A separate deterministic regression demonstrated that restarting a completed
 historical rotation at 58 days can miss the 60-day receipt target even when every
 request succeeds. Completed historical cycles now become eligible after 30 days,

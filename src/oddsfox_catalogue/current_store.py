@@ -100,7 +100,13 @@ def _newer(conn, kind, venue, key, stamp):
     ).fetchone()
     if old and stamp <= tuple(old):
         return False
-    conn.execute("INSERT OR REPLACE INTO _receipts VALUES (?,?,?,?,?)", [kind, venue, key, *stamp])
+    if old:
+        conn.execute(
+            "UPDATE _receipts SET receipt=?,response=? WHERE kind=? AND venue=? AND id=?",
+            [*stamp, kind, venue, key],
+        )
+    else:
+        conn.execute("INSERT INTO _receipts VALUES (?,?,?,?,?)", [kind, venue, key, *stamp])
     return True
 
 
@@ -144,7 +150,9 @@ def apply(conn, response: ResponseRows, progress=None):
         for row in response.events:
             venue, key = row["venue"], row["event_id"]
             before = _snapshot(conn, "events", "venue=? AND event_id=?", [venue, key])
-            if _newer(conn, "event", venue, key, stamp):
+            if _newer(conn, "event", venue, key, stamp) and before != [
+                tuple(row.get(name) for name in columns("events"))
+            ]:
                 _put(conn, "events", row)
             changed |= before != _snapshot(conn, "events", "venue=? AND event_id=?", [venue, key])
         for event_id, members in response.memberships.items():
@@ -168,13 +176,17 @@ def apply(conn, response: ResponseRows, progress=None):
             if members is None or (old and old[0] and stamp <= tuple(old[:2])):
                 continue
             before = _snapshot(conn, "event_markets", "venue=? AND event_id=?", [venue, event_id])
-            conn.execute(
-                "DELETE FROM event_markets WHERE venue=? AND event_id=?", [venue, event_id]
-            )
-            for market_id in set(members):
-                _put(
-                    conn, "event_markets", dict(venue=venue, event_id=event_id, market_id=market_id)
+            expected_links = sorted((venue, event_id, market_id) for market_id in set(members))
+            if before != expected_links:
+                conn.execute(
+                    "DELETE FROM event_markets WHERE venue=? AND event_id=?", [venue, event_id]
                 )
+                for market_id in set(members):
+                    _put(
+                        conn,
+                        "event_markets",
+                        dict(venue=venue, event_id=event_id, market_id=market_id),
+                    )
             conn.execute(
                 "UPDATE _membership SET receipt=?,response=? WHERE venue=? AND event_id=?",
                 [*stamp, venue, event_id],
@@ -260,18 +272,38 @@ def apply(conn, response: ResponseRows, progress=None):
                 accepted = candidate
             if candidate is None and old and old[0]:
                 candidate = json.loads(old[0])
-            _put(conn, "markets", row)
-            conn.execute(
-                "INSERT OR REPLACE INTO _identity VALUES (?,?,?,?,?,?)",
-                [
-                    venue,
-                    market_id,
-                    json.dumps(candidate) if candidate else None,
-                    json.dumps(accepted) if accepted else None,
-                    invalid[0] if invalid else None,
-                    invalid[1] if invalid else None,
-                ],
+            if before_markets[(venue, market_id)] != [
+                tuple(row.get(name) for name in columns("markets"))
+            ]:
+                _put(conn, "markets", row)
+            identity_values = (
+                candidate if candidate else None,
+                accepted if accepted else None,
+                invalid[0] if invalid else None,
+                invalid[1] if invalid else None,
             )
+            old_values = (
+                (
+                    json.loads(old[0]) if old[0] else None,
+                    json.loads(old[1]) if old[1] else None,
+                    old[2],
+                    old[3],
+                )
+                if old
+                else None
+            )
+            if old_values != identity_values:
+                conn.execute(
+                    "INSERT OR REPLACE INTO _identity VALUES (?,?,?,?,?,?)",
+                    [
+                        venue,
+                        market_id,
+                        json.dumps(candidate) if candidate else None,
+                        json.dumps(accepted) if accepted else None,
+                        identity_values[2],
+                        identity_values[3],
+                    ],
+                )
             for (claim_venue, _kind, _asset), owners in claims.items():
                 if claim_venue == venue:
                     owners.pop(market_id, None)
@@ -284,6 +316,21 @@ def apply(conn, response: ResponseRows, progress=None):
                     )
                     replacement.append((venue, market_id, role, kind, asset))
             replacements[(venue, market_id)] = replacement
+        if replacements:
+            values = ",".join("(?,?)" for _ in replacements)
+            stored_claims = {}
+            for claim in conn.execute(
+                "SELECT c.venue,c.market_id,c.role,c.asset_kind,c.asset_id FROM _identity_claims c "
+                f"JOIN (VALUES {values}) k(venue,market_id) "
+                "ON c.venue=k.venue AND c.market_id=k.market_id",
+                [value for key in replacements for value in key],
+            ).fetchall():
+                stored_claims.setdefault(claim[:2], []).append(claim)
+            replacements = {
+                key: replacement
+                for key, replacement in replacements.items()
+                if sorted(stored_claims.get(key, [])) != sorted(set(replacement))
+            }
         if replacements:
             values = ",".join("(?,?)" for _ in replacements)
             conn.execute(

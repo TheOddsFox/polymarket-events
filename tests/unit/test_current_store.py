@@ -228,7 +228,37 @@ def test_claim_scans_are_batched_per_response(db):
         response.outcomes.extend(item.outcomes)
     counted = CountingConnection(db)
     apply(counted, response)
-    assert len(counted.claim_queries) == 2
+    assert len(counted.claim_queries) == 3
     assert counted.claim_queries[0].startswith("SELECT")
     assert "JOIN (VALUES" in counted.claim_queries[0]
-    assert counted.claim_queries[1].startswith("DELETE")
+    assert counted.claim_queries[1].startswith("SELECT")
+    assert "k(venue,market_id)" in counted.claim_queries[1]
+    assert "JOIN (VALUES" in counted.claim_queries[1]
+    assert counted.claim_queries[2].startswith("DELETE")
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "stray", "missing"])
+def test_unchanged_identity_repairs_actual_owner_claims(db, corruption):
+    apply(db, packet())
+    expected = db.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall()
+    if corruption == "duplicate":
+        db.execute("INSERT INTO _identity_claims SELECT * FROM _identity_claims LIMIT 1")
+    elif corruption == "stray":
+        db.execute(
+            "INSERT INTO _identity_claims VALUES ('polymarket','2','candidate','ctf_token','999')"
+        )
+    else:
+        db.execute("DELETE FROM _identity_claims WHERE role='candidate'")
+    result = apply(db, packet(2))
+    assert result["changed"] is False
+    assert db.execute("SELECT * FROM _identity_claims ORDER BY ALL").fetchall() == expected
+    assert validate_store(db)["valid"]
+
+
+def test_unchanged_complete_membership_repairs_duplicate_links(db):
+    apply(db, packet())
+    db.execute("INSERT INTO event_markets SELECT * FROM event_markets")
+    result = apply(db, packet(2))
+    assert result["changed"] is True
+    assert db.execute("SELECT * FROM event_markets").fetchall() == [("polymarket", "1", "2")]
+    assert validate_store(db)["valid"]
