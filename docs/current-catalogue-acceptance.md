@@ -23,6 +23,10 @@ restore verification, exact identities, atomicity and all other resource and
 integrity safeguards remain required. Schedules stay disabled. Explicit old root
 configuration remains in force until the operator updates it.
 
+The operator selected one daily backup attempt. The disabled template uses 03:55
+Europe/Zurich; report recovery-point gaps above 24 hours rather than assuming one
+daily start guarantees that interval between successful completions.
+
 The three-case normal-refresh timing and fresh-root provisioning/headroom gates
 passed below. Deployment acceptance remains open for sustained freshness.
 Git delivery also requires hosted CI for the exact delivered commit.

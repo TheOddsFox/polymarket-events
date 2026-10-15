@@ -311,11 +311,12 @@ The Makefile frontends wrap this CLI; inspect the Makefile for current targets. 
 capture/load/dbt/replay/rebuild/validate commands are retired and reject use here.
 [The cron example](../ops/catalogue.cron.example) is **disabled template text only**:
 all lines are comments. It illustrates hourly refresh, offset hourly reconcile,
-and twice-daily backup attempts with an external root and absolute installed executable
-placeholders. Backup retention keeps one archive per date. The two backup slots avoid
-Europe/Zurich's skipped or repeated 02:00 hour and leave margin for variable completion
-times; failed or busy attempts still require operator attention. These slots alone
-do not prove the 24-hour recovery-point target or reconciliation capacity.
+and one daily backup attempt with an external root and absolute installed executable
+placeholders. The operator selected one slot at 03:55, avoiding Europe/Zurich's
+skipped or repeated 02:00 hour. Backup retention keeps seven daily archives, one
+per date. Variable runtimes, failed or busy attempts can produce recovery-point
+gaps above 24 hours; report those misses and require operator attention. The slot
+does not prove the recovery-point target or reconciliation capacity.
 Do not activate it until import/probe, recovery, installed verification, and representative
 benchmark evidence support the chosen provider and cadence.
 
