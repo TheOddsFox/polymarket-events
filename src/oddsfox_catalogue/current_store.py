@@ -117,6 +117,28 @@ def _snapshot(conn, table, predicate, params):
     ).fetchall()
 
 
+def _market_snapshots(conn, table, keys):
+    keys = list(dict.fromkeys(keys))
+    snapshots = {key: [] for key in keys}
+    fields = (
+        projection(table)
+        if table in SCHEMAS
+        else "venue,market_id,candidate,accepted,invalidated_at,invalidated_response"
+    )
+    ordering = KEYS[table] if table in SCHEMAS else ("venue", "market_id")
+    for start in range(0, len(keys), 1000):
+        batch = keys[start : start + 1000]
+        values = ",".join("(?,?)" for _ in batch)
+        rows = conn.execute(
+            f"SELECT {fields} FROM {table} JOIN (VALUES {values}) k(venue,market_id) "
+            f"USING (venue,market_id) ORDER BY {', '.join(ordering)}",
+            [value for key in batch for value in key],
+        ).fetchall()
+        for row in rows:
+            snapshots[row[:2]].append(row)
+    return snapshots
+
+
 def _identity_key(mapping):
     return [
         tuple(
@@ -195,26 +217,14 @@ def apply(conn, response: ResponseRows, progress=None):
             changed |= before != _snapshot(
                 conn, "event_markets", "venue=? AND event_id=?", [venue, event_id]
             )
-        impacted = set()
-        before_markets = {}
-        before_outcomes = {}
-
-        def remember(venue, market_id):
-            key = (venue, market_id)
-            if key not in impacted:
-                impacted.add(key)
-                before_markets[key] = _snapshot(conn, "markets", "venue=? AND market_id=?", key)
-                before_outcomes[key] = _snapshot(conn, "outcomes", "venue=? AND market_id=?", key)
-
-        old_identities = {}
+        incoming = {(row["venue"], row["market_id"]) for row in response.markets}
+        impacted = set(incoming)
+        old_identities = {
+            key: rows[0][2:] if rows else None
+            for key, rows in _market_snapshots(conn, "_identity", incoming).items()
+        }
         asset_keys = {(o["venue"], o["asset_kind"], o["asset_id"]) for o in response.outcomes}
-        for row in response.markets:
-            key = (row["venue"], row["market_id"])
-            old = conn.execute(
-                "SELECT candidate,accepted,invalidated_at,invalidated_response FROM _identity WHERE venue=? AND market_id=?",
-                key,
-            ).fetchone()
-            old_identities[key] = old
+        for key, old in old_identities.items():
             for mapping in old[:2] if old else []:
                 for outcome in json.loads(mapping) if mapping else []:
                     asset_keys.add((key[0], outcome["asset_kind"], outcome["asset_id"]))
@@ -229,11 +239,12 @@ def apply(conn, response: ResponseRows, progress=None):
             ).fetchall()
             for venue, market_id, role, kind, asset in matched:
                 claims.setdefault((venue, kind, asset), {}).setdefault(market_id, set()).add(role)
-                remember(venue, market_id)
+                impacted.add((venue, market_id))
+        before_markets = _market_snapshots(conn, "markets", impacted)
+        before_outcomes = _market_snapshots(conn, "outcomes", impacted)
         replacements = {}
         for row in response.markets:
             venue, market_id = row["venue"], row["market_id"]
-            remember(venue, market_id)
             if not _newer(conn, "market", venue, market_id, stamp):
                 continue
             outcomes = [
@@ -316,6 +327,7 @@ def apply(conn, response: ResponseRows, progress=None):
                     )
                     replacement.append((venue, market_id, role, kind, asset))
             replacements[(venue, market_id)] = replacement
+        del old_identities
         if replacements:
             values = ",".join("(?,?)" for _ in replacements)
             stored_claims = {}
@@ -348,11 +360,10 @@ def apply(conn, response: ResponseRows, progress=None):
             if len(owners) > 1
             for market_id in owners
         }
+        final_identities = _market_snapshots(conn, "_identity", impacted)
         for venue, market_id in impacted:
-            identity = conn.execute(
-                "SELECT candidate,accepted,invalidated_at FROM _identity WHERE venue=? AND market_id=?",
-                [venue, market_id],
-            ).fetchone()
+            rows = final_identities.pop((venue, market_id))
+            identity = rows[0][2:] if rows else None
             conflict = (venue, market_id) in conflicts
             if conflict:
                 conn.execute(
@@ -391,11 +402,13 @@ def apply(conn, response: ResponseRows, progress=None):
                 )
                 for outcome in outcomes:
                     _put(conn, "outcomes", outcome)
-            changed |= before_markets[(venue, market_id)] != _snapshot(
-                conn, "markets", "venue=? AND market_id=?", [venue, market_id]
-            ) or before_outcomes[(venue, market_id)] != _snapshot(
-                conn, "outcomes", "venue=? AND market_id=?", [venue, market_id]
-            )
+        del final_identities
+        after_markets = _market_snapshots(conn, "markets", impacted)
+        changed |= before_markets != after_markets
+        del before_markets, after_markets
+        after_outcomes = _market_snapshots(conn, "outcomes", impacted)
+        changed |= before_outcomes != after_outcomes
+        del before_outcomes, after_outcomes
         for event_id in response.parent_event_ids:
             conn.execute("INSERT OR IGNORE INTO _parent_repairs VALUES (?)", [event_id])
         for key, value in (progress or {}).items():

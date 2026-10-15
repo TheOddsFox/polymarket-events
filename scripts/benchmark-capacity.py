@@ -10,6 +10,7 @@ import math
 import os
 import shutil
 import signal
+import stat
 import sys
 import time
 from dataclasses import asdict
@@ -98,10 +99,31 @@ def paths(args):
 def capacity(roots, root, output):
     limits = CurrentLimits()
     usage = {str(p): accounting.aggregate_usage(p) for p in roots}
+    audit = output / "source.jsonl"
+    try:
+        audit_info = audit.lstat()
+    except FileNotFoundError:
+        audit_bytes = 0
+    else:
+        if not stat.S_ISREG(audit_info.st_mode):
+            raise ValueError("source audit must be a regular file")
+        audit_bytes = audit_info.st_size
+    # Subtract output occupancy only from the same measurement included in total.
+    usage[str(output)] = accounting.aggregate_usage(output)
+    if usage[str(output)].get("symlink_count", 0):
+        raise ValueError("evidence output contains a symlink")
+    ancillary = usage[str(output)]["logical_owned_bytes"] - audit_bytes
+    if audit_bytes > MAX_AUDIT_BYTES or ancillary < 0 or ancillary > ANCILLARY_BYTES:
+        raise ValueError("evidence output capacity exhausted")
     total = sum(v["logical_owned_bytes"] for v in usage.values())
     candidate = accounting.aggregate_usage(root)["logical_owned_bytes"]
-    # Reserve the entire remaining runtime allowance, plus bounded source audit.
-    reserved = max(0, limits.max_retained_bytes - candidate) + MAX_AUDIT_BYTES + ANCILLARY_BYTES
+    reserved = (
+        max(0, limits.max_retained_bytes - candidate)
+        + MAX_AUDIT_BYTES
+        - audit_bytes
+        + ANCILLARY_BYTES
+        - ancillary
+    )
     if candidate > limits.max_retained_bytes or total + reserved > 256 * 1024**3:
         raise ValueError("combined retained capacity exhausted")
     if shutil.disk_usage(output).free < limits.free_reserve_bytes + reserved:

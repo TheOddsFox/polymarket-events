@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 from argparse import Namespace
 from inspect import signature
 from pathlib import Path
@@ -32,6 +33,84 @@ def test_audit_reservation_matches_enforced_provider_bound(tmp_path, monkeypatch
     assert signature(capacity.CapacitySource).parameters["max_audit_bytes"].default == (
         capacity.MAX_AUDIT_BYTES
     )
+
+
+@pytest.mark.parametrize("audit,ancillary", [(0, 0), (7, 3), (16, 8)])
+def test_output_occupancy_keeps_peak_constant(tmp_path, monkeypatch, audit, ancillary):
+    root, output = tmp_path / "root", tmp_path / "output"
+    root.mkdir()
+    output.mkdir()
+    (output / "source.jsonl").write_bytes(b"a" * audit)
+    (output / "child.log").write_bytes(b"x" * ancillary)
+    monkeypatch.setattr(capacity, "MAX_AUDIT_BYTES", 16)
+    monkeypatch.setattr(capacity, "ANCILLARY_BYTES", 8)
+    monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _: SimpleNamespace(free=2**50))
+    measured = capacity.capacity([root, output], root, output)
+    assert measured["total_bytes"] == audit + ancillary
+    assert measured["reserved_bytes"] == (
+        capacity.CurrentLimits().max_retained_bytes + 24 - audit - ancillary
+    )
+    assert measured["total_bytes"] + measured["reserved_bytes"] == (
+        capacity.CurrentLimits().max_retained_bytes + 24
+    )
+
+
+@pytest.mark.parametrize("audit,ancillary", [(17, 0), (0, 9)])
+def test_output_budget_plus_one_rejected(tmp_path, monkeypatch, audit, ancillary):
+    (tmp_path / "source.jsonl").write_bytes(b"a" * audit)
+    (tmp_path / "child.log").write_bytes(b"x" * ancillary)
+    monkeypatch.setattr(capacity, "MAX_AUDIT_BYTES", 16)
+    monkeypatch.setattr(capacity, "ANCILLARY_BYTES", 8)
+    with pytest.raises(ValueError, match="evidence output capacity exhausted"):
+        capacity.capacity([tmp_path], tmp_path, tmp_path)
+
+
+def test_output_measurement_refreshed_before_total(tmp_path, monkeypatch):
+    (tmp_path / "source.jsonl").write_bytes(b"audit")
+    measurements = iter((0, 8, 0))
+    monkeypatch.setattr(
+        capacity.accounting,
+        "aggregate_usage",
+        lambda _: {"logical_owned_bytes": next(measurements)},
+    )
+    monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _: SimpleNamespace(free=2**50))
+    measured = capacity.capacity([tmp_path], tmp_path, tmp_path)
+    assert measured["total_bytes"] == 8
+    assert measured["total_bytes"] + measured["reserved_bytes"] == (
+        capacity.CurrentLimits().max_retained_bytes
+        + capacity.MAX_AUDIT_BYTES
+        + capacity.ANCILLARY_BYTES
+    )
+
+
+def test_audit_larger_than_accounted_output_rejected(tmp_path, monkeypatch):
+    (tmp_path / "source.jsonl").write_bytes(b"audit")
+    monkeypatch.setattr(
+        capacity.accounting, "aggregate_usage", lambda _: {"logical_owned_bytes": 4}
+    )
+    with pytest.raises(ValueError, match="evidence output capacity exhausted"):
+        capacity.capacity([tmp_path], tmp_path, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "name,kind",
+    [
+        ("source.jsonl", "symlink"),
+        ("source.jsonl", "directory"),
+        ("child.log", "symlink"),
+        ("child.log", "fifo"),
+    ],
+)
+def test_output_rejects_nonregular_evidence(tmp_path, name, kind):
+    path = tmp_path / name
+    if kind == "symlink":
+        path.symlink_to(tmp_path / "missing")
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        os.mkfifo(path)
+    with pytest.raises(ValueError):
+        capacity.capacity([tmp_path], tmp_path, tmp_path)
 
 
 def test_child_environment(monkeypatch):
@@ -302,3 +381,49 @@ def test_log_budget_counts_failed_logs(tmp_path):
     assert (
         capacity.log_budget(tmp_path) == capacity.ANCILLARY_BYTES - 2 * capacity.REPORT_BYTES - 10
     )
+
+
+def test_combined_capacity_accepts_exact_peak_and_rejects_one_extra_byte(tmp_path, monkeypatch):
+    root, output, legacy = tmp_path / "root", tmp_path / "output", tmp_path / "legacy"
+    output.mkdir()
+    (output / "source.jsonl").write_bytes(b"1234567")
+    (output / "child.log").write_bytes(b"abc")
+    limits = capacity.CurrentLimits()
+    ceiling = 256 * 1024**3
+    sizes = {
+        root: limits.max_retained_bytes,
+        output: 10,
+        legacy: ceiling
+        - limits.max_retained_bytes
+        - capacity.MAX_AUDIT_BYTES
+        - capacity.ANCILLARY_BYTES,
+    }
+    monkeypatch.setattr(
+        capacity.accounting, "aggregate_usage", lambda path: {"logical_owned_bytes": sizes[path]}
+    )
+    monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _: SimpleNamespace(free=2**50))
+    measured = capacity.capacity([root, output, legacy], root, output)
+    assert measured["total_bytes"] + measured["reserved_bytes"] == ceiling
+    sizes[legacy] += 1
+    with pytest.raises(ValueError, match="combined retained capacity exhausted"):
+        capacity.capacity([root, output, legacy], root, output)
+
+
+def test_free_reserve_uses_remaining_output_allowance_at_exact_boundary(tmp_path, monkeypatch):
+    root, output = tmp_path / "root", tmp_path / "output"
+    output.mkdir()
+    (output / "source.jsonl").write_bytes(b"1234567")
+    (output / "child.log").write_bytes(b"abc")
+    limits = capacity.CurrentLimits()
+    sizes = {root: limits.max_retained_bytes, output: 10}
+    remaining = capacity.MAX_AUDIT_BYTES + capacity.ANCILLARY_BYTES - 10
+    free = [limits.free_reserve_bytes + remaining]
+    monkeypatch.setattr(
+        capacity.accounting, "aggregate_usage", lambda path: {"logical_owned_bytes": sizes[path]}
+    )
+    monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _: SimpleNamespace(free=free[0]))
+    measured = capacity.capacity([root, output], root, output)
+    assert measured["reserved_bytes"] == remaining
+    free[0] -= 1
+    with pytest.raises(ValueError, match="free disk reserve unavailable"):
+        capacity.capacity([root, output], root, output)

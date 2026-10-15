@@ -262,3 +262,23 @@ def test_unchanged_complete_membership_repairs_duplicate_links(db):
     assert result["changed"] is True
     assert db.execute("SELECT * FROM event_markets").fetchall() == [("polymarket", "1", "2")]
     assert validate_store(db)["valid"]
+
+
+def test_conflict_batches_snapshot_incumbent_outside_response(db):
+    incumbent = packet()
+    incumbent.events = []
+    incumbent.memberships = {}
+    apply(db, incumbent)
+    contender = packet(2, market="3")
+    contender.events = []
+    contender.memberships = {}
+    assert apply(db, contender)["changed"]
+    assert generation(db) == 2
+    assert db.execute(
+        "SELECT market_id,usable,identity_error FROM markets ORDER BY market_id"
+    ).fetchall() == [
+        ("2", False, "asset_ownership_conflict"),
+        ("3", False, "asset_ownership_conflict"),
+    ]
+    assert db.execute("SELECT count(*) FROM outcomes").fetchone() == (0,)
+    assert not apply(db, contender)["changed"]

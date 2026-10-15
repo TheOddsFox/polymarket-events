@@ -4,4 +4,6 @@
 # One worker only. Busy exits 3; inspect status and retry at most twice with delay.
 # 0 * * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 refresh
 # 30 * * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 reconcile
-# 55 2 * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 backup create
+# Two attempts twelve hours apart; retention still keeps one archive per date.
+# These times avoid the skipped/repeated 02:00 hour in Europe/Zurich.
+# 55 3,15 * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 backup create
