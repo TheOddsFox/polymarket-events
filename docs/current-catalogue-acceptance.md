@@ -70,20 +70,60 @@ rotation completion or a daily recovery-point target.
 
 ### Software verification under the approved policy
 
-On 2026-10-15, both `scripts/verify-fast` and `scripts/verify` passed after the
-oracle fix: 1,362 tests,
-one optional consumer skip, lint and formatting; the completion gate also checked
-and synchronized the unchanged lockfile. The three metadata adapter tests passed
-separately in the sibling consumer environment. That consumer also loaded the
-installed producer's bundle with exact CTF and v2 position identities.
+The final point-read implementation passed both native gates after removing the
+slower candidate: 1,468 tests passed with one optional consumer skip.
+`scripts/verify-fast` took 229.50 seconds and `scripts/verify` took 214.11 seconds;
+lint, formatting, diff and lockfile checks passed. These runs overlapped read-only
+benchmark-copy hashing and are not performance measurements.
 
-The installed wheel and sdist passed distribution audits. Its isolated offline
-workflow passed all 12 steps, including verified backup, fresh-root restore,
+All 28 installed production modules were checked against the restored repository
+and match the previously verified point-read wheel, SHA-256
+`16a339cf860a0a862c9549075cac79b9c4aa89713cfb1f21f536e3bf90aefa00`.
+Its 12-step installed offline workflow passed in 8.80 seconds. The native suite's
+optional skip is covered separately by the three sibling-consumer adapter tests
+and actual exact-identity bundle consumption described below. Hosted CI must
+still pass for the delivered commit.
+
+#### Rejected batched state reads
+
+A serial full-store comparison applied one genuinely captured response containing
+100 events, 1,194 markets and 2,376 outcomes to independent copies of the same
+database. The baseline completed application and COMMIT in 101.94 seconds; batched
+joins took 215.60 seconds. Read statements fell from 8,960 to 1,811, but elapsed
+time increased by 2.115 times. All eleven persisted tables, schemas and catalog
+definitions matched exactly, with no sampled spill. Baseline ran first; filesystem
+caches were not flushed. This single pair rejects the proposed optimization; it
+does not establish a repeatable speedup or full-workflow acceptance.
+
+The parent report rejected the candidate because application and COMMIT did not
+improve; its source-stability check passed. Preserve that failed performance gate
+and the pinned child results. The final runtime retains the baseline
+point reads; the rejected joined-read implementation and its dedicated tests are
+removed. Capacity accounting improvements are independent of that rejection.
+
+The rejected batched-read candidate passed `scripts/verify-fast` and
+`scripts/verify` on 2026-10-15: 1,485 tests and one optional
+consumer skip, in 188.16 and 186.33 seconds respectively. Lint, formatting and
+diff checks passed; the completion gate also checked and synchronized the unchanged
+lockfile. The three metadata adapter tests passed separately in the sibling consumer
+environment. That environment emitted one warning because its pytest installation
+lacks the producer's timeout plugin. The actual consumer also loaded the installed
+producer's bundle with all four exact CTF and v2 position identities.
+
+That rejected wheel and sdist passed distribution audits. Its isolated offline
+workflow passed all 12 steps in 9.03 seconds, including verified backup, fresh-root restore,
 restored verification and rebuild. Independent architecture, data, security and
 implementation reviews found no introduced blocking defects. These small-fixture
 results do not prove full-store performance or sustained reconciliation capacity.
 Local measurements do not establish exact-head CI; check the matching hosted run
 before deployment.
+
+The rejected wheel SHA-256 is
+`f4b198986815872eb2a05d8e070223793ef1d9ce899dfb71b0aba2d278f96bfe`.
+Do not deploy it or use these results as final point-read runtime verification.
+An initial offline build against an empty cache failed before installation;
+the successful retry used the existing populated cache. This was a build-cache
+failure, not a passed workflow or a relaxation of offline verification.
 
 The operator explicitly approved deleting five superseded generated copies after
 inventorying them: 32,267,492,248 bytes were removed. The pinned legacy release,
