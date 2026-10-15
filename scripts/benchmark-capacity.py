@@ -19,7 +19,7 @@ import duckdb
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
-from fakes.capacity_source import CapacitySource  # noqa: E402
+from fakes.capacity_source import MAX_AUDIT_BYTES, CapacitySource  # noqa: E402
 from oddsfox_catalogue.current_config import (  # noqa: E402
     CurrentLimits,
     load_current_settings,
@@ -101,7 +101,7 @@ def capacity(roots, root, output):
     total = sum(v["logical_owned_bytes"] for v in usage.values())
     candidate = accounting.aggregate_usage(root)["logical_owned_bytes"]
     # Reserve the entire remaining runtime allowance, plus bounded source audit.
-    reserved = max(0, limits.max_retained_bytes - candidate) + 256 * 1024**2 + ANCILLARY_BYTES
+    reserved = max(0, limits.max_retained_bytes - candidate) + MAX_AUDIT_BYTES + ANCILLARY_BYTES
     if candidate > limits.max_retained_bytes or total + reserved > 256 * 1024**3:
         raise ValueError("combined retained capacity exhausted")
     if shutil.disk_usage(output).free < limits.free_reserve_bytes + reserved:

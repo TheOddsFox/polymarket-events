@@ -6,7 +6,7 @@ from urllib.request import urlopen
 import duckdb
 import pytest
 
-from fakes.capacity_source import CapacitySource
+from fakes.capacity_source import MAX_AUDIT_BYTES, CapacitySource
 from fakes.world import make_event, make_market
 from oddsfox_catalogue.current_rows import project_response
 from oddsfox_catalogue.current_store import apply, initialize
@@ -82,6 +82,8 @@ def test_frozen_full_shapes_and_controls(seed, tmp_path):
 
 
 def test_bounds_and_audit_path(seed, tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="invalid source limits"):
+        CapacitySource(seed, tmp_path / "oversized-audit", max_audit_bytes=MAX_AUDIT_BYTES + 1)
     with pytest.raises(ValueError):
         CapacitySource(seed, seed / "audit", delay_s=0)
     with CapacitySource(seed, tmp_path / "small-audit", delay_s=0, max_audit_bytes=1) as source:

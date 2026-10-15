@@ -3,7 +3,9 @@
 import importlib.util
 import json
 from argparse import Namespace
+from inspect import signature
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -14,6 +16,22 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts/benchmark-capacity.py"
 spec = importlib.util.spec_from_file_location("capacity_benchmark", SCRIPT)
 capacity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(capacity)
+
+
+def test_audit_reservation_matches_enforced_provider_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        capacity.accounting, "aggregate_usage", lambda _: {"logical_owned_bytes": 0}
+    )
+    monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _: SimpleNamespace(free=2**50))
+    measured = capacity.capacity([tmp_path], tmp_path, tmp_path)
+    assert measured["reserved_bytes"] == (
+        capacity.CurrentLimits().max_retained_bytes
+        + capacity.MAX_AUDIT_BYTES
+        + capacity.ANCILLARY_BYTES
+    )
+    assert signature(capacity.CapacitySource).parameters["max_audit_bytes"].default == (
+        capacity.MAX_AUDIT_BYTES
+    )
 
 
 def test_child_environment(monkeypatch):

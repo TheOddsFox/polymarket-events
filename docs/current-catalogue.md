@@ -299,7 +299,9 @@ This checkout-only harness runs invocations consecutively. Its result is always
 characterization, never sustained acceptance: it does not exercise real hourly
 cadence, daily backups, long-term churn or genuine repeated active renewal.
 Backup mode is refused until its external verification workspace is accounted for.
-SQL spill is disabled; bounded audit, logs and reports are included in admission.
+SQL spill is disabled; the complete source audit is capped at 128 MiB, and bounded
+audit, logs and reports are included in admission. Audit exhaustion fails the run;
+evidence is never truncated to fit.
 `--max-total-seconds` bounds admission of child commands; accounting, SQL snapshots
 and cleanup can extend total elapsed time beyond it.
 Run it serially with other large workloads, retain partial reports after failure,

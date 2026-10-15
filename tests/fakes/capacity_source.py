@@ -16,12 +16,13 @@ import duckdb
 from oddsfox_catalogue.current_config import safe_path
 
 MAX_RESPONSE_BYTES = 16 * 1024**2
+MAX_AUDIT_BYTES = 128 * 1024**2
 _ID = re.compile(r"[1-9][0-9]{0,19}\Z")
 
 
 class CapacitySource:
     def __init__(
-        self, seed_root: Path, audit_path: Path, *, delay_s=0.3, max_audit_bytes=256 * 1024**2
+        self, seed_root: Path, audit_path: Path, *, delay_s=0.3, max_audit_bytes=MAX_AUDIT_BYTES
     ):
         self.seed_root = safe_path(Path(seed_root)).resolve(strict=True)
         self.db_path = self.seed_root / "catalogue.duckdb"
@@ -33,7 +34,7 @@ class CapacitySource:
                 raise ValueError("unsafe audit parent")
         if self.db_path.is_symlink() or not stat.S_ISREG(self.db_path.stat().st_mode):
             raise ValueError("seed database must be regular")
-        if not 0 <= delay_s <= 10 or not 0 < max_audit_bytes <= 256 * 1024**2:
+        if not 0 <= delay_s <= 10 or not 0 < max_audit_bytes <= MAX_AUDIT_BYTES:
             raise ValueError("invalid source limits")
         before = self.db_path.stat()
         self.conn = duckdb.connect(
@@ -47,6 +48,7 @@ class CapacitySource:
         self.stats = {
             "requests": 0,
             "audit_bytes": 0,
+            "max_audit_bytes": max_audit_bytes,
             "response_bytes": 0,
             "faults": 0,
             "http_attempts": 0,
