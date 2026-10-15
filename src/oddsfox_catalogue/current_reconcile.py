@@ -84,7 +84,8 @@ def _cold(conn, settings, now, state):
             if (
                 window.get("started_at") is None
                 and window["cycle"] is not None
-                and now.timestamp() - window["cycle"] < settings.limits.cold_recheck_s
+                and now.timestamp() - window["cycle"]
+                < min(settings.limits.cold_recheck_s, COLD_FRESHNESS_S // 2)
             ):
                 continue
             high = window.get("high")

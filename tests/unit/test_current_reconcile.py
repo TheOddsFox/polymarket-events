@@ -283,8 +283,14 @@ def test_urgent_event_overrides_persisted_cold_turn(setup):
     assert current_store.get_state(conn, "reconcile")["turn"] == 0
 
 
-def test_historical_cycle_freezes_frontier_and_restarts_from_start_time(setup):
+@pytest.mark.parametrize("interval_days,restart_days", [(58, 30), (10, 10)])
+def test_historical_cycle_freezes_frontier_and_restarts_from_start_time(
+    setup, interval_days, restart_days
+):
     settings, conn = setup
+    settings = replace(
+        settings, limits=replace(settings.limits, cold_recheck_s=interval_days * 86400)
+    )
     state = {"cold_slot": 2, "windows": {}}
     start = datetime(2026, 1, 1, tzinfo=UTC)
     current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 200}}})
@@ -298,11 +304,12 @@ def test_historical_cycle_freezes_frontier_and_restarts_from_start_time(setup):
     assert ids == list(range(101, 201))
     assert window == {"next": 1, "cycle": start.timestamp()}
     state["windows"][lane] = window
-    assert reconcile._cold(conn, settings, start + timedelta(days=57), state) is None
-    _, ids, _, window = reconcile._cold(conn, settings, start + timedelta(days=58), state)
+    restart_at = start + timedelta(days=restart_days)
+    assert reconcile._cold(conn, settings, restart_at - timedelta(seconds=1), state) is None
+    _, ids, _, window = reconcile._cold(conn, settings, restart_at, state)
     assert ids == list(range(1, 101))
     assert window["high"] == 400
-    assert window["started_at"] == (start + timedelta(days=58)).timestamp()
+    assert window["started_at"] == restart_at.timestamp()
 
 
 @pytest.mark.parametrize("frontier", [0, 100])
@@ -434,3 +441,80 @@ def test_retry_cooldown_boundary_does_not_refresh_omission(setup, elapsed, due):
     run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
     assert len(calls) == int(due)
     assert reconcile.freshness(conn, now=NOW)["active_overdue_count"] == 1
+
+
+def test_successful_daily_cold_units_keep_all_receipts_within_sixty_days(setup):
+    settings, conn = setup
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    conn.execute(
+        "INSERT INTO markets (venue,market_id,closed,usable,identity_error) "
+        "SELECT 'polymarket',i::VARCHAR,true,false,'CTF market lacks clobTokenIds' "
+        "FROM range(1,701) ids(i)"
+    )
+    conn.execute(
+        "INSERT INTO _receipts SELECT 'market',venue,market_id,?,'seed' FROM markets",
+        [start - timedelta(days=1)],
+    )
+    current_store.set_state(
+        conn,
+        "discovery",
+        {"lanes": {"events": {"frontier": 0}, "markets": {"frontier": 700}}},
+    )
+    current_store.set_state(conn, "reconcile", {"turn": 0, "cold_slot": 0, "windows": {}})
+    reconcile._initialize(conn)
+    observed = set()
+    selected = []
+    for day in range(80):
+        now = start + timedelta(days=day)
+        state = current_store.get_state(conn, "reconcile")
+        unit = reconcile._cold(conn, settings, now, state)
+        if unit is not None:
+            lane, ids, slot, window = unit
+            assert lane == "markets"
+            assert 1 <= len(ids) <= 100
+            observed.update(map(int, ids))
+            selected.append((day, slot, min(map(int, ids)), max(map(int, ids))))
+            # Every requested market returns successfully; only cold selection is under test.
+            conn.execute(
+                "UPDATE _receipts SET receipt=?,response=? WHERE kind='market' "
+                "AND id IN (SELECT unnest(?))",
+                [now, f"day-{day}", list(map(str, ids))],
+            )
+            state["cold_slot"] = (slot + 1) % 4
+            if window is not None:
+                state["windows"][lane] = window
+            state["turn"] = 0
+            current_store.set_state(conn, "reconcile", state)
+            reconcile._attempt(conn, lane, ids, now)
+        oldest_id, oldest_receipt = conn.execute(
+            "SELECT id,receipt FROM _receipts ORDER BY receipt,id LIMIT 1"
+        ).fetchone()
+        age = now - oldest_receipt
+        assert age <= timedelta(days=60), (
+            f"day {day}: market {oldest_id} is {age.days} days old despite successful daily "
+            f"cold units; initial rotation covered {len(observed)}/700 markets; "
+            f"recent selections (day,slot,first,last): {selected[-10:]}"
+        )
+    assert observed == set(range(1, 701))
+
+
+@pytest.mark.parametrize("age_days", [0, 31, 61])
+def test_in_progress_historical_window_keeps_original_frontier_and_start(setup, age_days):
+    settings, conn = setup
+    started = NOW - timedelta(days=age_days)
+    reconcile._initialize(conn)
+    current_store.set_state(conn, "discovery", {"lanes": {"events": {"frontier": 500}}})
+    state = {
+        "cold_slot": 2,
+        "windows": {
+            "events": {"next": 101, "cycle": None, "started_at": started.timestamp(), "high": 300}
+        },
+    }
+    lane, ids, slot, window = reconcile._cold(conn, settings, NOW, state)
+    assert (lane, ids, slot) == ("events", list(range(101, 201)), 2)
+    assert window == {"next": 201, "cycle": None, "started_at": started.timestamp(), "high": 300}
+    state["windows"][lane] = window
+    lane, ids, _, window = reconcile._cold(conn, settings, NOW + timedelta(days=1), state)
+    assert lane == "events"
+    assert ids == list(range(201, 301))
+    assert window == {"next": 1, "cycle": started.timestamp()}

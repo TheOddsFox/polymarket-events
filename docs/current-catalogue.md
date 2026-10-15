@@ -112,7 +112,11 @@ events, then rotates closed events, all known markets, and historical ID windows
 Event responses also update their embedded markets. Unlinked market corrections may
 wait for the 60-day cold rotation. Work survives between invocations.
 Historical rotations pin their ID bounds and measure the next cycle from the prior
-cycle's start; status reports range ages separately from entity receipt ages.
+cycle's start. Completed historical cycles become eligible again after 30 days
+(or a stricter configured cold interval), leaving time to finish before the
+60-day target. Individual cold entities remain due at 58 days. In-progress
+windows retain their frozen bounds; status reports range ages separately from
+entity receipt ages.
 `publish` explicitly builds a verified release; `current` and `verify` verify the pointer.
 `status` reports progress, backlog/freshness, unstarted or overdue historical ranges,
 last run, verified backup age, and a

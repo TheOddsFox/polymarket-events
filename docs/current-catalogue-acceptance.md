@@ -30,6 +30,34 @@ The historical 72,589,620,854-byte publication-capacity model fits the new
 103,079,215,104-byte ceiling. Seven-day growth remains unmeasured; the model does
 not guarantee future capacity or establish freshness throughput.
 
+### Full-source follow-up findings
+
+A full-source characterization exposed an allocation failure while applying a
+100-event response containing 2,263 markets and 4,526 outcomes. The baseline
+exhausted its unchanged 2 GB DuckDB limit during the final market snapshots.
+The transaction rolled back and preserved the public pointer and pending response.
+Skipping only exact, unchanged outcome rewrites allowed that identical response
+to reach commit under the same limits. An installed-runtime offline resume then
+committed it in 51.708 seconds with zero provider requests, cleared pending work,
+and preserved generation and the published pointer. This is response recovery
+evidence, not a completed sustained-capacity measurement.
+
+A separate deterministic regression demonstrated that restarting a completed
+historical rotation at 58 days can miss the 60-day receipt target even when every
+request succeeds. Completed historical cycles now become eligible after 30 days,
+or a stricter configured interval. Entity due thresholds remain 58 days and
+in-progress windows retain their frozen bounds. The additional historical work
+must be included in capacity and evidence-retention projections.
+
+`scripts/verify-capacity-content.py` provides a separate offline content oracle
+for the controlled full-source workload. It authenticates changed receipts against
+retained response bodies and the source audit, compares all four complete domain
+relations, and verifies the actual published generation and Parquet content.
+An explicitly accounted fresh `--temporary` directory permits at most the existing
+8 GiB SQL spill allowance; absent that option, spill is disabled. Run this proof
+serially under supervision. Its success alone does not establish scheduler capacity,
+rotation completion or a daily recovery-point target.
+
 ### Software verification under the approved policy
 
 On 2026-10-15, both `scripts/verify-fast` and `scripts/verify` passed after the

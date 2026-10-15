@@ -329,12 +329,20 @@ def apply(conn, response: ResponseRows, progress=None):
                 )
             )
             conn.execute(
-                "UPDATE markets SET usable=?,identity_error=? WHERE venue=? AND market_id=?",
-                [usable, error, venue, market_id],
+                "UPDATE markets SET usable=?,identity_error=? WHERE venue=? AND market_id=? "
+                "AND (usable IS DISTINCT FROM ? OR identity_error IS DISTINCT FROM ?)",
+                [usable, error, venue, market_id, usable, error],
             )
-            conn.execute("DELETE FROM outcomes WHERE venue=? AND market_id=?", [venue, market_id])
-            if usable:
-                for outcome in json.loads(identity[1]):
+            outcomes = json.loads(identity[1]) if usable else []
+            expected_outcomes = sorted(
+                (tuple(outcome.get(name) for name in columns("outcomes")) for outcome in outcomes),
+                key=lambda row: row[:2] + (row[3],),
+            )
+            if before_outcomes[(venue, market_id)] != expected_outcomes:
+                conn.execute(
+                    "DELETE FROM outcomes WHERE venue=? AND market_id=?", [venue, market_id]
+                )
+                for outcome in outcomes:
                     _put(conn, "outcomes", outcome)
             changed |= before_markets[(venue, market_id)] != _snapshot(
                 conn, "markets", "venue=? AND market_id=?", [venue, market_id]
