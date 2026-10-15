@@ -51,7 +51,7 @@ def setup(tmp_path, monkeypatch):
     conn.close()
 
 
-def seed(conn, records, age=20000):
+def seed(conn, records, age=21 * 3600):
     current_store.apply(
         conn,
         project_response(
@@ -95,7 +95,7 @@ def test_missing_membership_keeps_previous_complete_and_unresolved(setup):
 
 def test_closed_known_ids_and_historical_windows_revisit(setup):
     settings, conn = setup
-    seed(conn, [event(1, True)], age=31 * 86400)
+    seed(conn, [event(1, True)], age=61 * 86400)
     current_store.set_state(
         conn, "discovery", {"lanes": {"events": {"frontier": 3}, "markets": {"frontier": 2}}}
     )
@@ -165,8 +165,8 @@ def test_frozen_pending_repair_resumes_before_selection(setup):
 
 def test_three_active_batches_before_cold_and_persisted_turn(setup):
     settings, conn = setup
-    seed(conn, [event(key) for key in range(1, 401)], age=17000)
-    seed(conn, [event(999, True)], age=31 * 86400)
+    seed(conn, [event(key) for key in range(1, 401)], age=21 * 3600)
+    seed(conn, [event(999, True)], age=61 * 86400)
     calls = []
     run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
     assert len(calls) == 5
@@ -185,7 +185,7 @@ def test_unknown_lifecycle_is_due_and_native_404_preserves_market(setup):
         project_response(
             [market],
             "markets",
-            received_at=(NOW - timedelta(days=30)).isoformat(),
+            received_at=(NOW - timedelta(days=60)).isoformat(),
             response_id="market",
         ),
     )
@@ -226,9 +226,17 @@ def test_missing_parent_omission_is_bounded_and_empty_windows_leave_no_id_state(
 
 @pytest.mark.parametrize("closed", [False, True, None])
 @pytest.mark.parametrize(
-    "age_days,due", [(0, False), (5 / 24, False), (28, False), (29, True), (31, True)]
+    "age_days,due",
+    [
+        (0, False),
+        (5 / 24, False),
+        (58 - 1 / 86400, False),
+        (58, True),
+        (60 - 1 / 86400, True),
+        (60, True),
+    ],
 )
-def test_all_known_markets_use_monthly_cold_lane(setup, closed, age_days, due):
+def test_all_known_markets_use_sixty_day_cold_lane(setup, closed, age_days, due):
     settings, conn = setup
     market = {"id": "7", "closed": closed}
     current_store.apply(
@@ -253,12 +261,12 @@ def test_all_known_markets_use_monthly_cold_lane(setup, closed, age_days, due):
     status = reconcile.freshness(conn, now=NOW)
     assert status["active_count"] == status["active_overdue_count"] == 0
     assert status["cold_count"] == 1
-    assert status["cold_overdue_count"] == int(age_days >= 30)
+    assert status["cold_overdue_count"] == int(age_days >= 60)
 
 
-def test_active_event_rechecks_before_six_hour_target(setup):
+def test_active_event_rechecks_before_daily_target(setup):
     settings, conn = setup
-    seed(conn, [event(1)], age=4.5 * 3600)
+    seed(conn, [event(1)], age=20 * 3600)
     calls = []
     run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
     assert [r.url.params.get_list("id") for r in calls] == [["1"]]
@@ -266,8 +274,8 @@ def test_active_event_rechecks_before_six_hour_target(setup):
 
 def test_urgent_event_overrides_persisted_cold_turn(setup):
     settings, conn = setup
-    seed(conn, [event(1)], age=5 * 3600)
-    seed(conn, [event(999, True)], age=31 * 86400)
+    seed(conn, [event(1)], age=22 * 3600)
+    seed(conn, [event(999, True)], age=61 * 86400)
     current_store.set_state(conn, "reconcile", {"turn": 3, "cold_slot": 0, "windows": {}})
     calls = []
     run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
@@ -290,11 +298,11 @@ def test_historical_cycle_freezes_frontier_and_restarts_from_start_time(setup):
     assert ids == list(range(101, 201))
     assert window == {"next": 1, "cycle": start.timestamp()}
     state["windows"][lane] = window
-    assert reconcile._cold(conn, settings, start + timedelta(days=28), state) is None
-    _, ids, _, window = reconcile._cold(conn, settings, start + timedelta(days=29), state)
+    assert reconcile._cold(conn, settings, start + timedelta(days=57), state) is None
+    _, ids, _, window = reconcile._cold(conn, settings, start + timedelta(days=58), state)
     assert ids == list(range(1, 101))
     assert window["high"] == 400
-    assert window["started_at"] == (start + timedelta(days=29)).timestamp()
+    assert window["started_at"] == (start + timedelta(days=58)).timestamp()
 
 
 @pytest.mark.parametrize("frontier", [0, 100])
@@ -327,7 +335,7 @@ def test_legacy_partial_historical_cycle_pins_frontier_on_resume(setup):
 def test_historical_long_cycle_is_due_immediately_after_completion(setup):
     settings, conn = setup
     reconcile._initialize(conn)
-    started = NOW - timedelta(days=31)
+    started = NOW - timedelta(days=61)
     state = {
         "cold_slot": 2,
         "windows": {
@@ -379,3 +387,50 @@ def test_historical_market_progress_commits_only_after_all_passes(setup):
         current_sync.resume_pending(settings, conn, client)
     assert current_store.get_state(conn, "reconcile") == progress
     assert current_store.get_state(conn, "fetch_pending") is None
+
+
+@pytest.mark.parametrize("age,due", [(20 * 3600 - 1, False), (20 * 3600, True)])
+def test_active_due_boundary(setup, age, due):
+    settings, conn = setup
+    seed(conn, [event(1)], age=age)
+    calls = []
+    run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
+    assert len(calls) == int(due)
+
+
+@pytest.mark.parametrize("age,active_first", [(22 * 3600 - 1, False), (22 * 3600, True)])
+def test_active_urgency_boundary_preserves_cold_turn(setup, age, active_first):
+    settings, conn = setup
+    seed(conn, [event(1)], age=age)
+    seed(conn, [event(999, True)], age=61 * 86400)
+    current_store.set_state(conn, "reconcile", {"turn": 3, "cold_slot": 0, "windows": {}})
+    calls = []
+    run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
+    assert calls[0].url.params.get_list("id") == (["1"] if active_first else ["999"])
+
+
+@pytest.mark.parametrize("age,overdue", [(86400 - 1, False), (86400, True)])
+def test_active_status_uses_latest_complete_membership_receipt(setup, age, overdue):
+    _, conn = setup
+    seed(conn, [event(1)], age=age)
+    assert reconcile.freshness(conn, now=NOW)["active_overdue_count"] == int(overdue)
+    payload = event(1)
+    payload.pop("markets")
+    seed(conn, [payload], age=0)
+    status = reconcile.freshness(conn, now=NOW)
+    assert datetime.fromisoformat(status["active_oldest_complete_receipt"]) == NOW - timedelta(
+        seconds=age
+    )
+    assert status["active_overdue_count"] == 1
+
+
+@pytest.mark.parametrize("elapsed,due", [(3600 - 1, False), (3600, True)])
+def test_retry_cooldown_boundary_does_not_refresh_omission(setup, elapsed, due):
+    settings, conn = setup
+    seed(conn, [event(1)], age=86400)
+    reconcile._initialize(conn)
+    reconcile._attempt(conn, "events", ["1"], NOW - timedelta(seconds=elapsed))
+    calls = []
+    run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
+    assert len(calls) == int(due)
+    assert reconcile.freshness(conn, now=NOW)["active_overdue_count"] == 1

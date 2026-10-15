@@ -101,6 +101,8 @@ def execute(settings, operation, options, deadline):
             )
             result["backup_age_s"] = age
             result["recovery_point_overdue"] = age is None or age > 86400
+            result["recovery_scope"] = "local_only"
+            result["disk_failure_protection"] = False
             return result
         if operation in {"verify", "current"}:
             return verify_current(settings, connection=conn)
@@ -171,6 +173,10 @@ def execute(settings, operation, options, deadline):
                 exc.http_attempts = client.stats.requests
                 exc.downloaded_bytes = client.stats.downloaded_bytes
                 raise
+        if operation in {"refresh", "reconcile"}:
+            result["parent_event_repair_count"] = conn.execute(
+                "SELECT count(*) FROM _parent_repairs"
+            ).fetchone()[0]
         set_state(
             conn,
             "last_run",

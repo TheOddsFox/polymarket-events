@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import selectors
 import signal
 import stat
 import subprocess
@@ -21,6 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 
 from fakes.current_gamma import CurrentGammaServer  # noqa: E402
+from oddsfox_catalogue.current_config import CurrentLimits  # noqa: E402
 from oddsfox_catalogue.signals import SIGNALS, Terminated  # noqa: E402
 
 
@@ -83,21 +85,55 @@ def assert_accounting(report: dict, measured: dict, allowed_paths: set[str]) -> 
         raise ValueError("fixture observed source calls outside the acquisition steps")
 
 
-def run_command(argv: list[str], cwd: Path, env: dict[str, str], log: Path, timeout=600) -> None:
-    with log.open("w") as output:
+def run_command(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log: Path,
+    timeout=600,
+    *,
+    max_output_bytes: int | None = None,
+) -> None:
+    if max_output_bytes is not None and (type(max_output_bytes) is not int or max_output_bytes < 1):
+        raise ValueError("command output allowance must be a positive integer")
+    with log.open("wb") as output:
         with SIGNALS.hold() as started:
             process = subprocess.Popen(
                 argv,
                 cwd=cwd,
                 env=env,
-                stdout=output,
+                stdout=output if max_output_bytes is None else subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         try:
             if started.signum is not None:
                 raise Terminated(started.signum)
-            code = process.wait(timeout=timeout)
+            if max_output_bytes is not None:
+                deadline, written = time.monotonic() + timeout, 0
+                with selectors.DefaultSelector() as readable:
+                    readable.register(process.stdout, selectors.EVENT_READ)
+                    try:
+                        while readable.get_map():
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(argv, timeout)
+                            for key, _ in readable.select(remaining):
+                                block = os.read(key.fd, 65536)
+                                if not block:
+                                    readable.unregister(key.fileobj)
+                                    continue
+                                output.write(block[: max_output_bytes - written])
+                                written += len(block)
+                                if written > max_output_bytes:
+                                    raise ValueError(
+                                        f"command output allowance exhausted; inspect {log}"
+                                    )
+                        code = process.wait(timeout=max(0, deadline - time.monotonic()))
+                    finally:
+                        process.stdout.close()
+            else:
+                code = process.wait(timeout=timeout)
         finally:
             with SIGNALS.hold() as stopped:
                 try:
@@ -239,7 +275,7 @@ def verify(output: Path) -> dict:
             runtime,
             child_env,
             log,
-            timeout=310,
+            timeout=CurrentLimits().max_duration_s + 10,
         )
         result = json.loads(log.read_text())
         steps.append({"name": name, "result": result})

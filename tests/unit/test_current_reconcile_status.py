@@ -23,7 +23,7 @@ def test_unstarted_and_starved_ranges_are_visible_without_entities():
                     "events": {
                         "next": 101,
                         "high": 200,
-                        "started_at": (now - timedelta(days=31)).timestamp(),
+                        "started_at": (now - timedelta(days=61)).timestamp(),
                     }
                 }
             },
@@ -31,7 +31,7 @@ def test_unstarted_and_starved_ranges_are_visible_without_entities():
         result = freshness(conn, now=now)
         assert result["cold_overdue_count"] == 0
         assert result["cold_ranges"]["events"] == {
-            "age_s": 31 * 86400,
+            "age_s": 61 * 86400,
             "overdue": True,
             "unstarted": False,
         }
@@ -57,3 +57,16 @@ def test_unstarted_and_starved_ranges_are_visible_without_entities():
             "overdue": False,
             "unstarted": False,
         }
+
+
+def test_historical_range_exact_sixty_day_target():
+    now = datetime(2026, 10, 14, tzinfo=UTC)
+    with duckdb.connect() as conn:
+        initialize(conn)
+        for age, overdue in [(60 * 86400 - 1, False), (60 * 86400, True)]:
+            set_state(
+                conn,
+                "reconcile",
+                {"windows": {"events": {"cycle": now.timestamp() - age, "next": 1}}},
+            )
+            assert freshness(conn, now=now)["cold_ranges"]["events"]["overdue"] is overdue

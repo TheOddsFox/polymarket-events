@@ -219,3 +219,33 @@ raise SystemExit(harness.main())
         if group.exists():
             with suppress(ProcessLookupError):
                 os.killpg(int(group.read_text()), signal.SIGKILL)
+
+
+def test_installed_cli_timeout_tracks_default_refresh_budget(tmp_path, monkeypatch):
+    output = tmp_path / "evidence"
+    output.mkdir()
+    package = output / "venv/lib/oddsfox_catalogue"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "cli.py").write_text("")
+    calls = []
+
+    def command(argv, cwd, env, log, **kwargs):
+        if log.name == "build.log":
+            dist = output / "dist"
+            dist.mkdir()
+            (dist / "package.whl").touch()
+            (dist / "package.tar.gz").touch()
+        elif log.name == "installed-origin.log":
+            log.write_text(str(package / "__init__.py"))
+        elif log.name == "init.json":
+            calls.append((argv, kwargs))
+            raise RuntimeError("captured installed CLI")
+
+    monkeypatch.setattr(harness, "run_command", command)
+    monkeypatch.setattr(harness, "freeze_resources", lambda root: None)
+    monkeypatch.setenv("CATALOGUE_CATALOGUE_MAX_DURATION_S", "1")
+    with pytest.raises(RuntimeError, match="captured installed CLI"):
+        harness.verify(output)
+    assert calls[0][0][-1] == "init"
+    assert calls[0][1]["timeout"] == harness.CurrentLimits().max_duration_s + 10 == 1210

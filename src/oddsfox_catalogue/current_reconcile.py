@@ -4,7 +4,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from . import current_store
-from .current_config import admit
+from .current_config import ACTIVE_FRESHNESS_S, COLD_FRESHNESS_S, admit
 from .current_sync import fetch_apply, resume_pending
 from .gamma.http import CaptureStopped, RequestBudgetExceeded
 
@@ -135,7 +135,7 @@ def reconcile(settings, conn, client, *, deadline):
             break
         # A near-target active receipt gets the next slot, even on a cold turn.
         urgent = active and any(
-            receipt is None or (now - receipt).total_seconds() >= 5 * 3600
+            receipt is None or (now - receipt).total_seconds() >= ACTIVE_FRESHNESS_S - 2 * 3600
             for _, receipt in active[1]
         )
         use_active = active is not None and (cold is None or state["turn"] < 3 or urgent)
@@ -223,7 +223,10 @@ def freshness(conn, *, now=None):
     """Observed age and coverage, never a source-completeness claim."""
     now = now or _now()
     result = {"source_complete": False}
-    for cold, prefix, interval in [(False, "active", 6 * 3600), (True, "cold", 30 * 86400)]:
+    for cold, prefix, interval in [
+        (False, "active", ACTIVE_FRESHNESS_S),
+        (True, "cold", COLD_FRESHNESS_S),
+    ]:
         entities = (
             f"SELECT * FROM ({_entities('events')}) WHERE (closed IS TRUE)={str(cold).lower()}"
         )
@@ -251,7 +254,7 @@ def freshness(conn, *, now=None):
         age = None if started is None else max(0, now.timestamp() - started)
         result["cold_ranges"][lane] = {
             "age_s": age,
-            "overdue": None if age is None else age >= 30 * 86400,
+            "overdue": None if age is None else age >= COLD_FRESHNESS_S,
             "unstarted": started is None and frontiers.get(lane, {}).get("frontier", 0) > 0,
         }
     return result

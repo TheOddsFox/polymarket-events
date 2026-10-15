@@ -122,13 +122,6 @@ def temporary_bytes(settings: Settings) -> int:
     return _union_bytes((settings.temporary_dir, settings.dlt_pipelines_dir))
 
 
-def remaining_temp_bytes(settings: Settings) -> int:
-    remaining = settings.capture.max_temp_bytes - temporary_bytes(settings)
-    if remaining <= 0:
-        raise RequestBudgetExceeded("temporary storage allowance exhausted")
-    return remaining
-
-
 def enforce_storage_limits(settings: Settings, *, additional_bytes: int = 0) -> None:
     if retained_bytes(settings) + additional_bytes > settings.capture.max_retained_bytes:
         raise RequestBudgetExceeded("retained storage allowance exhausted")

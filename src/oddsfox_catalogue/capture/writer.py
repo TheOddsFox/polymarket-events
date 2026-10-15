@@ -58,14 +58,6 @@ def manifest_path(scan_dir: Path, seq: int) -> Path:
     return scan_dir / f"{page_stem(seq)}.manifest.json"
 
 
-def scan_marker_path(scan_dir: Path) -> Path:
-    return scan_dir / "_scan.json"
-
-
-def batch_marker_path(batch_dir: Path) -> Path:
-    return batch_dir / "_batch.json"
-
-
 @dataclass(frozen=True)
 class PageWrite:
     gz_path: Path

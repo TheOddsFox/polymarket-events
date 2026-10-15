@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from oddsfox_catalogue.capture.writer import manifest_path, read_body, read_manifest
+from oddsfox_catalogue.capture.writer import read_body
 from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.gamma.http import MalformedResponse, encode_params
 from oddsfox_catalogue.gamma.paginators import (
@@ -24,43 +23,6 @@ from oddsfox_catalogue.ids import canonical_json, ids_hash, make_page_id
 
 class DurabilityError(RuntimeError):
     """A page the ledger considers fetched is missing or fails its checksum."""
-
-
-def scan_dir_for(settings: Settings, observation_date: str, batch_id: str, scan_id: str) -> Path:
-    return settings.raw_dir / observation_date / batch_id / scan_id
-
-
-def read_indexed_manifest(settings: Settings, directory: Path, page: dict[str, Any] | None):
-    """Read the actual page revision while binding its position to the ledger index."""
-    if page is None:
-        return None
-    manifest = read_manifest(manifest_path(directory, page["seq"]), trusted_root=settings.raw_dir)
-    fields = (
-        "page_id",
-        "batch_id",
-        "scan_id",
-        "seq",
-        "endpoint",
-        "input_cursor",
-        "output_cursor",
-        "offset_start",
-        "offset_end",
-        "record_count",
-        "http_status",
-        "retries",
-        "latency_s",
-        "body_sha256",
-        "gz_sha256",
-        "observed_at",
-    )
-    if (
-        manifest is None
-        or any(manifest.get(key) != page[key] for key in fields)
-        or bool(manifest["terminal"]) != bool(page["terminal"])
-        or canonical_json(manifest["params"]) != page["params_json"]
-    ):
-        raise DurabilityError("raw page manifest differs from the committed ledger evidence")
-    return manifest
 
 
 def _page_revision(manifest: dict[str, Any], spec: ScanSpec) -> int:
@@ -327,30 +289,3 @@ def read_page_records(
     except (KeyError, IndexError, TypeError, MalformedResponse) as exc:
         raise DurabilityError("capture page does not answer its committed source unit") from exc
     return records
-
-
-def iter_scan_pages(
-    settings: Settings,
-    batch: dict[str, Any],
-    scan: dict[str, Any],
-) -> Iterator[tuple[dict[str, Any], list[dict[str, Any]]]]:
-    """Yield ``(manifest, records)`` for each durable page of one scan attempt, in order."""
-    directory = scan_dir_for(
-        settings, batch["observation_date"], batch["batch_id"], scan["scan_id"]
-    )
-    seq = 0
-    previous = None
-    while True:
-        seq += 1
-        path = manifest_path(directory, seq)
-        if not path.exists():
-            break
-        manifest = read_manifest(path, trusted_root=settings.raw_dir)
-        if manifest is None:
-            raise DurabilityError(f"page {seq} of scan {scan['scan_id']} is not durable")
-        validate_page_identity(batch, scan, manifest, seq=seq, previous=previous)
-        records = read_page_records(
-            settings, directory, manifest, scan["record_key"], scan=scan, previous=previous
-        )
-        previous = manifest
-        yield manifest, records

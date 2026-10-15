@@ -379,6 +379,43 @@ def test_refresh_repairs_existing_parent_discovered_in_market_tail(catalogue, mo
     assert current_publish.verify_current(settings)["counts"]["event_markets"] == 1
 
 
+@pytest.mark.parametrize("operation", ["refresh", "reconcile"])
+def test_run_reports_live_parent_queue_when_noop_publication_retains_old_backlog(
+    catalogue, monkeypatch, operation
+):
+    settings, conn = catalogue
+    apply(conn, [{"id": "3", "events": [{"id": "1"}, {"id": "7"}]}], "markets")
+    publication = {"noop": True, "backlog": {"parent_event_repair_count": 0}}
+    monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
+    monkeypatch.setattr(current_backup, "prune", lambda *args, **kwargs: {})
+    monkeypatch.setattr(current_runtime, "_publish", lambda *args: (publication, 0))
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.path in {"/events", "/markets"}
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setattr(
+        current_runtime,
+        "GammaClient",
+        lambda gamma, **kwargs: GammaClient(
+            gamma, **kwargs, transport=httpx.MockTransport(handler)
+        ),
+    )
+    result = current_runtime.execute(settings, operation, {}, time.monotonic() + 30)
+    status = current_runtime.execute(settings, "status", {}, time.monotonic() + 30)
+
+    assert requests
+    assert conn.execute("SELECT count(*) FROM _parent_repairs").fetchone() == (2,)
+    assert result["parent_event_repair_count"] == 2
+    assert result["publication"]["backlog"]["parent_event_repair_count"] == 0
+    assert status["parent_event_repair_count"] == 2
+    assert status["last_run"]["operation"] == operation
+    assert status["last_run"]["parent_event_repair_count"] == 2
+    assert status["last_run"]["publication"]["backlog"]["parent_event_repair_count"] == 0
+
+
 def identity(key, tokens):
     return {
         "id": str(key),
@@ -397,7 +434,7 @@ def test_reconcile_natively_repairs_asset_conflicts(catalogue, monkeypatch):
     assert conn.execute("SELECT DISTINCT identity_error FROM markets").fetchall() == [
         ("asset_ownership_conflict",)
     ]
-    monkeypatch.setattr(current_reconcile, "_now", lambda: datetime(2026, 11, 1, tzinfo=UTC))
+    monkeypatch.setattr(current_reconcile, "_now", lambda: datetime(2026, 12, 1, tzinfo=UTC))
     native = []
 
     def handler(request):
@@ -580,6 +617,8 @@ def test_status_reports_backup_age_and_daily_recovery_point_boundary(catalogue, 
             {"valid": True, "created_at": (now - timedelta(seconds=age)).isoformat()},
         )
     result = current_runtime.execute(settings, "status", {}, time.monotonic() + 30)
+    assert result["recovery_scope"] == "local_only"
+    assert result["disk_failure_protection"] is False
     assert result["backup_age_s"] == age
     assert result["recovery_point_overdue"] is (age is None or age > 86400)
 

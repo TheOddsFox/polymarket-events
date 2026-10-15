@@ -10,7 +10,7 @@ Python3.12, DuckDB, HTTPX and filelock. catalogue.v3 is a breaking replacement f
 
 Complete event membership arrays replace links, including empty arrays. Missing/incomplete arrays preserve prior links and remain unresolved. List omissions never establish absence or source completeness. Retain closed/unlinked entities. Native IDs are exact decimal strings; unsafe/conflicting ownership is unavailable until native confirmation.
 
-Response application and progress commit atomically. Verified immutable Parquet releases use an atomic current pointer; current and previous releases survive failures. Bounded evidence and verified daily backups replace permanent raw replay. Default ceilings: 300s normal refresh including publication,10requests/s,1HTTPworker,25krequests,4GiBdownload,16MiBresponse,2GBSQLmemory,2threads,64GiBretained,8GiBtemporary,32GiBfree reserve. Do not raise limits to pass.
+Response application and progress commit atomically. Verified immutable Parquet releases use an atomic current pointer; current and previous releases survive failures. Bounded evidence and verified daily backups replace permanent raw replay. Default ceilings: 1200s normal refresh including publication,10requests/s,1HTTPworker,25krequests,4GiBdownload,16MiBresponse,2GBSQLmemory,2threads,96GiBretained,8GiBtemporary,32GiBfree reserve. The approved 2026-10-15 policy keeps the combined legacy/new-root envelope at 256 GiB. Do not raise limits to pass. Active membership freshness targets 24 hours and cold rotation 60 days; due thresholds are 20 hours and 58 days. Recovery is verified local-only daily backups; disk-failure protection is explicitly waived.
 
 ## Verification
 

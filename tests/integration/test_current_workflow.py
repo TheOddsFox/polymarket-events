@@ -192,6 +192,12 @@ def test_pending_native_receipt_resumes_frozen_capture_without_http(tmp_path, mo
 def test_cli_current_metadata_reconcile_backup_restore_offline(tmp_path):
     root = tmp_path.resolve() / "catalogue"
     assert cli(root, "init")["status"] == "initialized"
+    unprotected = cli(root, "status")
+    assert unprotected["recovery_scope"] == "local_only"
+    assert unprotected["disk_failure_protection"] is False
+    assert unprotected["last_backup"] is None
+    assert unprotected["backup_age_s"] is None
+    assert unprotected["recovery_point_overdue"] is True
     with CurrentGammaServer() as source:
         certificate = probe(root, source.url)
         assert all(lane["supported"] for lane in certificate["lanes"].values())
@@ -238,6 +244,14 @@ def test_cli_current_metadata_reconcile_backup_restore_offline(tmp_path):
         assert reconciled["source_complete"] is False
         requests = source.stats["http_attempts"]
         backup = cli(root, "backup", "create")
+        local_backup = cli(root, "status")
+        assert local_backup["recovery_scope"] == "local_only"
+        assert local_backup["disk_failure_protection"] is False
+        assert local_backup["last_backup"] == {
+            key: value for key, value in backup.items() if key != "retention"
+        }
+        assert 0 <= local_backup["backup_age_s"] < 86400
+        assert local_backup["recovery_point_overdue"] is False
         assert source.stats["http_attempts"] == requests
     backup_path = Path(backup["path"])
     assert cli(root, "backup", "verify", backup_path)["valid"] is True
@@ -298,7 +312,7 @@ def _stall_child(_pipe, _settings, _operation, _options, _deadline):
 
 def test_supervisor_stall_stops_child_before_writer_lock_release(tmp_path, monkeypatch):
     settings = CurrentSettings(tmp_path.resolve() / "catalogue")
-    assert settings.limits.max_duration_s == 300
+    assert settings.limits.max_duration_s == 1200
     context = multiprocessing.get_context("spawn")
     processes = []
 

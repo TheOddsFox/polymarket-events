@@ -1,5 +1,9 @@
 # Catalogue v2
 
+Historical contract for verified import and rollback with the preserved legacy
+runtime. The current executable uses [catalogue.v3](current-catalogue.md); the
+warehouse commands below require that matching legacy runtime.
+
 `oddsfox.polymarket.catalogue.v2` replaces the legacy warehouse and public projections.
 Use a fresh operator root. Retain old evidence and state separately; neither migration nor
 compatibility views are provided. The independent `oddsfox.polymarket.metadata.v1` JSON bundle

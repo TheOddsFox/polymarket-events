@@ -156,7 +156,6 @@ def test_delta_preserves_ten_old_memberships_and_uses_seed_frontiers(tmp_path, c
                     [[r[n] for n in names] for r in rows],
                 )
         assert benchmark.verify_expected(conn, tmp_path, delta)["event_markets"] == 10 + count
-        conn.execute("DROP TABLE expected_events")
         conn.execute("UPDATE events SET title='wrong' WHERE event_id='11'")
         with pytest.raises(ValueError, match="exact seed-plus-delta mismatch"):
             benchmark.verify_expected(conn, tmp_path, delta)
@@ -238,7 +237,9 @@ def test_cli_pins_canonical_limits_and_preserves_failure_output(tmp_path, monkey
     result = benchmark.cli(tmp_path, "http://127.0.0.1:123", None, "refresh")
     assert result["returncode"] == 1
     assert result["stderr"] == "capacity"
-    assert captured["env"]["CATALOGUE_CATALOGUE_MAX_DURATION_S"] == "300.0"
+    assert captured["env"]["CATALOGUE_CATALOGUE_MAX_DURATION_S"] == "1200.0"
+    assert captured["timeout"] == 1210
+    assert captured["env"]["CATALOGUE_CATALOGUE_MAX_RETAINED_BYTES"] == str(96 * 1024**3)
     assert captured["env"]["CATALOGUE_CATALOGUE_FREE_RESERVE_BYTES"] == str(32 * 1024**3)
     assert captured["env"]["CATALOGUE_GAMMA_REQUESTS_PER_SECOND"] == "10.0"
     with pytest.raises(ValueError, match="capacity"):
@@ -496,10 +497,11 @@ def test_real_seed_preflight_validates_private_store_once_before_build_or_copy(
 
 
 @pytest.mark.parametrize(
-    ("version", "unexpected_fault"), [("v1", False), ("v2", False), ("v2", True)]
+    ("version", "unexpected_fault", "count"),
+    [("v1", False, 12), ("v2", False, 12), ("v2", True, 12), ("v2", False, 1000)],
 )
 def test_representative_resumed_repair_real_http_and_exact_oracle(
-    tmp_path, monkeypatch, version, unexpected_fault
+    tmp_path, monkeypatch, version, unexpected_fault, count
 ):
     from fakes.world import make_event, make_market
     from oddsfox_catalogue import current_store
@@ -511,7 +513,9 @@ def test_representative_resumed_repair_real_http_and_exact_oracle(
         current_store.initialize(conn)
         originals = [
             make_event(
-                str(i), f"Event {i}", markets=[make_market(str(i), "original", version=version)]
+                str(i + 2889 if count == 1000 else i),
+                f"Event {i}",
+                markets=[make_market(str(i), "original", version=version)],
             )
             for i in range(1, 11)
         ]
@@ -529,7 +533,11 @@ def test_representative_resumed_repair_real_http_and_exact_oracle(
                 "next_lane": 0,
                 "pending": None,
                 "lanes": {
-                    lane: {"frontier": 10, "highwater": None, "phase": "tail"}
+                    lane: {
+                        "frontier": (1164836 if lane == "events" and count == 1000 else 10),
+                        "highwater": None,
+                        "phase": "tail",
+                    }
                     for lane in ("events", "markets")
                 },
             },
@@ -540,7 +548,7 @@ def test_representative_resumed_repair_real_http_and_exact_oracle(
         for table in benchmark.SCHEMAS:
             benchmark.shutil.copy2(Path(seed_release["path"]) / f"{table}.parquet", baseline)
         events, markets, controls, new_events, new_markets = benchmark.build_source(
-            conn, {"events": 10, "markets": 10}, 12
+            conn, {"events": 1164836 if count == 1000 else 10, "markets": 10}, count
         )
         fixture = benchmark.repair_fixture(conn, markets, new_markets)
         assert fixture["market_id"] == "1"
@@ -589,13 +597,36 @@ def test_representative_resumed_repair_real_http_and_exact_oracle(
                 [str(Path(publication["path"]) / "outcomes.parquet")],
             ).fetchone() == (0,)
         before = source.stats["http_attempts"]
-        refreshed = benchmark.successful(benchmark.cli(root, source.url, None, "refresh"))
+        started = benchmark.time.monotonic()
+        invocation = benchmark.cli(root, source.url, None, "refresh")
+        refreshed = benchmark.successful(invocation)
         requests = source.stats["responses"][before:]
         assert (
             benchmark.verify_repair_requests(requests, fixture["market_id"])["native_http_attempts"]
             == 1
         )
         assert refreshed["http_attempts"] == len(requests)
+        if count == 1000:
+            pending = benchmark.pending_parents(settings, events)
+            assert {str(i) for i in range(2890, 2900)} <= pending
+            with benchmark.connect_store(settings, read_only=True) as conn:
+                assert (
+                    conn.execute(
+                        "SELECT count(*) FROM event_markets WHERE event_id IN "
+                        "(SELECT unnest(?::VARCHAR[]))",
+                        [[str(i) for i in range(2890, 2900)]],
+                    ).fetchone()[0]
+                    == 10
+                )
+                with pytest.raises(ValueError, match="event_markets"):
+                    benchmark.verify_expected(conn, baseline, delta)
+        row = {"refresh": invocation}
+        refreshed = benchmark.drain_parents(root, source, None, events, row, started)
+        if count == 1000:
+            assert row["first_refresh_pending_parents"]
+            assert row["followups"]
+            assert row["first_refresh_complete"] is False
+        assert benchmark.pending_parents(settings, events) == set()
         with benchmark.connect_store(settings) as conn:
             assert benchmark.get_state(conn, "fetch_pending") is None
             assert (
@@ -777,7 +808,7 @@ def test_aggregate_usage_rejects_symlink_root_and_symlink_ancestors(tmp_path):
 
 @pytest.mark.parametrize(
     ("publication_seconds", "fail_publication"),
-    [(40, False), (200, False), (299, False), (400, False), (40, True)],
+    [(40, False), (800, False), (1199, False), (1400, False), (40, True)],
 )
 def test_preparation_calibrates_changed_publication_without_relaxing_refresh_budget(
     tmp_path, monkeypatch, publication_seconds, fail_publication
@@ -818,13 +849,13 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
 
         def client(gamma, **kwargs):
             client_calls.append(kwargs)
-            assert kwargs["max_duration_s"] == 300
-            assert kwargs["deadline"] == started + 300
+            assert kwargs["max_duration_s"] == 1200
+            assert kwargs["deadline"] == started + 1200
             return original_client(gamma, **kwargs)
 
         def publish(given_settings, given_conn, *, deadline):
             assert given_settings.limits == settings.limits
-            assert given_settings.limits.max_duration_s == 300
+            assert given_settings.limits.max_duration_s == 1200
             assert deadline == started + 14400
             if fail_publication:
                 clock[0] += publication_seconds
@@ -885,17 +916,17 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
                 for row in source.stats["responses"]
             )
             assert len(client_calls) == 1
-        if publication_seconds >= 200:
+        if publication_seconds >= 800:
             monkeypatch.setattr(current_publish, "publish", original_publish)
-            normal_deadline = clock[0] + 300
+            normal_deadline = clock[0] + 1200
             reserve = max(settings.limits.publication_reserve_s, 1.5 * publication_seconds)
-            assert reserve >= 300
-            if publication_seconds == 299:
-                assert reserve == 448.5
+            assert reserve >= 1200
+            if publication_seconds == 1199:
+                assert reserve == 1798.5
             normal_requests = []
 
             def normal_client(gamma, **kwargs):
-                assert kwargs["max_duration_s"] == 300
+                assert kwargs["max_duration_s"] == 1200
                 assert kwargs["deadline"] == normal_deadline - reserve
                 assert kwargs["deadline"] <= clock[0]
                 return original_client(
@@ -923,3 +954,296 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
                     current_store.get_state(conn, "previous_publish_seconds") == publication_seconds
                 )
                 assert current_store.get_state(conn, "fetch_pending") == prepared["fetch_pending"]
+
+
+@pytest.mark.parametrize(
+    "pending", [set(), {"1"}, {str(i) for i in range(100)}, {str(i) for i in range(101)}]
+)
+def test_followup_bound_and_empty_queue(monkeypatch, tmp_path, pending):
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(url="fixture", stats={"http_attempts": 0, "responses": []})
+    queue = set(pending)
+    monkeypatch.setattr(benchmark, "pending_parents", lambda *_: set(queue))
+
+    def refresh(*_):
+        queue.difference_update(sorted(queue)[:100])
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "elapsed_wall_s": 1,
+            "result": {
+                "status": "published",
+                "pending": None,
+                "backlog": 0,
+                "http_attempts": 0,
+                "downloaded_bytes": 0,
+            },
+        }
+
+    monkeypatch.setattr(benchmark, "cli", refresh)
+    row = {"refresh": refresh()}
+    queue.update(pending)
+    benchmark.drain_parents(tmp_path, source, None, pending, row, benchmark.time.monotonic())
+    assert len(row["followups"]) == math.ceil(len(pending) / 100)
+    assert not queue
+
+
+@pytest.mark.parametrize(
+    "fault", ["stall", "added", "native", "accounting", "deadline", "pending", "status"]
+)
+def test_followup_failure_retains_evidence(monkeypatch, tmp_path, fault):
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(url="fixture", stats={"http_attempts": 0, "responses": []})
+    queue = {"1"}
+    monkeypatch.setattr(benchmark, "pending_parents", lambda *_: set(queue))
+    result = {
+        "status": "published",
+        "pending": None,
+        "backlog": 0,
+        "http_attempts": 0,
+        "downloaded_bytes": 0,
+    }
+    invocation = {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "elapsed_wall_s": 1,
+        "result": result,
+    }
+
+    def refresh(*_):
+        if fault == "added":
+            queue.add("2")
+        elif fault != "stall":
+            queue.clear()
+        if fault == "native":
+            source.stats["responses"].append({"path": "/events/1", "bytes": 0})
+            result["http_attempts"] = 1
+        elif fault == "accounting":
+            result["downloaded_bytes"] = 1
+        elif fault == "deadline":
+            invocation["elapsed_wall_s"] = 1200
+        elif fault == "pending":
+            result["pending"] = True
+        elif fault == "status":
+            result["status"] = "failed"
+        return invocation
+
+    monkeypatch.setattr(benchmark, "cli", refresh)
+    row = {"refresh": invocation}
+    with pytest.raises(ValueError):
+        benchmark.drain_parents(tmp_path, source, None, {"1", "2"}, row, benchmark.time.monotonic())
+    assert len(row["followups"]) == 1
+    assert row["followups"][0]["invocation"] is invocation
+    assert "http" in row["followups"][0]
+    assert "refresh_sequence_elapsed_wall_s" in row
+
+
+def test_live_parent_queue_rejects_unknown_ids(tmp_path):
+    from oddsfox_catalogue.current_store import initialize
+
+    settings = benchmark.CurrentSettings(benchmark.validate_root(tmp_path, initialize=True))
+    with benchmark.connect_store(settings) as conn:
+        initialize(conn)
+        conn.execute("INSERT INTO _parent_repairs VALUES ('unexpected')")
+    with pytest.raises(ValueError, match="unexpected parent"):
+        benchmark.pending_parents(settings, {"1"})
+
+
+def test_cli_timeout_retains_captured_failure(tmp_path, monkeypatch):
+    def timeout(command, **_):
+        raise benchmark.subprocess.TimeoutExpired(command, 1210, b"partial output", b"deadline")
+
+    monkeypatch.setattr(benchmark.subprocess, "run", timeout)
+    invocation = benchmark.cli(tmp_path, "http://fixture", None, "refresh")
+    assert invocation["returncode"] == 124
+    assert invocation["stdout"] == "partial output"
+    assert invocation["stderr"] == "deadline"
+    with pytest.raises(ValueError, match="deadlinepartial output"):
+        benchmark.successful(invocation)
+
+
+def test_followup_cap_never_extends_for_slow_progress(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    queue = {str(i) for i in range(101)}
+    source = SimpleNamespace(url="fixture", stats={"http_attempts": 0, "responses": []})
+    monkeypatch.setattr(benchmark, "pending_parents", lambda *_: set(queue))
+    invocation = {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "elapsed_wall_s": 1,
+        "result": {
+            "status": "published",
+            "pending": None,
+            "backlog": 0,
+            "http_attempts": 0,
+            "downloaded_bytes": 0,
+        },
+    }
+
+    def refresh(*_):
+        queue.pop()
+        return invocation
+
+    monkeypatch.setattr(benchmark, "cli", refresh)
+    row = {"refresh": invocation}
+    with pytest.raises(ValueError, match="cap exhausted"):
+        benchmark.drain_parents(tmp_path, source, None, set(queue), row, benchmark.time.monotonic())
+    assert row["followup_cap"] == len(row["followups"]) == 2
+    assert len(queue) == 99
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "lost_duplicate", "extra_duplicate", "null", "value", "key", "schema"]
+)
+def test_exact_oracle_full_multiset_and_cleanup(tmp_path, fault):
+    import duckdb
+
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE events(venue VARCHAR, event_id VARCHAR, title VARCHAR, slug VARCHAR, active BOOLEAN, closed BOOLEAN, archived BOOLEAN)"
+        )
+        row = (None, "1", None, "slug", True, None, False)
+        conn.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)", [row, row])
+        conn.execute(f"COPY events TO '{tmp_path / 'events.parquet'}' (FORMAT PARQUET)")
+        delta_row = dict(
+            zip(
+                benchmark.columns("events"),
+                ("polymarket", "2", "delta", None, False, False, False),
+                strict=True,
+            )
+        )
+        conn.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)", list(delta_row.values()))
+        if fault == "lost_duplicate":
+            conn.execute("DELETE FROM events WHERE rowid = 0")
+        elif fault == "extra_duplicate":
+            conn.execute("INSERT INTO events SELECT * FROM events WHERE event_id = '2'")
+        elif fault == "null":
+            conn.execute("UPDATE events SET title = '' WHERE event_id = '1'")
+        elif fault == "value":
+            conn.execute("UPDATE events SET title = 'changed' WHERE event_id = '2'")
+        elif fault == "key":
+            conn.execute("UPDATE events SET event_id = 'unexpected' WHERE event_id = '2'")
+        elif fault == "schema":
+            conn.execute("ALTER TABLE events ALTER COLUMN active TYPE VARCHAR")
+        if fault:
+            with pytest.raises(ValueError, match="exact seed-plus-delta"):
+                benchmark.verify_expected(conn, tmp_path, {"events": [delta_row]})
+        else:
+            assert benchmark.verify_expected(conn, tmp_path, {"events": [delta_row]}) == {
+                "events": 3
+            }
+            assert benchmark.verify_expected(conn, tmp_path, {"events": [delta_row]}) == {
+                "events": 3
+            }
+        assert (
+            conn.execute("SELECT table_name FROM duckdb_tables() WHERE temporary").fetchall() == []
+        )
+
+
+def test_exact_oracle_empty_relations_and_unexpected_rows(tmp_path):
+    import duckdb
+
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE event_markets(venue VARCHAR, event_id VARCHAR, market_id VARCHAR)"
+        )
+        conn.execute(
+            f"COPY event_markets TO '{tmp_path / 'event_markets.parquet'}' (FORMAT PARQUET)"
+        )
+        assert benchmark.verify_expected(conn, tmp_path, {"event_markets": []}) == {
+            "event_markets": 0
+        }
+        conn.execute("INSERT INTO event_markets VALUES (NULL, NULL, NULL)")
+        with pytest.raises(ValueError, match="exact seed-plus-delta mismatch"):
+            benchmark.verify_expected(conn, tmp_path, {"event_markets": []})
+
+
+def test_disk_oracle_batches_preserve_exact_values_and_caller_transaction(tmp_path):
+    import duckdb
+
+    rows = [
+        (
+            "polymarket",
+            str(i + 1),
+            (None, "null", 'quote " slash \\ newline\n雪')[i % 3],
+            (None, "null", "slug")[i % 3],
+            (None, True, False)[i % 3],
+            (True, False, None)[i % 3],
+            False,
+        )
+        for i in range(1002)
+    ]
+    rows[1000] = rows[0]
+    maximum_asset = str(2**256 - 1)
+    outcome_rows = [
+        (
+            "polymarket",
+            "1",
+            None,
+            1,
+            "雪\nYes",
+            "poly_v2_position",
+            maximum_asset,
+            None,
+            maximum_asset,
+        ),
+        ("polymarket", "1", "null", 2, 'No "quoted"', "ctf_token", "1", "1", None),
+    ]
+    relations = {"events": rows, "outcomes": outcome_rows}
+    with duckdb.connect(str(tmp_path / "oracle.duckdb")) as conn:
+        for table in relations:
+            schema = ", ".join(f'"{name}" {kind}' for name, kind in benchmark.SCHEMAS[table])
+            conn.execute(f"CREATE TABLE {table} ({schema})")
+            conn.execute(f"COPY {table} TO '{tmp_path / f'{table}.parquet'}' (FORMAT PARQUET)")
+        conn.execute("BEGIN TRANSACTION")
+        for table, values in relations.items():
+            placeholders = ",".join("?" for _ in benchmark.columns(table))
+            conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})", values)
+        delta = {
+            table: [dict(zip(benchmark.columns(table), row, strict=True)) for row in values]
+            for table, values in relations.items()
+        }
+        assert benchmark.verify_expected(conn, tmp_path, delta) == {"events": 1002, "outcomes": 2}
+        assert conn.execute("SELECT count(*) FROM events WHERE event_id='1'").fetchone() == (2,)
+        conn.execute("ROLLBACK")
+        for table in relations:
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+        assert (
+            conn.execute("SELECT table_name FROM duckdb_tables() WHERE temporary").fetchall() == []
+        )
+
+
+def test_disk_oracle_missing_key_after_full_batch_cleans_up_without_committing(tmp_path):
+    import duckdb
+
+    schema = ", ".join(f'"{name}" {kind}' for name, kind in benchmark.SCHEMAS["events"])
+    complete = dict(
+        zip(
+            benchmark.columns("events"),
+            ("polymarket", "1", None, "null", True, False, None),
+            strict=True,
+        )
+    )
+    with duckdb.connect(str(tmp_path / "oracle.duckdb")) as conn:
+        conn.execute(f"CREATE TABLE events ({schema})")
+        conn.execute(f"COPY events TO '{tmp_path / 'events.parquet'}' (FORMAT PARQUET)")
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)", list(complete.values()))
+        with pytest.raises(KeyError, match="title"):
+            benchmark.verify_expected(
+                conn,
+                tmp_path,
+                {"events": [complete] * 1000 + [{"venue": "polymarket", "event_id": "2"}]},
+            )
+        assert (
+            conn.execute("SELECT table_name FROM duckdb_tables() WHERE temporary").fetchall() == []
+        )
+        conn.execute("ROLLBACK")
+        assert conn.execute("SELECT count(*) FROM events").fetchone() == (0,)
+        assert benchmark.verify_expected(conn, tmp_path, {"events": []}) == {"events": 0}

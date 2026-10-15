@@ -2,6 +2,6 @@
 # Replace /absolute/installed/bin/catalogue and /external/catalogue-v3 explicitly.
 # Run init/import, successful provider probes, verification, and benchmarks first.
 # One worker only. Busy exits 3; inspect status and retry at most twice with delay.
-# */15 * * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 refresh
-# 7 * * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 reconcile
-# 37 2 * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 backup create
+# 0 * * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 refresh
+# 30 * * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 reconcile
+# 55 2 * * * /absolute/installed/bin/catalogue --root /external/catalogue-v3 backup create

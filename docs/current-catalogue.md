@@ -64,6 +64,12 @@ protocol 1 import requires a fresh root; preserve that failed root as evidence.
 A repeated completed import verifies its pinned seed identity. Import is offline and
 makes no source-completeness claim. Never delete the old runtime/root to make room.
 Rollback means returning consumers and scheduling to that preserved pair.
+Do not deploy a copy of the benchmark seed directly: it retains an older measured
+publication cost whose 50% reserve exceeds the 20-minute budget. Provision a fresh
+root through the pinned import with the current installed runtime, then measure its
+actual publication and acquisition headroom before deployment. An unchanged publish,
+completed import rerun or restore does not recalibrate publication cost. Preserve
+the measured cost and reserve; insufficient headroom remains an unmet deployment gate.
 Select the old root explicitly with the preserved executable, and retain the original
 `CATALOGUE_CONFIG` if one was used:
 
@@ -102,9 +108,9 @@ Unsupported behavior remains blocked. Lifecycle transitions can cause omissions 
 passes, and the boolean controls do not prove coverage of unknown lifecycle values.
 Known entities remain retained and historical ranges are revisited.
 `refresh` advances durable discovery frontiers. `reconcile` prioritizes active/unknown
-events, then rotates closed events, all known markets, and historical ID windows monthly.
+events, then rotates closed events, all known markets, and historical ID windows every 60 days.
 Event responses also update their embedded markets. Unlinked market corrections may
-wait for monthly reconciliation. Work survives between invocations.
+wait for the 60-day cold rotation. Work survives between invocations.
 Historical rotations pin their ID bounds and measure the next cycle from the prior
 cycle's start; status reports range ages separately from entity receipt ages.
 `publish` explicitly builds a verified release; `current` and `verify` verify the pointer.
@@ -114,22 +120,37 @@ last run, verified backup age, and a
 Its `ready` status means seed initialization is complete; inspect freshness and
 recovery fields separately before deployment.
 
+In refresh output, `backlog` describes discovery only. The top-level
+`parent_event_repair_count` reports the live queued event checks, including
+highwater rechecks whose memberships may already be complete. A no-op release
+retains its original manifest backlog snapshot; use the live counter and `status`
+for current work. A single refresh repairs at most 100 parents. Follow-up
+invocations may be needed before every newly discovered market has a verified
+event relationship; never infer those links from market-side references.
+
 One supervised HTTP worker, one root writer lock, and at most 10 requests/second are
 allowed. The worker holds that lock through database and filesystem changes, so
 killing its CLI parent cannot admit a second canonical writer while it finishes.
-Default per-invocation ceilings are 300 seconds, 25,000 HTTP attempts,
+Default per-invocation ceilings are 1200 seconds, 25,000 HTTP attempts,
 4 GiB downloaded, and 16 MiB per response. Publication time is reserved inside the
 refresh deadline (at least 60 seconds). Import and backup operations have separate
-four-hour supervision. The full-store five-minute acceptance gate has not passed;
-the measured publication alone exceeds that deadline on the tested connection.
+four-hour supervision. The approved full-store refresh and standalone verification
+target is 20 minutes each; the previous five-minute target was not met.
 See the [acceptance record](current-catalogue-acceptance.md). A deadline can stop work before a new
 publication; inspect the result and verify the existing pointer.
 
-Active/unknown event membership freshness within six hours, and closed events and all
-known markets within a month,
+Active/unknown event membership freshness within 24 hours, and closed events and all
+known markets within 60 days,
 are conditional targets, requiring compatible provider behavior and adequate cadence
-and capacity. Default due thresholds are 4.5 hours and 29 days, leaving scheduling
-margin. Neither a completed scan nor an empty response establishes source completeness.
+and capacity. Default due thresholds are 20 hours and 58 days, leaving scheduling
+margin. Active checks become urgent at 22 hours. Neither a completed scan nor an
+empty response establishes source completeness.
+
+Existing roots with explicit 300-second or 64 GiB configuration retain those stricter
+values. Inspect `config show` and update the root's `config.toml` deliberately while
+idle to adopt the new sample limits; do not overwrite provider settings or modify
+immutable seed and legacy roots. The combined retained acceptance envelope remains
+256 GiB, including legacy evidence and benchmark roots.
 
 A busy invocation exits **3** with `status: busy`; other blocked failures also exit 3.
 Inspect the status/message before retrying. For a busy lock, allow the current worker
@@ -138,7 +159,7 @@ Persistent busy or blocked results require operator investigation, not an infini
 
 ## Storage and recovery
 
-Admission limits: 64 GiB retained root, 8 GiB raw, raw age at most seven days,
+Admission limits: 96 GiB retained root, 8 GiB raw, raw age at most seven days,
 8 GiB temporary space, and 32 GiB free-space reserve. Keep seven daily backups;
 backup creation retains one verified backup per day. Pending responses are protected
 from pruning, so an exhausted allowance blocks progress rather than discarding needed
@@ -165,7 +186,8 @@ No automatic prefix cleanup is performed.
 Seven retained backups plus the next staging copy must fit the retained ceiling.
 They must also leave the normal changed-publication admission reserve available;
 fitting the backups alone does not establish an operable root. The measured
-mixed-codec checkpoint fails that combined gate; see the acceptance record.
+mixed-codec checkpoint exceeded the former 64 GiB ceiling. Revalidate it against
+the approved 96 GiB ceiling; see the acceptance record.
 A full root fails explicitly rather than deleting verified recovery points before
 their replacement is ready.
 
@@ -178,17 +200,18 @@ uv run catalogue --root /srv/catalogue-v3-restored verify
 uv run catalogue --root /srv/catalogue-v3-restored status
 ```
 
-Copy a completed backup to offline storage, verify that copy, and restore only to a
-fresh destination. Backup verification checks its inventory and checksums; recovery
+An additional offline copy is optional; verify any copy before relying on it. Restore
+only to a fresh destination. Backup verification checks its inventory and checksums; recovery
 includes the store, pending progress/raw dependencies, and last publication pointer.
-The 24-hour disk-loss target requires a daily verified copy on an independent device.
-The backup-age status measures local verified backups; operator monitoring must also
-track the independent copy and alert on a failed or overdue transfer.
+Recovery is explicitly local-only: disk-failure protection has been waived. Status
+reports `recovery_scope: local_only` and `disk_failure_protection: false`; backup age
+and `recovery_point_overdue` measure the daily verified local recovery point only.
+Losing the catalogue device can lose both the database and its local backups.
 Verify the restored pointer before redirecting consumers or scheduling. Interrupted
 work resumes from committed progress and pending responses; a failed publication keeps
 the last verified pointer. Raw retention is bounded: there is no permanent replay
-archive and no promise of reconstruction from arbitrarily old raw data. Retain offline
-backups and the old runtime/root independently.
+archive and no promise of reconstruction from arbitrarily old raw data. Preserve the
+old runtime/root for rollback.
 
 ## Isolated metadata.v1
 
@@ -243,16 +266,54 @@ alone pins only the CLI children. Repeat `--account-root` for every external
 legacy/operator root; repository data
 is counted automatically. The harness freezes a controlled loopback HTTP provider,
 includes new memberships on existing events, checks exact content independently, and
-measures verified publication plus unchanged refreshes. It does not reproduce historical
-network delays or prove six-hour/monthly reconciliation capacity. Measure sustained
+measures each verified refresh, bounded parent-repair follow-ups and the complete
+sequence separately, then checks unchanged refreshes after those repairs drain.
+The exact seed-plus-delta comparison remains mandatory. Stalled or unexpected
+repair work fails the frozen follow-up bound. Unchanged highwater requests may
+queue already-complete parents again; those live counts are disclosed separately.
+The harness does not reproduce historical
+network delays or prove 24-hour/60-day reconciliation capacity. Measure sustained
 reconciliation, initial catch-up, import, backup and restore separately. Retain elapsed
 time, HTTP/download counts, publication time, freshness/backlog and resource evidence
 before making performance claims.
 
-The Makefile frontends wrap this CLI; inspect `make help` for current targets. Historical
+For bounded full-population reconciliation characterization, use
+`uv run python scripts/benchmark-capacity.py --help`. Supply an immutable verified
+`--seed-root`, a separate idle `--root` imported with the current runtime, a fresh
+`--output`, the installed `--executable`, and every external `--account-root`.
+The explicit `--characterize` mode probes a disk-backed loopback provider, runs a
+refresh and bounded reconciliation invocations, and reports successful receipt
+renewals across the original active and cold populations. It preserves original
+receipt ages and counts unresolved memberships separately. The provider reconstructs
+current domain responses, including exact native identifiers and complete event
+memberships; it does not reproduce original raw response bytes. Unsupported invalid
+identity forms fail closed.
+Market lists deliberately default to open status so the actual probe requires
+both open and closed passes, matching the frozen production request policy.
+
+This checkout-only harness runs invocations consecutively. Its result is always
+characterization, never sustained acceptance: it does not exercise real hourly
+cadence, daily backups, long-term churn or genuine repeated active renewal.
+Backup mode is refused until its external verification workspace is accounted for.
+SQL spill is disabled; bounded audit, logs and reports are included in admission.
+`--max-total-seconds` bounds admission of child commands; accounting, SQL snapshots
+and cleanup can extend total elapsed time beyond it.
+Run it serially with other large workloads, retain partial reports after failure,
+and independently check domain content before claiming full acceptance.
+
+The Makefile frontends wrap this CLI; inspect the Makefile for current targets. Historical
 capture/load/dbt/replay/rebuild/validate commands are retired and reject use here.
 [The cron example](../ops/catalogue.cron.example) is **disabled template text only**:
-all lines are comments. It illustrates quarter-hourly refresh, offset hourly reconcile,
+all lines are comments. It illustrates hourly refresh, offset hourly reconcile,
 and daily backup with an external root and absolute installed executable placeholders.
 Do not activate it until import/probe, recovery, installed verification, and representative
 benchmark evidence support the chosen provider and cadence.
+
+## Historical warehouse documentation
+
+The retired warehouse acceptance reports are preserved at Git revision
+`a03d7cb1910530358df40180bd7a5caae3da41fd` under
+`docs/acceptance-2026-10-10.md` and `docs/completion-storage-2026-10-12.md`.
+They describe the retired dlt/dbt workflow. Use this guide and the
+[current acceptance record](current-catalogue-acceptance.md) for the current runtime.
+The [v2 contract](catalogue-v2.md) remains available for legacy import and rollback.

@@ -1,5 +1,6 @@
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import pytest
 
@@ -57,6 +58,74 @@ def test_limits_and_legacy_config(tmp_path):
     (root / "config.toml").write_text("[load]\nmax_pages_per_run=1\n")
     with pytest.raises(CurrentError, match="legacy"):
         load_current_settings(root, env={})
+
+
+def test_approved_defaults_and_sample_config_match(tmp_path):
+    settings = load_current_settings(tmp_path / "root", env={})
+    assert asdict(settings.limits) == {
+        "max_duration_s": 1200.0,
+        "max_requests": 25_000,
+        "max_download_bytes": 4 * 1024**3,
+        "max_response_bytes": 16 * 1024**2,
+        "max_retained_bytes": 96 * 1024**3,
+        "max_temp_bytes": 8 * 1024**3,
+        "free_reserve_bytes": 32 * 1024**3,
+        "max_raw_bytes": 8 * 1024**3,
+        "raw_max_age_s": 7 * 86400,
+        "active_recheck_s": 20 * 3600,
+        "cold_recheck_s": 58 * 86400,
+        "publication_reserve_s": 60.0,
+    }
+    sample = load_current_settings(
+        tmp_path / "root",
+        env={
+            "CATALOGUE_CONFIG": str(Path(__file__).resolve().parents[2] / "config/catalogue.toml")
+        },
+    )
+    assert sample == settings
+
+
+@pytest.mark.parametrize("duration,retained_gib", [(1200, 96), (300, 64)])
+def test_approved_resource_boundaries_and_legacy_values_accepted(tmp_path, duration, retained_gib):
+    settings = load_current_settings(
+        tmp_path / "root",
+        env={
+            "CATALOGUE_CATALOGUE_MAX_DURATION_S": str(duration),
+            "CATALOGUE_CATALOGUE_MAX_RETAINED_BYTES": str(retained_gib * 1024**3),
+        },
+    )
+    assert settings.limits.max_duration_s == duration
+    assert settings.limits.max_retained_bytes == retained_gib * 1024**3
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("max_duration_s", 1200.001),
+        ("max_retained_bytes", 96 * 1024**3 + 1),
+        ("max_requests", 25_001),
+        ("max_download_bytes", 4 * 1024**3 + 1),
+        ("max_response_bytes", 16 * 1024**2 + 1),
+        ("max_temp_bytes", 8 * 1024**3 + 1),
+        ("max_raw_bytes", 8 * 1024**3 + 1),
+        ("raw_max_age_s", 7 * 86400 + 1),
+        ("free_reserve_bytes", 32 * 1024**3 - 1),
+        ("publication_reserve_s", 59.999),
+        ("publication_reserve_s", 1200),
+    ],
+)
+def test_resource_limits_reject_values_outside_approved_policy(tmp_path, name, value):
+    with pytest.raises(CurrentError):
+        load_current_settings(
+            tmp_path / "root", env={f"CATALOGUE_CATALOGUE_{name.upper()}": str(value)}
+        )
+
+
+@pytest.mark.parametrize("name", ["max_duration_s", "max_retained_bytes"])
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_resource_limit_expansion_preserves_positive_finite_validation(tmp_path, name, value):
+    with pytest.raises((CurrentError, ValueError)):
+        load_current_settings(tmp_path / "root", env={f"CATALOGUE_CATALOGUE_{name.upper()}": value})
 
 
 def test_admission_checks_reserve_and_retained(tmp_path):

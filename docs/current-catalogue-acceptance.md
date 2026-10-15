@@ -3,6 +3,238 @@
 Acceptance remains open. Do not activate schedules or cut consumers over on the
 strength of the small fixture tests alone.
 
+## Approved operating policy — 2026-10-15
+
+The operator approved these revised requirements; historical measurements below
+retain their original limits and do not establish acceptance under the new policy.
+
+| Requirement | Approved target |
+| --- | --- |
+| Normal refresh through verified publication | Under 1200 seconds |
+| Standalone verification | Under 1200 seconds |
+| Retained root / combined retained envelope | 96 GiB / 256 GiB |
+| Active event membership freshness | 24 hours; due at 20 hours, urgent at 22 hours |
+| Cold entities and historical discovery rotation | 60 days; entities due at 58 days |
+| Recovery | Daily verified local backups, seven daily archives |
+
+**Disk-failure protection is explicitly waived.** Local backup age remains subject
+to the 24-hour target; device loss can destroy both store and backups. Backup and
+restore verification, exact identities, atomicity and all other resource and
+integrity safeguards remain required. Schedules stay disabled. Explicit old root
+configuration remains in force until the operator updates it.
+
+The three-case normal-refresh timing and fresh-root provisioning/headroom gates
+passed below. Deployment acceptance remains open for sustained freshness.
+Git delivery also requires hosted CI for the exact delivered commit.
+The historical 72,589,620,854-byte publication-capacity model fits the new
+103,079,215,104-byte ceiling. Seven-day growth remains unmeasured; the model does
+not guarantee future capacity or establish freshness throughput.
+
+### Software verification under the approved policy
+
+On 2026-10-15, both `scripts/verify-fast` and `scripts/verify` passed after the
+oracle fix: 1,362 tests,
+one optional consumer skip, lint and formatting; the completion gate also checked
+and synchronized the unchanged lockfile. The three metadata adapter tests passed
+separately in the sibling consumer environment. That consumer also loaded the
+installed producer's bundle with exact CTF and v2 position identities.
+
+The installed wheel and sdist passed distribution audits. Its isolated offline
+workflow passed all 12 steps, including verified backup, fresh-root restore,
+restored verification and rebuild. Independent architecture, data, security and
+implementation reviews found no introduced blocking defects. These small-fixture
+results do not prove full-store performance or sustained reconciliation capacity.
+Local measurements do not establish exact-head CI; check the matching hosted run
+before deployment.
+
+The operator explicitly approved deleting five superseded generated copies after
+inventorying them: 32,267,492,248 bytes were removed. The pinned legacy release,
+raw archive, rollback runtime, final supplemented seed and verified full-scale
+backup were preserved. Strict special-file rejection remains enabled; only
+zero-byte FIFO fixtures from completed tests were removed before accounting.
+
+### Full-store pilot Q — bounded work remains
+
+The first invocation met the approved timing limit, but the pilot did **not** pass
+complete-delta acceptance:
+
+| Measurement | Observed |
+| --- | ---: |
+| Refresh through verified publication | 582.19 seconds |
+| Acquisition and application | 124.32 seconds |
+| Publication and its verification | 450.83 seconds |
+| Separate release/store verification | 163.68 seconds |
+| HTTP attempts / downloaded bytes | 212 / 1,469,714 |
+| Combined retained bytes before the run reservation | 165,487,217,194 |
+
+Market discovery queued 260 parent events. The documented foreground repair step
+processed 100; 160 remained queued, including ten existing events whose new links
+had not yet been established by authoritative event responses. The exact oracle
+caught those ten missing links and stopped the harness. Successful discovery and
+release verification did not imply completion of all relationship work.
+
+The operator approved preserving the frozen payloads and measuring bounded
+follow-up invocations. Each invocation must finish within 1200 seconds; the report
+must retain individual and cumulative timings, pending IDs and request accounting.
+The unchanged full seed-plus-delta oracle runs after the queue drains. A stalled,
+unexpected or incomplete queue fails the finite follow-up bound. Unchanged refresh
+is measured afterward against the last completed publication; legitimate highwater
+rechecks are reported separately. This correction changes neither runtime authority
+rules nor the source workload. Manual pilot pauses remain part of actual freshness
+age, and this pilot does not replace the required three fresh formal runs.
+
+The pilot's derived 7,025,209,344-byte database was subsequently retired with
+explicit operator approval to make room for those fresh runs. Pending-work state,
+raw responses, both published snapshots, frozen source and the failed report were
+retained. Snapshot physical hashes were rechecked before retirement, and the root
+was disabled to prevent accidental canonical reuse.
+
+### Provisioning qualification
+
+The immutable seed retains a historical changed-publication cost of 915.485 seconds.
+Its required 50% reserve is 1373.228 seconds, exceeding the new invocation limit;
+that copied seed is not ready for direct refresh deployment. No-op publication,
+completed-import reruns and restore preserve this measurement. Cutover requires a
+fresh root imported from the pinned legacy evidence using the current installed
+runtime, followed by actual publication and acquisition-headroom checks. Do not erase
+the measurement or reduce the reserve to admit work.
+
+Formal benchmark R preparation performs a genuine changed-generation publication:
+run 1 recorded 361.499 seconds, giving a 542.249-second reserve. This establishes
+headroom for that prepared benchmark root. It does not measure fresh-root import
+or prove deployment readiness, and file-size differences do not establish the cause
+of the timing difference.
+
+### Formal R — comparison harness failure
+
+The initial refresh took 725.443 seconds, followed by two ordinary refreshes taking
+268.019 and 373.570 seconds. The live parent queue fell from 160 to 60 to zero;
+the complete finite sequence took 1367.117 seconds. Separate verification passed
+in 103.677 seconds. Each measured invocation met the approved 1200-second ceiling.
+
+The process then failed in the independent exact oracle at the unchanged 8 GiB
+temporary-storage ceiling. Its full expected-table copies and symmetric `EXCEPT ALL`
+comparison were replaced by one relation at a time, combining seed and delta rows
+with positive counts and actual rows with negative counts. Grouping every field
+and rejecting nonzero sums preserves exact nulls and duplicate multiplicities.
+Only the small typed delta is materialized. All 71 focused benchmark tests passed,
+with independent exactness review. The corrected full-store comparison passed in
+212.110 seconds under the unchanged limits and matched all four relation counts:
+1,138,846 events, 4,322,358 markets, 4,322,342 links and 8,641,433 outcomes.
+
+An append-only continuation passed the remaining checks, binding the original
+failed report, frozen source, seed manifest, installed runtime, generation and
+release. The restarted loopback origin was separately probed against the identical
+source and policy. The unchanged refresh took 235.864 seconds, reused the release,
+exported nothing and made three highwater requests with no native market lookups.
+Its two already-complete parent rechecks are disclosed separately from the drained
+delta. Final verification took 183.806 seconds; closing combined retained storage
+was 179,125,962,434 bytes. Manual interruption is outside the original finite refresh
+sequence and does not prove sustained freshness.
+
+Independent data review accepted this as one instrumentation-recovered case. The
+original failed process remains evidence and is not relabeled as successful. The
+verified generated copy was removed under the harness's successful-copy cleanup
+policy after recording its inventory; source, preparation, original failure and
+continuation reports remain. Both subsequent fresh cases passed below.
+
+The initial refresh reported 4,231,299,072 bytes of peak process RSS. DuckDB retained
+its configured 2 GB memory limit and two threads; that setting is not a total-process
+RSS ceiling. Reported retained and temporary usage for that invocation were
+10,989,606,328 and 1,629,061,120 bytes respectively; these endpoint readings are not
+claims about peak temporary usage. The corrected oracle remained subject to the
+8 GiB temporary limit throughout.
+
+### Fresh formal case 2 — passed
+
+The first fresh S case passed every check with the same installed runtime and
+frozen source as recovered case 1. Initial refresh took 463.549 seconds; bounded
+follow-ups took 155.590 and 474.942 seconds, draining the live queue 160 → 60 → 0.
+The complete finite sequence took 1094.162 seconds. Standalone verification took
+74.096 seconds, unchanged refresh 143.719 seconds and final verification 109.672
+seconds. The exact four-table counts matched recovered case 1.
+
+Unchanged refresh reused the release, exported nothing and made three highwater
+requests with no native lookups; its two already-complete parent rechecks remain
+disclosed. Combined retained usage was 171,352,838,957 bytes before and
+180,850,249,957 bytes after the case, within the unchanged 256 GiB envelope.
+Peak process RSS across its refresh invocations reached 4,474,290,176 bytes while
+DuckDB retained its configured 2 GB limit. The verified generated copy was removed
+automatically under the existing harness policy.
+
+### Three-case normal-refresh gate — passed
+
+The final fresh S case also passed. All three cases used the same frozen source,
+installed runtime, settings and lockfile. Each initial refresh, bounded follow-up,
+unchanged refresh and standalone verification finished below 1200 seconds.
+
+| Case | Initial refresh (s) | Follow-ups (s) | Complete finite sequence (s) | Unchanged (s) | Verification / final verification (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| R, explicitly recovered continuation | 725.443 | 268.019 / 373.570 | 1367.117 | 235.864 | 103.677 / 183.806 |
+| S, fresh case 1 | 463.549 | 155.590 / 474.942 | 1094.162 | 143.719 | 74.096 / 109.672 |
+| S, fresh case 2 | 394.051 | 103.647 / 212.532 | 710.290 | 128.011 | 65.725 / 70.753 |
+
+The complete sequence includes the initial refresh and automatic follow-ups. Its
+duration is separate from the approved per-invocation ceiling. In every case the
+live parent queue drained 160 → 60 → 0 within two bounded follow-ups. Each case
+used 212 requests for initial refresh, then four per follow-up. Unchanged refresh used three
+highwater requests, no native market lookups and no exports; its two already-complete
+parent rechecks were disclosed. All four exact relation counts and semantic digests
+matched across cases. This is a finite-workload result, not sustained freshness proof.
+
+Maximum closing combined retained usage was 180,850,668,315 bytes, below the
+unchanged 256 GiB envelope. Admission reserved the full 96 GiB root allowance before
+each fresh copy. No resource ceiling was raised. All successful generated roots were
+removed under the harness policy; frozen source and reports remain. OS caches were
+not flushed; these are serial fresh copies, not claims of cold filesystem caches.
+
+Provenance:
+
+- Installed runtime wheel SHA-256: `67ed0852928249fa1d03054765b080379c313c0b949449d087b7b9861207cf4f`.
+- Corrected harness SHA-256: `a66616a782699a4157dd6e5a4417c24bc4ddea452a988a3e04a0060153a5fcc8`.
+- Source SHA-256: `fc77dbeee35e58e43a7f6d5fec95889e39975464133b72c4907cefe737a6e587`.
+- Lockfile SHA-256: `2f11132f3d8b8f93caa812e47334b42d6beca4d16c236de6dca984016fe518a4`.
+- Seed manifest SHA-256: `f3329df660ff0dd7d825d262259cac381cfe318baa949f97a2afdcd78cd634f9`.
+
+R's original failed process report and append-only successful continuation are
+retained separately. The two fresh S cases have a successful combined report.
+Independent verification checked their source bytes, seed/distribution/hash bindings,
+exact counts/digests, queue progression, request accounting, timings and capacity.
+
+### Remaining deployment evidence
+
+Fresh current-runtime provisioning passed on 2026-10-15 using the pinned legacy
+release and inventoried event evidence, in a separate new root. Offline import,
+including its genuine first verified publication, took 2,199.955 seconds. The
+publication took 282.633 seconds; its unchanged 50% reserve leaves approximately
+776 seconds for acquisition under the approved 1,200-second invocation budget.
+Separate full-store verification passed in 227.956 seconds. Counts were
+1,138,596 events, 4,321,358 markets, 4,321,342 links and 8,639,383 outcomes,
+including the approved 254-market supplement. Original receipt ages and discovery
+frontiers were preserved. The old seed's retained publication cost was not reset.
+
+The present fixture covers about 260 events. It cannot establish successful receipt
+renewal across the full due population or sustained cold rotation: omitted IDs would
+only measure attempts, not successful reconciliation. A representative delivery and
+churn workload covering recurrence, memberships, identities, response sizes, delays
+and failures is still needed while refresh, reconciliation and backups share cadence.
+The approved 24-hour/60-day targets remain blocking until explicitly revised.
+
+The new disk-backed characterization provider can serve the full frozen population
+without copying the source database. Its actual probe requires two market lifecycle
+passes. Bounded receipt comparisons measure successful renewal, not just attempts;
+they do not establish recurring freshness or exact content equivalence. The harness
+explicitly refuses sustained-acceptance and backup modes. Real recurrence and shared
+backup cadence remain required; see the [operator guide](current-catalogue.md).
+
+Require hosted CI for the exact delivered commit in addition to the local evidence.
+Seven-day growth remains unmeasured; verified local daily
+backups, seven-backup retention, capacity admission and overdue reporting remain
+required. No mandatory seven-elapsed-day observation has been added. Schedules stay
+disabled; operational cutover is not authorized by code delivery.
+
+## Historical evidence under the original requirements
+
 ## Verified import
 
 The selected legacy release is `20261013T191053Z`, manifest SHA-256
@@ -191,9 +423,10 @@ change. All-ZSTD steady state remains unmeasured. No limit was increased and no
 source evidence was removed to obtain these results.
 
 Recovery must remain offline and preserve applicable catalogue content and pending
-progress. Local verified backups do not establish the 24-hour disk-loss target
-until an independently stored verified copy exists. Keep legacy roots and their
-matching runtime intact throughout acceptance and rollback.
+progress. Under the policy used for these historical measurements, an independent
+copy was required for disk-loss protection. That requirement is now explicitly
+waived; verified local backups remain required. Keep legacy roots and their matching
+runtime intact throughout acceptance and rollback.
 
 Daily retention prioritizes the last successfully verified, durably recorded
 backup before selecting six other dates. Random UUID order does not determine

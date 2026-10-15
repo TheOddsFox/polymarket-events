@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,14 +10,13 @@ from filelock import FileLock, Timeout
 
 
 class RunBusy(RuntimeError):
-    """Another capture, load, dbt, or publish run holds the lock."""
+    """Another catalogue run holds the lock."""
 
 
 @contextmanager
 def run_lock(path: Path, timeout: float = 0.0) -> Iterator[None]:
     """Hold an OS file lock for the duration of a run. Fails fast by default."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Rebuild owns the lock while invoking the same owner's existing stage functions.
     lock = FileLock(str(path), is_singleton=True)
     try:
         lock.acquire(timeout=timeout)
@@ -28,20 +26,3 @@ def run_lock(path: Path, timeout: float = 0.0) -> Iterator[None]:
         yield
     finally:
         lock.release()
-
-
-def current_git_sha(root: Path) -> str | None:
-    """HEAD commit of the project, or None outside a git checkout."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    sha = result.stdout.strip()
-    return sha or None

@@ -36,10 +36,12 @@ uv run catalogue --root /srv/catalogue-v3 status
 uv run catalogue --root /srv/catalogue-v3 verify
 ```
 
-**Deployment acceptance remains open:** full-store refresh and verification exceeded
-the 300-second deadline, and the measured seven-backup publication reservation exceeded
-the storage limit. See the [acceptance evidence](docs/current-catalogue-acceptance.md).
-Active/unknown checks within six hours and cold closed checks within a month remain
+**Deployment acceptance remains open:** the approved operating targets are a
+20-minute refresh and verification, a 96 GiB retained root inside the combined
+256 GiB envelope, active membership freshness within 24 hours and cold rotation
+within 60 days. See the [acceptance evidence](docs/current-catalogue-acceptance.md)
+for historical measurements and current validation. Recovery uses daily verified
+local backups; disk-failure protection is explicitly waived. Freshness remains
 conditional on provider behavior, backlog, invocation cadence and measured capacity.
 Observed coverage is never a claim of source completeness.
 

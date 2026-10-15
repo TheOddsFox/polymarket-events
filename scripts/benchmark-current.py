@@ -3,7 +3,7 @@
 
 Requires a verified, idle v3 seed. Copies only its stamp, store, publication and
 configuration, serially; retains failed copies and removes verified successful
-copies. This measures normal refresh, not six-hour/monthly reconciliation.
+copies. This measures normal refresh, not 24-hour active/60-day cold reconciliation.
 """
 
 from __future__ import annotations
@@ -363,7 +363,7 @@ def prepare_identity_repair(settings, conn, source, events, markets, fixture):
         "elapsed_s": time.monotonic() - started,
         "http": source.stats["responses"][before:],
         "fetch_pending": pending,
-        "scope": "one resumed native identity repair; preparation publication has a cooperative four-hour deadline outside the unchanged 300-second refresh budget; automatic scheduling capacity remains unmeasured",
+        "scope": "one resumed native identity repair; preparation publication has a cooperative four-hour deadline outside the default normal refresh budget; automatic scheduling capacity remains unmeasured",
         "invalid_source_sha256": hashlib.sha256(
             json.dumps([bad_events, bad_markets], sort_keys=True).encode()
         ).hexdigest(),
@@ -441,21 +441,45 @@ def expected_delta(events, markets, new_events, new_markets):
 def verify_expected(conn, seed_release, delta):
     counts = {}
     for table, rows in delta.items():
-        conn.execute(
-            f"CREATE TEMP TABLE expected_{table} AS SELECT * FROM read_parquet(?)",
-            [str(seed_release / f"{table}.parquet")],
-        )
+        path = str(seed_release / f"{table}.parquet")
+        expected_schema = list(SCHEMAS[table])
+        for query, parameters in (
+            ("SELECT * FROM read_parquet(?)", [path]),
+            (f"SELECT * FROM {table}", []),
+        ):
+            schema = [
+                tuple(row[:2]) for row in conn.execute(f"DESCRIBE {query}", parameters).fetchall()
+            ]
+            require(schema == expected_schema, f"exact seed-plus-delta schema mismatch: {table}")
         names = columns(table)
-        if rows:
-            conn.executemany(
-                f"INSERT INTO expected_{table} VALUES ({','.join('?' for _ in names)})",
-                [[r[n] for n in names] for r in rows],
+        projection = ", ".join(f'"{name}"' for name in names)
+        conn.execute(
+            "CREATE TEMP TABLE expected_delta AS SELECT * FROM read_parquet(?) WHERE false",
+            [path],
+        )
+        try:
+            values = ", ".join(
+                f"json_extract_string(value,'$[{i}]')::{kind}"
+                for i, (_, kind) in enumerate(expected_schema)
             )
-        mismatch = conn.execute(
-            f"SELECT * FROM ((SELECT * FROM expected_{table} EXCEPT ALL SELECT * FROM {table}) UNION ALL (SELECT * FROM {table} EXCEPT ALL SELECT * FROM expected_{table})) LIMIT 1"
-        ).fetchone()
-        require(mismatch is None, f"exact seed-plus-delta mismatch: {table}: {mismatch}")
-        counts[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for start in range(0, len(rows), 1000):
+                conn.execute(
+                    f"INSERT INTO expected_delta SELECT {values} FROM json_each(?)",
+                    [json.dumps([[r[n] for n in names] for r in rows[start : start + 1000]])],
+                )
+            # Group full values, including NULLs; signed counts retain duplicate multiplicity.
+            mismatch = conn.execute(
+                f"SELECT {projection} FROM ("
+                "SELECT *, 1::BIGINT AS multiplicity FROM read_parquet(?) UNION ALL "
+                "SELECT *, 1::BIGINT AS multiplicity FROM expected_delta UNION ALL "
+                f"SELECT *, -1::BIGINT AS multiplicity FROM {table}"
+                f") GROUP BY {projection} HAVING sum(multiplicity) <> 0 LIMIT 1",
+                [path],
+            ).fetchone()
+            require(mismatch is None, f"exact seed-plus-delta mismatch: {table}: {mismatch}")
+            counts[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.execute("DROP TABLE expected_delta")
     return counts
 
 
@@ -475,14 +499,26 @@ def cli(root, source, executable, *args):
                 )
     command = [executable] if executable else [sys.executable, "-m", "oddsfox_catalogue"]
     started = time.monotonic()
-    completed = subprocess.run(
-        [*command, "--root", str(root), *args],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=310,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [*command, "--root", str(root), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=defaults.limits.max_duration_s + 10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        completed = subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            exc.stdout.decode(errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else exc.stdout or "",
+            exc.stderr.decode(errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else exc.stderr or "CLI timeout",
+        )
     peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     result = {
         "process_rss": {
@@ -503,6 +539,76 @@ def cli(root, source, executable, *args):
 def successful(invocation):
     require(invocation["returncode"] == 0, invocation["stderr"] + invocation["stdout"])
     return invocation["result"]
+
+
+def pending_parents(settings, source_events):
+    """Read only the bounded live queue, never a no-op publication's snapshot."""
+    with connect_store(settings, read_only=True) as conn:
+        ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT event_id FROM _parent_repairs LIMIT ?", [len(source_events) + 1]
+            ).fetchall()
+        }
+    require(ids <= set(source_events), "unexpected parent repair IDs")
+    return ids
+
+
+def check_refresh(invocation, responses, settings):
+    result = successful(invocation)
+    require(result.get("status") == "published", "refresh did not publish")
+    require(
+        result.get("pending") is None and result.get("backlog") == 0, "discovery remains pending"
+    )
+    require(
+        invocation["elapsed_wall_s"] < settings.limits.max_duration_s,
+        "normal refresh exceeded default duration ceiling",
+    )
+    require(
+        result["http_attempts"] == len(responses)
+        and result["downloaded_bytes"] == sum(r["bytes"] for r in responses),
+        "request accounting mismatch",
+    )
+    return result
+
+
+def drain_parents(root, source, executable, source_events, row, started):
+    settings = CurrentSettings(root)
+    pending = pending_parents(settings, source_events)
+    row["first_refresh_pending_parents"] = sorted(pending)
+    row["first_refresh_complete"] = not pending
+    cap = math.ceil(len(pending) / 100)
+    row["followup_cap"] = cap
+    row["followups"] = []
+    result = row["refresh"]["result"]
+    try:
+        for _ in range(cap):
+            if not pending:
+                break
+            entry = {"pending_before": sorted(pending)}
+            row["followups"].append(entry)
+            before = source.stats["http_attempts"]
+            entry["invocation"] = cli(root, source.url, executable, "refresh")
+            entry["http"] = source.stats["responses"][before:]
+            result = check_refresh(entry["invocation"], entry["http"], settings)
+            require(
+                all(urlsplit(r["path"]).path in {"/events", "/markets"} for r in entry["http"]),
+                "followup made native or unknown HTTP request",
+            )
+            after = pending_parents(settings, source_events)
+            entry["pending_after"] = sorted(after)
+            require(after < pending, "parent repair queue stalled or added IDs")
+            pending = after
+        require(not pending, "parent repair followup cap exhausted")
+        return result
+    finally:
+        row["refresh_sequence_invocation_s"] = row["refresh"]["elapsed_wall_s"] + sum(
+            entry["invocation"]["elapsed_wall_s"]
+            for entry in row["followups"]
+            if "invocation" in entry
+        )
+        row["refresh_sequence_elapsed_wall_s"] = time.monotonic() - started
+        row["freshness_scope"] = "finite frozen-source drain; does not prove sustained freshness"
 
 
 def verify_highwater_only(responses, certificate):
@@ -732,7 +838,7 @@ def run(args):
         "account_roots": [str(path) for path in accounting_roots(account_roots)],
         "passed": False,
         "runs": [],
-        "limitations": "No historical network claim; six-hour/monthly reconciliation remains unmeasured.",
+        "limitations": "No historical network claim; 24-hour active/60-day cold reconciliation remains unmeasured.",
         "hardware": {
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -782,7 +888,7 @@ def run(args):
             )
             require(
                 directory_bytes(seed) <= settings.limits.max_retained_bytes,
-                "seed exceeds 64 GiB retained ceiling",
+                "seed exceeds default retained ceiling",
             )
             frontiers = {key: value["frontier"] for key, value in discovery["lanes"].items()}
             retained = retained_maxima(conn)
@@ -829,7 +935,11 @@ def run(args):
             row["copy_bytes"] = seed_size
             # Reserve the full canonical run ceiling, including publication/spill.
             row["capacity_before"] = capacity(
-                seed, output, args.max_retained_bytes, 64 * 1024**3, account_roots=account_roots
+                seed,
+                output,
+                args.max_retained_bytes,
+                settings.limits.max_retained_bytes,
+                account_roots=account_roots,
             )
             root = output / f"run-{index + 1}"
             root.mkdir()
@@ -865,6 +975,7 @@ def run(args):
                 (output / f"run-{index + 1}-preparation.json").write_text(
                     json.dumps(row["identity_repair_preparation"], indent=2, default=str)
                 )
+                sequence_started = time.monotonic()
                 before = source.stats["http_attempts"]
                 row["refresh"] = cli(root, source.url, args.executable, "refresh")
                 row["refresh_http"] = source.stats["responses"][before:]
@@ -875,16 +986,11 @@ def run(args):
                 row["identity_repair_requests"] = verify_repair_requests(
                     row["refresh_http"], repair["market_id"]
                 )
+                check_refresh(row["refresh"], row["refresh_http"], settings)
+                result = drain_parents(root, source, args.executable, events, row, sequence_started)
                 require(
-                    row["refresh"]["elapsed_wall_s"] < 300, "normal refresh exceeded 300 seconds"
-                )
-                require(
-                    not result.get("pending") and result.get("backlog") == 0,
-                    "delta was not fully applied",
-                )
-                require(
-                    result["http_attempts"] == len(row["refresh_http"]),
-                    "request accounting mismatch",
+                    row["refresh_sequence_elapsed_wall_s"] < 24 * 3600,
+                    "finite refresh sequence exceeded 24 hours",
                 )
                 row["verify"] = cli(root, source.url, args.executable, "verify")
                 successful(row["verify"])
@@ -906,11 +1012,17 @@ def run(args):
                     row["identity_repair_restored_generation"] = get_state(conn, "generation")
                     row["sql_generation"] = get_state(conn, "generation")
                 before = source.stats["http_attempts"]
+                row["unchanged_pending_before"] = sorted(
+                    pending_parents(CurrentSettings(root), events)
+                )
                 row["unchanged"] = cli(root, source.url, args.executable, "refresh")
+                row["unchanged_pending_after"] = sorted(
+                    pending_parents(CurrentSettings(root), events)
+                )
                 unchanged = successful(row["unchanged"])
                 require(
-                    row["unchanged"]["elapsed_wall_s"] < 300,
-                    "unchanged refresh exceeded 300 seconds",
+                    row["unchanged"]["elapsed_wall_s"] < settings.limits.max_duration_s,
+                    "unchanged refresh exceeded default duration ceiling",
                 )
                 require(
                     unchanged["publication"]["noop"]
