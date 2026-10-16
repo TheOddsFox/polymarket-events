@@ -72,6 +72,40 @@ An explicitly accounted fresh `--temporary` directory permits at most the existi
 serially under supervision. Its success alone does not establish scheduler capacity,
 rotation completion or a daily recovery-point target.
 
+### Full-source initial renewal — 2026-10-16
+
+An independent offline oracle passed for all four complete domain relations,
+their schemas and semantic digests, and the actual published generation 59.
+It authenticated changed receipts against retained responses and eight complete
+source audits, including failed preparation runs. All 21,874 original active
+events had strictly newer complete-membership receipts, with zero missing or
+unresolved memberships. The immutable source hash matched before and after.
+The SQL sequence took 596.68 seconds; total proof time, including source hashing
+and admission, was 900.29 seconds. It made no provider requests.
+
+Supplemental committed samples used the full store and real loopback networking
+with a 0.3-second provider delay. These are fetch/application/commit measurements;
+they exclude outer scheduling, publication and verification:
+
+| Sample | Records | Seconds |
+| --- | ---: | ---: |
+| Known closed events | 100 | 11.054 |
+| Known markets | 100 | 5.846 |
+| Dense event range | 100 | 266.289 |
+| Dense market range | 100 | 3.792 |
+
+The dense event response contained 11,027 memberships and 22,054 outcomes;
+HTTP took 2.554 seconds. This selected example is not a global cost bound.
+Scheduler checkpoints remained unchanged across samples. The final ordinary
+refresh and actual release verification passed; 23 background parent repairs
+remained disclosed, with no in-flight seed, fetch or discovery work.
+
+This establishes initial renewal, not sustained recurrence or a complete cold
+rotation. The subsequent real-clock trial stopped at its first storage admission
+because the complete reservation exceeded the unchanged 256 GiB combined
+envelope. It made no provider requests and produced no cadence or recovery
+acceptance evidence. Those gates remain open; schedules remain disabled.
+
 ### Software verification under the approved policy
 
 The final point-read implementation passed both native gates after removing the
