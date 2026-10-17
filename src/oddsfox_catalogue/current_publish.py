@@ -123,6 +123,14 @@ def _prune_unreferenced_raw(settings, referenced):
     return {"deleted_count": deleted, "deleted_bytes": freed}
 
 
+def _retain_raw(settings, referenced, result):
+    """Prune after the pointer is settled; a failed deletion is reported, never fatal."""
+    try:
+        result["raw_retention"] = _prune_unreferenced_raw(settings, referenced)
+    except Exception as exc:
+        result["retention_warning"] = str(exc)
+
+
 def _physical(path):
     safe_path(path)
     digest = hashlib.sha256()
@@ -340,8 +348,11 @@ def publish(settings, conn, *, deadline=None):
                         settings, {pinned.get("release_id"), pinned.get("previous_release_id")}
                     )
                     _check_deadline(deadline)
+                    referenced = _referenced_raw(conn)
                     conn.execute("COMMIT")
-                    return {**verified, "noop": True}
+                    result = {**verified, "noop": True}
+                    _retain_raw(settings, referenced, result)
+                    return result
         _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
         # Existing failed staging and orphan releases are counted by admit as retained bytes.
         estimate = 2 * (settings.store_path.stat().st_size if settings.store_path.exists() else 0)
@@ -430,10 +441,7 @@ def publish(settings, conn, *, deadline=None):
             _cleanup(settings, {release_id, previous})
         except Exception as exc:
             result["cleanup_warning"] = str(exc)
-        try:
-            result["raw_retention"] = _prune_unreferenced_raw(settings, referenced)
-        except Exception as exc:
-            result["retention_warning"] = str(exc)
+        _retain_raw(settings, referenced, result)
         return result
     except BaseException:
         conn.execute("ROLLBACK")

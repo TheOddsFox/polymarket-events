@@ -102,6 +102,35 @@ def test_publication_deletes_only_unreferenced_raw_and_keeps_every_reference(sto
     assert operator_data.exists()
 
 
+def test_unchanged_publication_deletes_unreferenced_raw_and_keeps_references(store):
+    settings, conn = store
+    referenced = make_raw(settings, RECEIPT)
+    assert publisher.publish(settings, conn)["noop"] is False
+    garbage = make_raw(settings, UNREFERENCED)
+    pending = make_raw(settings, PENDING)
+    set_state(conn, "fetch_pending", {"raw_id": PENDING, "remaining": []})
+    result = publisher.publish(settings, conn)
+    assert result["noop"] is True
+    assert result["raw_retention"] == {"deleted_count": 1, "deleted_bytes": 4}
+    assert not garbage.exists()
+    assert referenced.exists()
+    assert pending.exists()
+
+
+def test_unchanged_publication_reports_failed_raw_deletion_without_failing(store, monkeypatch):
+    settings, conn = store
+    assert publisher.publish(settings, conn)["noop"] is False
+    make_raw(settings, UNREFERENCED)
+
+    def fail(*_args):
+        raise OSError("injected delete failure")
+
+    monkeypatch.setattr(publisher, "_prune_unreferenced_raw", fail)
+    result = publisher.publish(settings, conn)
+    assert result["noop"] is True
+    assert "injected delete failure" in result["retention_warning"]
+
+
 def test_pending_raw_is_never_deleted_by_later_publications(store):
     settings, conn = store
     pending = make_raw(settings, PENDING)

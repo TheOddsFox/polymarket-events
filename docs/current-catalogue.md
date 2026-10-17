@@ -152,17 +152,18 @@ CLI parent cannot admit a second writer while it finishes.
 
 ## Raw retention
 
-Raw responses are retained by reference. After a publication pointer swap, the
-publisher deletes raw response directories that nothing references. A raw response is
-kept if any of these reference it:
+Raw responses are retained by reference. After every publication, including one that
+is a no-op because the current release is unchanged, the publisher deletes raw response
+directories that nothing references. A raw response is kept if any of these reference it:
 
 - `_receipts.response`, `_membership.response` or `_membership.latest_response`, or
   `_identity.invalidated_response`, in the store;
 - a pending durable response or any other sync-state pin, including nested ones.
 
 Pending raw is never deleted. Raw that is not named by a reference is deleted only
-after the new release is promoted; a failed deletion is reported as `retention_warning`
-and does not undo the release. The manifest records `raw.referenced_count` and
+after the publication commits, whether that promotes a new release or confirms the
+unchanged one; a failed deletion is reported as `retention_warning` and does not undo the
+publication. The manifest records `raw.referenced_count` and
 `raw.referenced_bytes`. Non-matching names in the raw directory are left alone.
 
 There is no age-based or size-based raw prune and no permanent replay archive.
