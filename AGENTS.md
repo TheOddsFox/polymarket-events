@@ -2,7 +2,7 @@
 
 This repository uses the Universal Pad specification for non-trivial agentic work.
 
-**Git** is the source of truth for code. **CI** is the source of truth for verification. **Pad** is the source of truth for intent, scope, status, dependencies, decisions, evidence, and handoffs.
+**Git** is the source of truth for code. **`scripts/verify`** is the source of truth for verification. **Pad** is the source of truth for intent, scope, status, dependencies, decisions, evidence, and handoffs. This repository has no GitHub Actions workflow.
 
 Read [`PROJECT_AGENT.md`](PROJECT_AGENT.md) before implementation. It holds repository-specific invariants, stack notes, and the native verification commands wrapped by `scripts/verify-fast` and `scripts/verify`.
 
@@ -20,7 +20,7 @@ Do not create Ideas, Tasks, chores, or extra default types. Do not run the Pad o
 
 ## Lifecycle
 
-specify → test/reproduce → implement → targeted verification → full verification → adversarial review → fix findings → re-verify → CI → evidence → done
+specify → test/reproduce → implement → targeted verification → full verification → adversarial review → fix findings → re-verify → evidence → done
 
 Do not start material implementation until the ticket is `ready`: intended behavior, invariants, regression surface, and verification are specified.
 
