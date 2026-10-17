@@ -61,6 +61,9 @@ the largest values any root configuration may set.
 | `active_recheck_s` | 72,000 s (20 h) | — |
 | `cold_recheck_s` | 58 days | — |
 | `publication_reserve_s` | 60 s (minimum) | — |
+| `full_pass_publish_interval_s` | 21,600 s (6 h) | — |
+| `duckdb_memory_bytes` | 2 GiB | 16 GiB |
+| `duckdb_threads` | 2 | 8 |
 
 Each root is admitted against its own ceilings. No combined envelope across roots
 is claimed. Ceilings are set from measured peaks; they are not a promise that any
@@ -69,7 +72,10 @@ corpus fits.
 ## Provider gate
 
 Before discovery or reconciliation, certify each event and market lane against known
-open, closed, and absent controls. Use IDs you established independently:
+open, closed, and absent controls. Use IDs you established independently. An absent
+control must be an ID the native endpoint answers with HTTP 404. `/events/2` and
+`/markets/10000000` do. A huge ID such as `999999999999` returns HTTP 422 and fails
+the lane.
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 probe \
@@ -90,6 +96,8 @@ permission to fall back to an unproven query.
 Run each command by hand. Each invocation is bounded by `max_duration_s` (1200 s),
 including publication. Publication time is reserved inside that deadline: the reserve is
 at least 60 seconds, or 1.5 times the previous measured publication if that is larger.
+A `reconcile --full-pass` invocation that is not publishing reserves only
+`publication_reserve_s`.
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 refresh
@@ -109,11 +117,20 @@ uv run catalogue --root /srv/catalogue-v3 verify
   Closed events, known markets and historical ID windows rotate on the cold schedule.
   Work survives between invocations.
 - `reconcile --full-pass` starts a forced full pass, or resumes an unfinished one.
-  While the pass is active it bypasses the 58-day cold gate, the 30-day window gate and
-  the active freshness skip. It visits every known event and market until each has a
-  receipt newer than the pass start. Each invocation stops at `max_duration_s`; the next
-  invocation resumes. When no known entity is left, the pass records `completed_at`. The
-  pass never changes `source_complete`, which stays `false`.
+  While the pass is active it bypasses the 58-day cold gate and the active freshness
+  skip, and it does not schedule historical id-range windows. It loads the stale event
+  ids once per invocation and walks them in numeric order from `cursor_after`, 100 ids
+  per request. Nested markets renew from the event response. After those events, a
+  markets sweep fetches markets that are still stale, including orphans. An active event
+  within two hours of the 24-hour target takes the next slot. The next list request is
+  prefetched on a second client that shares the rate limit; a prefetched body is used
+  only when it matches the frozen request. Each invocation stops at `max_duration_s`;
+  the next invocation resumes from the cursor. When no known entity is left, the pass
+  records `completed_at`. The pass never changes `source_complete`, which stays `false`.
+  The invocation publishes when the pass completes, or when the last publication is
+  older than `full_pass_publish_interval_s`. Otherwise it exits 3 with `published: false`
+  and the `full_pass` object. `refresh`, plain `reconcile`, and `publish` still publish
+  on every invocation.
 - `status` reports progress, freshness, the `full_pass` object, the discovery state and
   the last run.
 - `current` and `verify` verify the publication pointer and release. `verify` is the
@@ -142,13 +159,23 @@ A known event whose source member list stays incomplete produces no membership r
 so `remaining` stays above 0 for it and the pass stays open. Investigate those events
 before treating a pass as complete.
 
-A busy invocation exits **3** with `status: busy`. Other blocked failures also exit 3.
+A busy invocation exits **3** with `status: busy`. A full-pass invocation that does not
+publish also exits 3, with `published: false`. Other blocked failures also exit 3.
 Read the status and message before retrying. Persistent busy or blocked results need
 operator investigation, not a retry loop.
 
 One supervised HTTP worker, one root writer lock, and at most 10 requests per second are
 allowed. The worker holds the lock through database and filesystem changes. Killing its
-CLI parent cannot admit a second writer while it finishes.
+CLI parent cannot admit a second writer while it finishes. A second client may prefetch
+the next full-pass request; it shares that worker's rate limit.
+
+When a publication's store generation matches the current release, the publisher checks
+the pointer, the manifest SHA-256, the exact file inventory, and each Parquet's size and
+SHA-256, and it still rejects a live store that fails its own checks. It does not
+re-fingerprint the Parquet. A changed publication, and the standalone `verify` and
+`current` commands, keep the full semantic check. Retained-byte
+admission walks the root when the invocation connects, again before publication, and
+again at exit, and adds bytes as raw responses are written.
 
 ## Raw retention
 

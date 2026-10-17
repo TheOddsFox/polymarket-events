@@ -84,39 +84,6 @@ def generation(conn):
     return get_state(conn, "generation", 0)
 
 
-def _put(conn, table, row):
-    names = columns(table)
-    insert = "INSERT" if table == "event_markets" else "INSERT OR REPLACE"
-    conn.execute(
-        f"{insert} INTO {table} ({projection(table)}) VALUES ({', '.join('?' for _ in names)})",
-        [row.get(k) for k in names],
-    )
-
-
-def _newer(conn, kind, venue, key, stamp):
-    old = conn.execute(
-        "SELECT receipt,response FROM _receipts WHERE kind=? AND venue=? AND id=?",
-        [kind, venue, key],
-    ).fetchone()
-    if old and stamp <= tuple(old):
-        return False
-    if old:
-        conn.execute(
-            "UPDATE _receipts SET receipt=?,response=? WHERE kind=? AND venue=? AND id=?",
-            [*stamp, kind, venue, key],
-        )
-    else:
-        conn.execute("INSERT INTO _receipts VALUES (?,?,?,?,?)", [kind, venue, key, *stamp])
-    return True
-
-
-def _snapshot(conn, table, predicate, params):
-    return conn.execute(
-        f"SELECT {projection(table)} FROM {table} WHERE {predicate} ORDER BY {', '.join(KEYS[table])}",
-        params,
-    ).fetchall()
-
-
 def _identity_key(mapping):
     return [
         tuple(
@@ -134,297 +101,693 @@ def _identity_key(mapping):
     ]
 
 
-def apply(conn, response: ResponseRows, progress=None):
+def record_attempts(conn, lane, ids, when):
+    """Record scheduler attempts for ids that exist after this response.
+
+    Window gaps are not rows. ``lane`` ``native`` records against markets.
+    """
+    table, key = ("events", "event_id") if lane == "events" else ("markets", "market_id")
+    source = f"SELECT {key} id FROM {table}"
+    if lane == "events":
+        source += " UNION SELECT event_id FROM _parent_repairs"
+    conn.execute(
+        f"""INSERT OR REPLACE INTO _reconcile_attempts
+        SELECT ?, id, ? FROM ({source}) WHERE id IN (SELECT unnest(?))""",
+        [lane, when, [str(value) for value in ids]],
+    )
+
+
+def apply(conn, response: ResponseRows, progress=None, *, attempts=None):
+    """Apply one response as a set. ``attempts`` commits in this transaction."""
+    stamp = _receipt_stamp(response)
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        result = _apply_set(conn, response, stamp, progress, attempts)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return result
+
+
+_WRITE_CHUNK = 1000
+
+
+def _receipt_stamp(response):
     stamp = (
         datetime.fromisoformat(response.received_at.replace("Z", "+00:00")),
         response.response_id,
     )
     if stamp[0].tzinfo is None:
         raise CurrentError("receipt must include timezone")
-    stamp = (stamp[0].astimezone(UTC), stamp[1])
-    conn.execute("BEGIN TRANSACTION")
-    try:
-        changed = False
-        for row in response.events:
-            venue, key = row["venue"], row["event_id"]
-            before = _snapshot(conn, "events", "venue=? AND event_id=?", [venue, key])
-            if _newer(conn, "event", venue, key, stamp) and before != [
-                tuple(row.get(name) for name in columns("events"))
-            ]:
-                _put(conn, "events", row)
-            changed |= before != _snapshot(conn, "events", "venue=? AND event_id=?", [venue, key])
-        for event_id, members in response.memberships.items():
-            event = next((e for e in response.events if e["event_id"] == event_id), None)
-            venue = event["venue"] if event else "polymarket"
-            old = conn.execute(
-                "SELECT receipt,response,latest_receipt,latest_response FROM _membership WHERE venue=? AND event_id=?",
-                [venue, event_id],
-            ).fetchone()
-            latest = old is None or stamp > tuple(old[2:])
-            if old is None:
-                conn.execute(
-                    "INSERT INTO _membership VALUES (?,?,NULL,NULL,true,?,?)",
-                    [venue, event_id, *stamp],
-                )
-            if latest:
-                conn.execute(
-                    "UPDATE _membership SET unresolved=?,latest_receipt=?,latest_response=? WHERE venue=? AND event_id=?",
-                    [members is None, *stamp, venue, event_id],
-                )
-            if members is None or (old and old[0] and stamp <= tuple(old[:2])):
-                continue
-            before = _snapshot(conn, "event_markets", "venue=? AND event_id=?", [venue, event_id])
-            expected_links = sorted((venue, event_id, market_id) for market_id in set(members))
-            if before != expected_links:
-                conn.execute(
-                    "DELETE FROM event_markets WHERE venue=? AND event_id=?", [venue, event_id]
-                )
-                for market_id in set(members):
-                    _put(
-                        conn,
-                        "event_markets",
-                        dict(venue=venue, event_id=event_id, market_id=market_id),
-                    )
+    return (stamp[0].astimezone(UTC), stamp[1])
+
+
+def _chunks(rows):
+    rows = list(rows)
+    for start in range(0, len(rows), _WRITE_CHUNK):
+        yield rows[start : start + _WRITE_CHUNK]
+
+
+def _placeholders(count, width):
+    row = "(" + ",".join("?" * width) + ")"
+    return ",".join(row for _ in range(count))
+
+
+def _flat(rows):
+    return [value for row in rows for value in row]
+
+
+def _select_in(conn, query, keys, width):
+    found = []
+    for chunk in _chunks(keys):
+        found.extend(
             conn.execute(
-                "UPDATE _membership SET receipt=?,response=? WHERE venue=? AND event_id=?",
-                [*stamp, venue, event_id],
-            )
-            conn.execute("DELETE FROM _parent_repairs WHERE event_id=?", [event_id])
-            changed |= before != _snapshot(
-                conn, "event_markets", "venue=? AND event_id=?", [venue, event_id]
-            )
-        impacted = set()
-        before_markets = {}
-        before_outcomes = {}
-
-        def remember(venue, market_id):
-            key = (venue, market_id)
-            if key not in impacted:
-                impacted.add(key)
-                before_markets[key] = _snapshot(conn, "markets", "venue=? AND market_id=?", key)
-                before_outcomes[key] = _snapshot(conn, "outcomes", "venue=? AND market_id=?", key)
-
-        old_identities = {}
-        asset_keys = {(o["venue"], o["asset_kind"], o["asset_id"]) for o in response.outcomes}
-        for row in response.markets:
-            key = (row["venue"], row["market_id"])
-            old = conn.execute(
-                "SELECT candidate,accepted,invalidated_at,invalidated_response FROM _identity WHERE venue=? AND market_id=?",
-                key,
-            ).fetchone()
-            old_identities[key] = old
-            for mapping in old[:2] if old else []:
-                for outcome in json.loads(mapping) if mapping else []:
-                    asset_keys.add((key[0], outcome["asset_kind"], outcome["asset_id"]))
-        claims = {}
-        if asset_keys:
-            values = ",".join("(?,?,?)" for _ in asset_keys)
-            matched = conn.execute(
-                "SELECT c.venue,c.market_id,c.role,c.asset_kind,c.asset_id FROM _identity_claims c "
-                f"JOIN (VALUES {values}) k(venue,asset_kind,asset_id) "
-                "ON c.venue=k.venue AND c.asset_kind=k.asset_kind AND c.asset_id=k.asset_id",
-                [value for key in asset_keys for value in key],
+                query.format(values=_placeholders(len(chunk), width)), _flat(chunk)
             ).fetchall()
-            for venue, market_id, role, kind, asset in matched:
-                claims.setdefault((venue, kind, asset), {}).setdefault(market_id, set()).add(role)
-                remember(venue, market_id)
-        replacements = {}
-        for row in response.markets:
-            venue, market_id = row["venue"], row["market_id"]
-            remember(venue, market_id)
-            if not _newer(conn, "market", venue, market_id, stamp):
-                continue
-            outcomes = [
-                o for o in response.outcomes if o["venue"] == venue and o["market_id"] == market_id
-            ]
-            candidate = (
-                sorted(outcomes, key=lambda o: o["outcome_index"])
-                if row.get("usable") and outcomes
-                else None
-            )
-            old = old_identities[(venue, market_id)]
-            accepted = json.loads(old[1]) if old and old[1] else None
-            invalid = (old[2], old[3]) if old and old[2] else None
-            if invalid is None and (
-                candidate is None
-                or (accepted is not None and _identity_key(candidate) != _identity_key(accepted))
-            ):
-                invalid = stamp
-            native = market_id in response.native_market_ids
-            ownership_conflict = any(
-                any(
-                    owner != market_id
-                    for owner in claims.get((venue, o["asset_kind"], o["asset_id"]), {})
-                )
-                for o in candidate or []
-            )
-            if (
-                candidate
-                and native
-                and not ownership_conflict
-                and (invalid is None or stamp >= invalid)
-            ):
-                # A native response can resolve its own map change, but not older invalidation.
-                accepted, invalid = candidate, None
-            elif candidate and invalid is None and not ownership_conflict:
-                accepted = candidate
-            if candidate is None and old and old[0]:
-                candidate = json.loads(old[0])
-            if before_markets[(venue, market_id)] != [
-                tuple(row.get(name) for name in columns("markets"))
-            ]:
-                _put(conn, "markets", row)
-            identity_values = (
-                candidate if candidate else None,
-                accepted if accepted else None,
-                invalid[0] if invalid else None,
-                invalid[1] if invalid else None,
-            )
-            old_values = (
-                (
-                    json.loads(old[0]) if old[0] else None,
-                    json.loads(old[1]) if old[1] else None,
-                    old[2],
-                    old[3],
-                )
-                if old
-                else None
-            )
-            if old_values != identity_values:
-                conn.execute(
-                    "INSERT OR REPLACE INTO _identity VALUES (?,?,?,?,?,?)",
-                    [
-                        venue,
-                        market_id,
-                        json.dumps(candidate) if candidate else None,
-                        json.dumps(accepted) if accepted else None,
-                        identity_values[2],
-                        identity_values[3],
-                    ],
-                )
-            for (claim_venue, _kind, _asset), owners in claims.items():
-                if claim_venue == venue:
-                    owners.pop(market_id, None)
-            replacement = []
-            for role, mapping in [("candidate", candidate), ("accepted", accepted)]:
-                for outcome in mapping or []:
-                    kind, asset = outcome["asset_kind"], outcome["asset_id"]
-                    claims.setdefault((venue, kind, asset), {}).setdefault(market_id, set()).add(
-                        role
-                    )
-                    replacement.append((venue, market_id, role, kind, asset))
-            replacements[(venue, market_id)] = replacement
-        if replacements:
-            values = ",".join("(?,?)" for _ in replacements)
-            stored_claims = {}
-            for claim in conn.execute(
-                "SELECT c.venue,c.market_id,c.role,c.asset_kind,c.asset_id FROM _identity_claims c "
-                f"JOIN (VALUES {values}) k(venue,market_id) "
-                "ON c.venue=k.venue AND c.market_id=k.market_id",
-                [value for key in replacements for value in key],
-            ).fetchall():
-                stored_claims.setdefault(claim[:2], []).append(claim)
-            replacements = {
-                key: replacement
-                for key, replacement in replacements.items()
-                if sorted(stored_claims.get(key, [])) != sorted(set(replacement))
+        )
+    return found
+
+
+def _write_values(conn, sql, rows, width):
+    for chunk in _chunks(rows):
+        conn.execute(sql.format(values=_placeholders(len(chunk), width)), _flat(chunk))
+
+
+def _row_tuple(table, row):
+    return tuple(row.get(name) for name in columns(table))
+
+
+def _load_keyed(conn, query, keys, width, key_length):
+    return {
+        tuple(row[:key_length]): row[key_length:] for row in _select_in(conn, query, keys, width)
+    }
+
+
+def _apply_set(conn, response, stamp, progress, attempts):
+    event_keys = list({(row["venue"], row["event_id"]) for row in response.events})
+    # A repeated id in one response keeps the first row, matching the receipt gate.
+    event_rows = {}
+    for row in response.events:
+        event_rows.setdefault((row["venue"], row["event_id"]), row)
+    stored_events = (
+        _load_keyed(
+            conn,
+            "SELECT s.venue, s.event_id, "
+            + ", ".join(f's."{name}"' for name in columns("events"))
+            + " FROM events s JOIN (VALUES {values}) k(venue, event_id) "
+            "ON s.venue=k.venue AND s.event_id=k.event_id",
+            event_keys,
+            2,
+            2,
+        )
+        if event_keys
+        else {}
+    )
+    event_receipts = (
+        _load_keyed(
+            conn,
+            "SELECT r.venue, r.id, r.receipt, r.response FROM _receipts r "
+            "JOIN (VALUES {values}) k(venue, id) ON r.kind='event' AND r.venue=k.venue AND r.id=k.id",
+            event_keys,
+            2,
+            2,
+        )
+        if event_keys
+        else {}
+    )
+    membership_keys = []
+    for event_id in response.memberships:
+        event = next((row for row in response.events if row["event_id"] == event_id), None)
+        venue = event["venue"] if event else "polymarket"
+        membership_keys.append((venue, event_id))
+    memberships = {
+        key: {
+            "receipt": row[0],
+            "response": row[1],
+            "unresolved": row[2],
+            "latest_receipt": row[3],
+            "latest_response": row[4],
+        }
+        for key, row in (
+            _load_keyed(
+                conn,
+                "SELECT m.venue, m.event_id, m.receipt, m.response, m.unresolved, "
+                "m.latest_receipt, m.latest_response FROM _membership m "
+                "JOIN (VALUES {values}) k(venue, event_id) "
+                "ON m.venue=k.venue AND m.event_id=k.event_id",
+                membership_keys,
+                2,
+                2,
+            ).items()
+            if membership_keys
+            else []
+        )
+    }
+    link_rows = (
+        _select_in(
+            conn,
+            "SELECT s.venue, s.event_id, s.market_id FROM event_markets s "
+            "JOIN (VALUES {values}) k(venue, event_id) ON s.venue=k.venue AND s.event_id=k.event_id "
+            "ORDER BY s.venue, s.event_id, s.market_id",
+            membership_keys,
+            2,
+        )
+        if membership_keys
+        else []
+    )
+    links = {}
+    for venue, event_id, market_id in link_rows:
+        links.setdefault((venue, event_id), []).append((venue, event_id, market_id))
+
+    changed = False
+    event_writes = {}
+    receipt_writes = {}
+    for key, row in event_rows.items():
+        before = [stored_events[key]] if key in stored_events else []
+        projected = [_row_tuple("events", row)]
+        old = event_receipts.get(key)
+        newer = not (old and stamp <= old)
+        if newer and before != projected:
+            event_writes[key] = projected[0]
+            stored_events[key] = projected[0]
+        if newer:
+            receipt_writes[("event", *key)] = ("event", *key, *stamp)
+        after = [stored_events[key]] if key in stored_events else []
+        changed |= before != after
+
+    membership_writes = {}
+    link_deletes = []
+    link_inserts = []
+    repair_deletes = []
+    for event_id, members in response.memberships.items():
+        event = next((row for row in response.events if row["event_id"] == event_id), None)
+        venue = event["venue"] if event else "polymarket"
+        key = (venue, event_id)
+        old = memberships.get(key)
+        old_receipt = None if old is None else (old["receipt"], old["response"])
+        old_latest = None if old is None else (old["latest_receipt"], old["latest_response"])
+        latest = old is None or stamp > old_latest
+        if old is None:
+            old = {
+                "receipt": None,
+                "response": None,
+                "unresolved": True,
+                "latest_receipt": stamp[0],
+                "latest_response": stamp[1],
             }
-        if replacements:
-            values = ",".join("(?,?)" for _ in replacements)
-            conn.execute(
-                "DELETE FROM _identity_claims USING "
-                f"(VALUES {values}) k(venue,market_id) WHERE "
-                "_identity_claims.venue=k.venue AND _identity_claims.market_id=k.market_id",
-                [value for key in replacements for value in key],
+            memberships[key] = old
+            membership_writes[key] = old
+        if latest:
+            old["unresolved"] = members is None
+            old["latest_receipt"], old["latest_response"] = stamp
+            membership_writes[key] = old
+        if members is None or (old_receipt and old_receipt[0] and stamp <= old_receipt):
+            continue
+        before = links.get(key, [])
+        expected = sorted((venue, event_id, market_id) for market_id in set(members))
+        if before != expected:
+            link_deletes.append(key)
+            link_inserts.extend(expected)
+            links[key] = expected
+        old["receipt"], old["response"] = stamp
+        membership_writes[key] = old
+        repair_deletes.append(event_id)
+        changed |= before != links.get(key, [])
+
+    market_rows = {}
+    for row in response.markets:
+        market_rows.setdefault((row["venue"], row["market_id"]), row)
+    market_keys = list(market_rows)
+    identities = {
+        key: row
+        for key, row in (
+            _load_keyed(
+                conn,
+                "SELECT i.venue, i.market_id, i.candidate, i.accepted, "
+                "i.invalidated_at, i.invalidated_response FROM _identity i "
+                "JOIN (VALUES {values}) k(venue, market_id) "
+                "ON i.venue=k.venue AND i.market_id=k.market_id",
+                market_keys,
+                2,
+                2,
+            ).items()
+            if market_keys
+            else []
+        )
+    }
+    asset_keys = {(row["venue"], row["asset_kind"], row["asset_id"]) for row in response.outcomes}
+    for key, old in identities.items():
+        for mapping in old[:2]:
+            for outcome in json.loads(mapping) if mapping else []:
+                asset_keys.add((key[0], outcome["asset_kind"], outcome["asset_id"]))
+    claims = {}
+    matched = (
+        _select_in(
+            conn,
+            "SELECT c.venue, c.market_id, c.role, c.asset_kind, c.asset_id FROM _identity_claims c "
+            "JOIN (VALUES {values}) k(venue, asset_kind, asset_id) "
+            "ON c.venue=k.venue AND c.asset_kind=k.asset_kind AND c.asset_id=k.asset_id",
+            asset_keys,
+            3,
+        )
+        if asset_keys
+        else []
+    )
+    impacted = set(market_keys)
+    for venue, market_id, role, kind, asset in matched:
+        claims.setdefault((venue, kind, asset), {}).setdefault(market_id, set()).add(role)
+        impacted.add((venue, market_id))
+    extra_markets = [key for key in impacted if key not in market_keys and key not in identities]
+    if extra_markets:
+        identities.update(
+            _load_keyed(
+                conn,
+                "SELECT i.venue, i.market_id, i.candidate, i.accepted, "
+                "i.invalidated_at, i.invalidated_response FROM _identity i "
+                "JOIN (VALUES {values}) k(venue, market_id) "
+                "ON i.venue=k.venue AND i.market_id=k.market_id",
+                extra_markets,
+                2,
+                2,
             )
-            rows = list({row for replacement in replacements.values() for row in replacement})
-            if rows:
-                conn.executemany("INSERT INTO _identity_claims VALUES (?,?,?,?,?)", rows)
-        conflicts = {
-            (venue, market_id)
-            for (venue, _kind, _asset), owners in claims.items()
-            if len(owners) > 1
-            for market_id in owners
+        )
+    before_markets = (
+        _load_keyed(
+            conn,
+            "SELECT s.venue, s.market_id, "
+            + ", ".join(f's."{name}"' for name in columns("markets"))
+            + " FROM markets s JOIN (VALUES {values}) k(venue, market_id) "
+            "ON s.venue=k.venue AND s.market_id=k.market_id",
+            impacted,
+            2,
+            2,
+        )
+        if impacted
+        else {}
+    )
+    outcome_lists = {}
+    if impacted:
+        for row in _select_in(
+            conn,
+            "SELECT "
+            + ", ".join(f's."{name}"' for name in columns("outcomes"))
+            + " FROM outcomes s JOIN (VALUES {values}) k(venue, market_id) "
+            "ON s.venue=k.venue AND s.market_id=k.market_id",
+            impacted,
+            2,
+        ):
+            outcome_lists.setdefault(row[:2], []).append(row)
+    before_outcomes = {
+        key: sorted(outcome_lists.get(key, []), key=lambda item: item[:2] + (item[3],))
+        for key in impacted
+    }
+    market_receipts = (
+        _load_keyed(
+            conn,
+            "SELECT r.venue, r.id, r.receipt, r.response FROM _receipts r "
+            "JOIN (VALUES {values}) k(venue, id) ON r.kind='market' AND r.venue=k.venue AND r.id=k.id",
+            list({*market_keys, *[("polymarket", key) for key in response.absent_market_ids]}),
+            2,
+            2,
+        )
+        if market_keys or response.absent_market_ids
+        else {}
+    )
+    stored_claims = {}
+    if market_keys:
+        for claim in _select_in(
+            conn,
+            "SELECT c.venue, c.market_id, c.role, c.asset_kind, c.asset_id FROM _identity_claims c "
+            "JOIN (VALUES {values}) k(venue, market_id) "
+            "ON c.venue=k.venue AND c.market_id=k.market_id",
+            market_keys,
+            2,
+        ):
+            stored_claims.setdefault(claim[:2], []).append(claim)
+
+    market_state = {key: list(before_markets[key]) for key in before_markets}
+    market_columns = columns("markets")
+    outcome_state = {key: list(rows) for key, rows in before_outcomes.items()}
+    identity_writes = {}
+    claim_replacements = {}
+    for key, row in market_rows.items():
+        venue, market_id = key
+        old_receipt = market_receipts.get(key)
+        if old_receipt and stamp <= old_receipt:
+            continue
+        receipt_writes[("market", *key)] = ("market", *key, *stamp)
+        market_receipts[key] = stamp
+        outcomes = [
+            item
+            for item in response.outcomes
+            if item["venue"] == venue and item["market_id"] == market_id
+        ]
+        candidate = (
+            sorted(outcomes, key=lambda item: item["outcome_index"])
+            if row.get("usable") and outcomes
+            else None
+        )
+        old = identities.get(key)
+        accepted = json.loads(old[1]) if old and old[1] else None
+        invalid = (old[2], old[3]) if old and old[2] else None
+        if invalid is None and (
+            candidate is None
+            or (accepted is not None and _identity_key(candidate) != _identity_key(accepted))
+        ):
+            invalid = stamp
+        native = market_id in response.native_market_ids
+        ownership_conflict = any(
+            any(
+                owner != market_id
+                for owner in claims.get((venue, item["asset_kind"], item["asset_id"]), {})
+            )
+            for item in candidate or []
+        )
+        if (
+            candidate
+            and native
+            and not ownership_conflict
+            and (invalid is None or stamp >= invalid)
+        ):
+            accepted, invalid = candidate, None
+        elif candidate and invalid is None and not ownership_conflict:
+            accepted = candidate
+        if candidate is None and old and old[0]:
+            candidate = json.loads(old[0])
+        projected = list(_row_tuple("markets", row))
+        if key not in before_markets or list(before_markets[key]) != projected:
+            market_state[key] = projected
+        identity_values = (
+            candidate if candidate else None,
+            accepted if accepted else None,
+            invalid[0] if invalid else None,
+            invalid[1] if invalid else None,
+        )
+        old_values = (
+            (
+                json.loads(old[0]) if old[0] else None,
+                json.loads(old[1]) if old[1] else None,
+                old[2],
+                old[3],
+            )
+            if old
+            else None
+        )
+        if old_values != identity_values:
+            identities[key] = (
+                json.dumps(candidate) if candidate else None,
+                json.dumps(accepted) if accepted else None,
+                identity_values[2],
+                identity_values[3],
+            )
+            identity_writes[key] = identities[key]
+        for (claim_venue, _kind, _asset), owners in claims.items():
+            if claim_venue == venue:
+                owners.pop(market_id, None)
+        replacement = []
+        for role, mapping in [("candidate", candidate), ("accepted", accepted)]:
+            for outcome in mapping or []:
+                kind, asset = outcome["asset_kind"], outcome["asset_id"]
+                claims.setdefault((venue, kind, asset), {}).setdefault(market_id, set()).add(role)
+                replacement.append((venue, market_id, role, kind, asset))
+        if sorted(stored_claims.get(key, [])) != sorted(set(replacement)):
+            claim_replacements[key] = list(set(replacement))
+
+    conflicts = {
+        (venue, market_id)
+        for (venue, _kind, _asset), owners in claims.items()
+        if len(owners) > 1
+        for market_id in owners
+    }
+    outcome_deletes = []
+    outcome_inserts = []
+    for venue, market_id in impacted:
+        key = (venue, market_id)
+        identity = identities.get(key)
+        conflict = key in conflicts
+        if conflict and identity is not None:
+            invalidated = identity[2]
+            if invalidated is None or (identity[2], identity[3]) < stamp:
+                identity = (identity[0], identity[1], stamp[0], stamp[1])
+                identities[key] = identity
+                identity_writes[key] = identity
+        usable = bool(identity and identity[0] and identity[1] and not identity[2] and not conflict)
+        error = (
+            None
+            if usable
+            else (
+                "asset_ownership_conflict"
+                if conflict
+                else "native_confirmation_required"
+                if identity and identity[2]
+                else "invalid_identity"
+            )
+        )
+        if key in market_state:
+            usable_at = market_columns.index("usable")
+            error_at = market_columns.index("identity_error")
+            current = market_state[key]
+            if current[usable_at] is not usable or current[error_at] != error:
+                current[usable_at] = usable
+                current[error_at] = error
+        parsed = json.loads(identity[1]) if usable else []
+        expected = sorted(
+            (tuple(outcome.get(name) for name in columns("outcomes")) for outcome in parsed),
+            key=lambda item: item[:2] + (item[3],),
+        )
+        if before_outcomes.get(key, []) != expected:
+            outcome_deletes.append(key)
+            outcome_inserts.extend(expected)
+            outcome_state[key] = expected
+        market_changed = ([tuple(before_markets[key])] if key in before_markets else []) != (
+            [tuple(market_state[key])] if key in market_state else []
+        )
+        outcome_changed = before_outcomes.get(key, []) != outcome_state.get(key, [])
+        changed |= market_changed or outcome_changed
+
+    absent_events = sorted(response.absent_event_ids)
+    existing_events = {
+        event_id
+        for venue, event_id in event_writes
+        if venue == "polymarket" and event_id in response.absent_event_ids
+    }
+    if absent_events:
+        existing_events.update(
+            row[0]
+            for row in _select_in(
+                conn,
+                "SELECT event_id FROM events WHERE venue='polymarket' AND event_id IN "
+                "(SELECT * FROM (VALUES {values}) k(event_id))",
+                [(event_id,) for event_id in absent_events],
+                1,
+            )
+        )
+    absent_memberships = {}
+    if existing_events:
+        absent_memberships = _load_keyed(
+            conn,
+            "SELECT m.event_id, m.venue, m.receipt, m.response, m.unresolved, "
+            "m.latest_receipt, m.latest_response FROM _membership m "
+            "JOIN (VALUES {values}) k(event_id) ON m.venue='polymarket' AND m.event_id=k.event_id",
+            [(event_id,) for event_id in existing_events],
+            1,
+            1,
+        )
+    for event_id in absent_events:
+        key = ("polymarket", event_id)
+        if key in membership_writes and event_id in existing_events:
+            row = dict(membership_writes[key])
+            if row["receipt"] is not None and (row["receipt"], row["response"]) >= stamp:
+                continue
+            row["receipt"], row["response"] = stamp
+            membership_writes[key] = row
+            continue
+        if event_id not in existing_events or (event_id,) not in absent_memberships:
+            continue
+        venue, receipt, response_id, unresolved, latest_receipt, latest_response = (
+            absent_memberships[(event_id,)]
+        )
+        if receipt is not None and (receipt, response_id) >= stamp:
+            continue
+        key = (venue, event_id)
+        row = membership_writes.get(key) or memberships.get(key)
+        if row is None:
+            row = {
+                "receipt": stamp[0],
+                "response": stamp[1],
+                "unresolved": unresolved,
+                "latest_receipt": latest_receipt,
+                "latest_response": latest_response,
+            }
+        else:
+            row = dict(row)
+            row["receipt"], row["response"] = stamp
+        membership_writes[key] = row
+
+    absent_market_ids = [
+        market_id
+        for market_id in sorted(response.absent_market_ids)
+        if ("polymarket", market_id) not in market_state
+        and ("polymarket", market_id) not in before_markets
+    ]
+    absent_present = (
+        {
+            row[0]
+            for row in _select_in(
+                conn,
+                "SELECT market_id FROM markets WHERE venue='polymarket' AND market_id IN "
+                "(SELECT * FROM (VALUES {values}) k(market_id))",
+                [(market_id,) for market_id in absent_market_ids],
+                1,
+            )
         }
-        for venue, market_id in impacted:
-            identity = conn.execute(
-                "SELECT candidate,accepted,invalidated_at FROM _identity WHERE venue=? AND market_id=?",
-                [venue, market_id],
-            ).fetchone()
-            conflict = (venue, market_id) in conflicts
-            if conflict:
-                conn.execute(
-                    "UPDATE _identity SET invalidated_at=?, invalidated_response=? "
-                    "WHERE venue=? AND market_id=? AND "
-                    "(invalidated_at IS NULL OR (invalidated_at, invalidated_response) < (?, ?))",
-                    [*stamp, venue, market_id, *stamp],
-                )
-            usable = bool(
-                identity and identity[0] and identity[1] and not identity[2] and not conflict
+        if absent_market_ids
+        else set()
+    )
+    for market_id in sorted(response.absent_market_ids):
+        key = ("polymarket", market_id)
+        if (
+            key not in market_state
+            and key not in before_markets
+            and market_id not in absent_present
+        ):
+            continue
+        old = market_receipts.get(key)
+        if not (old and stamp <= old):
+            receipt_writes[("market", *key)] = ("market", *key, *stamp)
+
+    _write_values(
+        conn,
+        "INSERT OR REPLACE INTO events ("
+        + projection("events")
+        + ") SELECT * FROM (VALUES {values}) v("
+        + projection("events")
+        + ")",
+        event_writes.values(),
+        len(columns("events")),
+    )
+    _write_values(
+        conn,
+        "INSERT OR REPLACE INTO _receipts (kind, venue, id, receipt, response) "
+        "SELECT * FROM (VALUES {values}) v(kind, venue, id, receipt, response)",
+        receipt_writes.values(),
+        5,
+    )
+    _write_values(
+        conn,
+        "DELETE FROM event_markets USING (VALUES {values}) k(venue, event_id) "
+        "WHERE event_markets.venue=k.venue AND event_markets.event_id=k.event_id",
+        link_deletes,
+        2,
+    )
+    _write_values(
+        conn,
+        "INSERT INTO event_markets ("
+        + projection("event_markets")
+        + ") SELECT * FROM (VALUES {values}) v("
+        + projection("event_markets")
+        + ")",
+        link_inserts,
+        3,
+    )
+    # Membership receipt lands after the link replacement so a failure there rolls it back.
+    _write_values(
+        conn,
+        "INSERT OR REPLACE INTO _membership "
+        "(venue, event_id, receipt, response, unresolved, latest_receipt, latest_response) "
+        "SELECT * FROM (VALUES {values}) v("
+        "venue, event_id, receipt, response, unresolved, latest_receipt, latest_response)",
+        [
+            (
+                venue,
+                event_id,
+                row["receipt"],
+                row["response"],
+                row["unresolved"],
+                row["latest_receipt"],
+                row["latest_response"],
             )
-            error = (
-                None
-                if usable
-                else (
-                    "asset_ownership_conflict"
-                    if conflict
-                    else "native_confirmation_required"
-                    if identity and identity[2]
-                    else "invalid_identity"
-                )
-            )
-            conn.execute(
-                "UPDATE markets SET usable=?,identity_error=? WHERE venue=? AND market_id=? "
-                "AND (usable IS DISTINCT FROM ? OR identity_error IS DISTINCT FROM ?)",
-                [usable, error, venue, market_id, usable, error],
-            )
-            outcomes = json.loads(identity[1]) if usable else []
-            expected_outcomes = sorted(
-                (tuple(outcome.get(name) for name in columns("outcomes")) for outcome in outcomes),
-                key=lambda row: row[:2] + (row[3],),
-            )
-            if before_outcomes[(venue, market_id)] != expected_outcomes:
-                conn.execute(
-                    "DELETE FROM outcomes WHERE venue=? AND market_id=?", [venue, market_id]
-                )
-                for outcome in outcomes:
-                    _put(conn, "outcomes", outcome)
-            changed |= before_markets[(venue, market_id)] != _snapshot(
-                conn, "markets", "venue=? AND market_id=?", [venue, market_id]
-            ) or before_outcomes[(venue, market_id)] != _snapshot(
-                conn, "outcomes", "venue=? AND market_id=?", [venue, market_id]
-            )
-        # Confirmed absence is a receipt, not data: it never changes rows or the generation.
-        for event_id in sorted(response.absent_event_ids):
-            conn.execute(
-                "UPDATE _membership SET receipt=?,response=? WHERE venue=? AND event_id=? "
-                "AND (receipt IS NULL OR (receipt,response)<(?,?)) AND EXISTS "
-                "(SELECT 1 FROM events e WHERE e.venue=_membership.venue "
-                "AND e.event_id=_membership.event_id)",
-                [*stamp, "polymarket", event_id, *stamp],
-            )
-        for market_id in sorted(response.absent_market_ids):
-            if conn.execute(
-                "SELECT 1 FROM markets WHERE venue=? AND market_id=?", ["polymarket", market_id]
-            ).fetchone():
-                _newer(conn, "market", "polymarket", market_id, stamp)
-        for event_id in response.parent_event_ids:
-            conn.execute("INSERT OR IGNORE INTO _parent_repairs VALUES (?)", [event_id])
-        for key, value in (progress or {}).items():
-            set_state(conn, key, value)
-        if changed:
-            set_state(conn, "generation", generation(conn) + 1)
-        result = {
-            "generation": generation(conn),
-            "changed": bool(changed),
-            "events": len(response.events),
-            "markets": len(response.markets),
-        }
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    return result
+            for (venue, event_id), row in membership_writes.items()
+        ],
+        7,
+    )
+    _write_values(
+        conn,
+        "DELETE FROM _parent_repairs USING (VALUES {values}) k(event_id) "
+        "WHERE _parent_repairs.event_id=k.event_id",
+        [(event_id,) for event_id in repair_deletes],
+        1,
+    )
+    changed_markets = [
+        market_state[key]
+        for key in market_state
+        if key not in before_markets or list(before_markets[key]) != list(market_state[key])
+    ]
+    _write_values(
+        conn,
+        "INSERT OR REPLACE INTO markets ("
+        + projection("markets")
+        + ") SELECT * FROM (VALUES {values}) v("
+        + projection("markets")
+        + ")",
+        changed_markets,
+        len(columns("markets")),
+    )
+    _write_values(
+        conn,
+        "INSERT OR REPLACE INTO _identity "
+        "(venue, market_id, candidate, accepted, invalidated_at, invalidated_response) "
+        "SELECT * FROM (VALUES {values}) v("
+        "venue, market_id, candidate, accepted, invalidated_at, invalidated_response)",
+        [(*key, *row) for key, row in identity_writes.items()],
+        6,
+    )
+    _write_values(
+        conn,
+        "DELETE FROM _identity_claims USING (VALUES {values}) k(venue, market_id) "
+        "WHERE _identity_claims.venue=k.venue AND _identity_claims.market_id=k.market_id",
+        list(claim_replacements),
+        2,
+    )
+    _write_values(
+        conn,
+        "INSERT INTO _identity_claims (venue, market_id, role, asset_kind, asset_id) "
+        "SELECT * FROM (VALUES {values}) v(venue, market_id, role, asset_kind, asset_id)",
+        [row for rows in claim_replacements.values() for row in rows],
+        5,
+    )
+    _write_values(
+        conn,
+        "DELETE FROM outcomes USING (VALUES {values}) k(venue, market_id) "
+        "WHERE outcomes.venue=k.venue AND outcomes.market_id=k.market_id",
+        outcome_deletes,
+        2,
+    )
+    _write_values(
+        conn,
+        "INSERT INTO outcomes ("
+        + projection("outcomes")
+        + ") SELECT * FROM (VALUES {values}) v("
+        + projection("outcomes")
+        + ")",
+        outcome_inserts,
+        len(columns("outcomes")),
+    )
+    for event_id in response.parent_event_ids:
+        conn.execute("INSERT OR IGNORE INTO _parent_repairs VALUES (?)", [event_id])
+    if attempts:
+        record_attempts(conn, *attempts)
+    for key, value in (progress or {}).items():
+        set_state(conn, key, value)
+    if changed:
+        set_state(conn, "generation", generation(conn) + 1)
+    return {
+        "generation": generation(conn),
+        "changed": bool(changed),
+        "events": len(response.events),
+        "markets": len(response.markets),
+    }
 
 
 def _validate_schema(conn):

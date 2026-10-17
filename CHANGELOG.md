@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A forced full pass walks stale events in numeric id order, then markets those events
+  did not renew. It skips historical id-range windows. The next list request is fetched
+  while the current response is applied. Responses are applied as one set of writes.
+- `reconcile --full-pass` publishes when the pass completes or when
+  `full_pass_publish_interval_s` (default 6 hours) has elapsed since the last publication.
+  Other invocations still publish every time. A pass invocation that does not publish
+  exits 3 with `published: false` and reserves only `publication_reserve_s`.
+- An unchanged publication checks the pointer, the manifest hash, the file inventory, and
+  each Parquet size and SHA-256. It still rejects a live store that fails its own checks,
+  and it does not recompute the Parquet semantic fingerprint. `verify` and `current` stay
+  full semantic checks.
+- Retained-byte admission walks the root at connect, before publication, and at exit, and
+  adds raw bytes as they are written.
+- `[catalogue] duckdb_memory_bytes` defaults to 2 GiB (hard maximum 16 GiB) and
+  `duckdb_threads` defaults to 2 (maximum 8). A config without the new keys still loads.
+
 ## 1.0.0
 
 The first release ships the current Polymarket catalogue as a manual, single-host tool.

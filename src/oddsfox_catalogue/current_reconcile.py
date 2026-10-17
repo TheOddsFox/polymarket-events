@@ -4,8 +4,14 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from . import current_store
-from .current_config import ACTIVE_FRESHNESS_S, COLD_FRESHNESS_S, admit
-from .current_sync import fetch_apply, fetch_unit, resume_pending
+from .current_config import ACTIVE_FRESHNESS_S, COLD_FRESHNESS_S, admit, publication_reserve
+from .current_sync import (
+    ResponsePrefetcher,
+    fetch_apply,
+    fetch_unit,
+    first_bulk_request,
+    resume_pending,
+)
 from .gamma.http import CaptureStopped, RequestBudgetExceeded
 
 
@@ -57,16 +63,8 @@ def _due(conn, lane, cold, now, interval, *, pass_started=None):
 
 
 def _attempt(conn, lane, ids, now):
-    table, key = ("events", "event_id") if lane == "events" else ("markets", "market_id")
     # Empty numeric windows must not create one scheduler row per absent source ID.
-    source = f"SELECT {key} id FROM {table}"
-    if lane == "events":
-        source += " UNION SELECT event_id FROM _parent_repairs"
-    conn.execute(
-        f"""INSERT OR REPLACE INTO _reconcile_attempts
-        SELECT ?, id, ? FROM ({source}) WHERE id IN (SELECT unnest(?))""",
-        [lane, now, [str(value) for value in ids]],
-    )
+    current_store.record_attempts(conn, lane, ids, now)
 
 
 def _cold(conn, settings, now, state, *, pass_started=None):
@@ -86,6 +84,8 @@ def _cold(conn, settings, now, state, *, pass_started=None):
             if rows:
                 return lane, [r[0] for r in rows], slot, None
         else:
+            if pass_started is not None:
+                continue
             window = state["windows"].get(lane, {"next": 1, "cycle": None})
             if (
                 pass_started is None
@@ -148,7 +148,9 @@ def start_full_pass(conn, *, now=None):
         return
     started = now or _now()
     current_store.set_state(
-        conn, "full_pass", {"pass_started_at": started.isoformat(), "completed_at": None}
+        conn,
+        "full_pass",
+        {"pass_started_at": started.isoformat(), "completed_at": None, "cursor_after": None},
     )
 
 
@@ -194,19 +196,162 @@ def full_pass_status(conn, *, now=None):
     }
 
 
-def reconcile(settings, conn, client, *, deadline):
+def _stale_event_ids(conn, started, after):
+    """Known events a forced pass still has to visit, in numeric id order."""
+    return [
+        row[0]
+        for row in conn.execute(
+            """SELECT id FROM (
+                SELECT e.event_id id, m.receipt, coalesce(m.unresolved, true) unresolved
+                FROM events e LEFT JOIN _membership m USING (venue, event_id)
+                UNION ALL
+                SELECT p.event_id, NULL, true FROM _parent_repairs p
+                WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id=p.event_id)
+            ) WHERE (receipt IS NULL OR receipt<=? OR unresolved)
+            AND (? IS NULL OR try_cast(id AS BIGINT) > ?)
+            ORDER BY try_cast(id AS BIGINT)""",
+            [started, after, after],
+        ).fetchall()
+    ]
+
+
+def _urgent_active_ids(conn, settings, now):
+    rows = _due(conn, "events", False, now, settings.limits.active_recheck_s)
+    if not rows:
+        return None
+    urgent = any(
+        receipt is None or (now - receipt).total_seconds() >= ACTIVE_FRESHNESS_S - 2 * 3600
+        for _, receipt in rows
+    )
+    if not urgent:
+        return None
+    return [row[0] for row in rows]
+
+
+def _pass_checkpoint(conn, cursor):
+    state = dict(current_store.get_state(conn, "full_pass") or {})
+    if cursor is not None:
+        state["cursor_after"] = int(cursor)
+    reconcile_state = current_store.get_state(
+        conn, "reconcile", {"turn": 0, "cold_slot": 0, "windows": {}}
+    )
+    return {"full_pass": state, "reconcile": reconcile_state}
+
+
+def _reconcile_pass(settings, conn, client, stop, counters):
+    """Walk stale events in id order, then the markets those events did not renew."""
+    started = _pass_started(conn)
+    if started is not None and _remaining(conn, started) == 0:
+        return {**counters, "source_complete": False}
+    stored = current_store.get_state(conn, "full_pass") or {}
+    pending = _stale_event_ids(conn, started, stored.get("cursor_after"))
+    prefetcher = ResponsePrefetcher(client, deadline=stop)
+    try:
+        while time.monotonic() < stop:
+            now = _now()
+            urgent = _urgent_active_ids(conn, settings, now)
+            if urgent:
+                lane, ids, advance = "events", urgent, None
+                counter = "active_batches"
+                urgent_ids = set(ids)
+                pending = [item for item in pending if item not in urgent_ids]
+            elif pending:
+                ids = pending[:100]
+                pending = pending[100:]
+                lane, advance, counter = "events", ids[-1], "cold_batches"
+            else:
+                rows = _due(
+                    conn,
+                    "markets",
+                    True,
+                    now,
+                    settings.limits.cold_recheck_s,
+                    pass_started=started,
+                )
+                if not rows:
+                    break
+                lane, ids, advance = "markets", [row[0] for row in rows], None
+                counter = "cold_batches"
+            if pending and lane == "events" and advance is not None:
+                prefetcher.submit(first_bulk_request(settings, conn, "events", pending[:100]))
+            if time.monotonic() >= stop:
+                break
+            admit(settings, additional_bytes=65536)
+            try:
+                result, omitted = fetch_unit(
+                    settings,
+                    conn,
+                    client,
+                    lane,
+                    ids,
+                    progress=_pass_checkpoint(conn, None),
+                    attempts=(lane, ids, now),
+                    prefetcher=prefetcher,
+                )
+            except (CaptureStopped, RequestBudgetExceeded):
+                break
+            counters["responses"] += result["responses"]
+            counters[counter] += 1
+            # The cursor moves only after omissions are settled, so a deadline here
+            # retries the batch instead of skipping a known entity forever.
+            if omitted and time.monotonic() >= stop:
+                break
+            if omitted:
+                try:
+                    counters["responses"] += _confirm_omitted(settings, conn, client, lane, omitted)
+                except (CaptureStopped, RequestBudgetExceeded):
+                    break
+            if advance is not None:
+                state = dict(current_store.get_state(conn, "full_pass") or {})
+                state["cursor_after"] = int(advance)
+                current_store.set_state(conn, "full_pass", state)
+            repairs = conn.execute(
+                """SELECT DISTINCT m.market_id FROM markets m
+                LEFT JOIN _reconcile_attempts a ON a.kind='native' AND a.id=m.market_id
+                WHERE NOT m.usable
+                AND (a.last_attempt IS NULL OR a.last_attempt<=?) AND (
+                    (?='markets' AND m.market_id IN (SELECT unnest(?))) OR
+                    (?='events' AND EXISTS (SELECT 1 FROM event_markets e
+                        WHERE e.market_id=m.market_id AND e.event_id IN (SELECT unnest(?)))))
+                ORDER BY m.market_id LIMIT 100""",
+                [
+                    now - timedelta(hours=1),
+                    lane,
+                    [str(key) for key in ids],
+                    lane,
+                    [str(key) for key in ids],
+                ],
+            ).fetchall()
+            for (key,) in repairs:
+                if time.monotonic() >= stop:
+                    break
+                try:
+                    counters["responses"] += fetch_apply(
+                        settings,
+                        conn,
+                        client,
+                        "markets",
+                        [key],
+                        native=True,
+                        attempts=("native", [key], now),
+                    )["responses"]
+                except (CaptureStopped, RequestBudgetExceeded):
+                    return {**counters, "source_complete": False}
+    finally:
+        prefetcher.close()
+    return {**counters, "source_complete": False}
+
+
+def reconcile(settings, conn, client, *, deadline, publishing=True):
     """Run bounded reconcile units; a forced pass is recorded complete once remaining hits 0."""
-    result = _reconcile_units(settings, conn, client, deadline=deadline)
+    result = _reconcile_units(settings, conn, client, deadline=deadline, publishing=publishing)
     _complete_pass(conn, _now())
     return result
 
 
-def _reconcile_units(settings, conn, client, *, deadline):
+def _reconcile_units(settings, conn, client, *, deadline, publishing=True):
     """Run 3 active units per cold unit, retaining finite rotation checkpoints."""
-    reserve = max(
-        settings.limits.publication_reserve_s,
-        1.5 * current_store.get_state(conn, "previous_publish_seconds", 0),
-    )
+    reserve = publication_reserve(settings, conn, publishing=publishing)
     stop = deadline - reserve
     counters = {"responses": 0, "active_batches": 0, "cold_batches": 0}
     if time.monotonic() >= stop:
@@ -217,6 +362,8 @@ def _reconcile_units(settings, conn, client, *, deadline):
     except (CaptureStopped, RequestBudgetExceeded):
         return {**counters, "source_complete": False}
     _initialize(conn)
+    if _pass_started(conn) is not None:
+        return _reconcile_pass(settings, conn, client, stop, counters)
     while time.monotonic() < stop:
         now = _now()
         state = current_store.get_state(
@@ -261,11 +408,16 @@ def _reconcile_units(settings, conn, client, *, deadline):
         admit(settings, additional_bytes=65536)
         try:
             result, omitted = fetch_unit(
-                settings, conn, client, lane, ids, progress={"reconcile": state}
+                settings,
+                conn,
+                client,
+                lane,
+                ids,
+                progress={"reconcile": state},
+                attempts=(lane, ids, now),
             )
         except (CaptureStopped, RequestBudgetExceeded):
             break
-        _attempt(conn, lane, ids, now)
         counters["responses"] += result["responses"]
         counters[counter] += 1
         # Only a forced pass must settle every known entity, so only it spends native lookups
@@ -298,9 +450,14 @@ def _reconcile_units(settings, conn, client, *, deadline):
                 break
             try:
                 counters["responses"] += fetch_apply(
-                    settings, conn, client, "markets", [key], native=True
+                    settings,
+                    conn,
+                    client,
+                    "markets",
+                    [key],
+                    native=True,
+                    attempts=("native", [key], now),
                 )["responses"]
-                _attempt(conn, "native", [key], now)
             except (CaptureStopped, RequestBudgetExceeded):
                 return {**counters, "source_complete": False}
     return {**counters, "source_complete": False}
@@ -328,8 +485,7 @@ def repair_pending(settings, conn, client, *, deadline):
     ]
     if not ids:
         return {"responses": 0}
-    result = fetch_apply(settings, conn, client, "events", ids)
-    _attempt(conn, "events", ids, now)
+    result = fetch_apply(settings, conn, client, "events", ids, attempts=("events", ids, now))
     return result
 
 

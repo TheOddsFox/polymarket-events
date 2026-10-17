@@ -386,7 +386,7 @@ def test_preflight_uses_bounded_readonly_connection_before_validation(
         visited.append(True)
         assert conn.execute("SELECT * FROM evidence").fetchall() == [(42,)]
         assert conn.execute("SELECT current_setting('threads')").fetchone()[0] == 2
-        assert conn.execute("SELECT current_setting('memory_limit')").fetchone()[0] == "1.8 GiB"
+        assert conn.execute("SELECT current_setting('memory_limit')").fetchone()[0] == "2.0 GiB"
         assert conn.execute("SELECT current_setting('temp_directory')").fetchone()[0] == str(
             seed / "tmp"
         )

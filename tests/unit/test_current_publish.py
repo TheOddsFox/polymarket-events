@@ -75,6 +75,36 @@ def test_each_publication_validates_source_once_and_external_verify_remains_fres
     assert calls == [conn]
 
 
+def test_unchanged_publish_hashes_bytes_and_skips_the_semantic_fingerprint(store, monkeypatch):
+    settings, conn = store
+    publisher.publish(settings, conn)
+    order = []
+    physical = publisher._physical
+    fingerprint = publisher.semantic_fingerprint
+
+    def tracked_physical(path):
+        order.append("physical")
+        return physical(path)
+
+    def tracked_fingerprint(*args, **kwargs):
+        order.append("semantic")
+        return fingerprint(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "_physical", tracked_physical)
+    monkeypatch.setattr(publisher, "semantic_fingerprint", tracked_fingerprint)
+    assert publisher.publish(settings, conn)["noop"]
+    assert "physical" in order
+    assert "semantic" not in order
+    parquet = next((settings.published_dir / "releases").iterdir()) / "events.parquet"
+    blob = bytearray(parquet.read_bytes())
+    blob[-1] ^= 0xFF
+    parquet.write_bytes(blob)
+    order.clear()
+    rebuilt = publisher.publish(settings, conn)
+    assert rebuilt["noop"] is False
+    assert order.index("physical") < order.index("semantic")
+
+
 def test_physical_and_manifest_corruption(store):
     settings, conn = store
     release = publisher.publish(settings, conn)
