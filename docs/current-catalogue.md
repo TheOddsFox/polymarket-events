@@ -239,7 +239,8 @@ consumers.
 ## Verification
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion.
-Tests use synthetic loopback fixtures and never contact live Gamma. The offline
+Tests use synthetic loopback fixtures and never contact live Gamma. Pytest runs them
+in parallel (`-n auto`); pass `-n0` to run one test in-process. The offline
 environment is `CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9` with
 `CATALOGUE_GAMMA_ALLOW_LOOPBACK=1`.
 

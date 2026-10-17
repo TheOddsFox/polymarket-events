@@ -52,7 +52,7 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -n auto"
 timeout = 120
 
 [tool.ruff]
