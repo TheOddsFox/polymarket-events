@@ -8,6 +8,21 @@ from pathlib import Path
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
 
 
+class StorageMeter:
+    """One retained-byte walk per invocation, plus bytes added as raw is written."""
+
+    def __init__(self):
+        self.retained = None
+
+    def snapshot(self, directory: Path) -> int:
+        self.retained = directory_bytes(directory)
+        return self.retained
+
+    def add(self, amount: int) -> None:
+        if self.retained is not None and amount > 0:
+            self.retained += amount
+
+
 def directory_bytes(directory: Path) -> int:
     for ancestor in (directory, *directory.parents):
         if ancestor.is_symlink():

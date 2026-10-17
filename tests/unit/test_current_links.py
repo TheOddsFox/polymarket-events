@@ -189,7 +189,7 @@ def test_replacement_failure_rolls_back_links_membership_progress_and_generation
                 normalized = " ".join(query.upper().split())
                 if (
                     fault == "after-replacement"
-                    and normalized.startswith("UPDATE _MEMBERSHIP SET RECEIPT=")
+                    and normalized.startswith("INSERT OR REPLACE INTO _MEMBERSHIP")
                 ) or (fault == "commit" and normalized == "COMMIT"):
                     assert links(conn) == [("polymarket", "1", "3", 1)]
                     if fault == "commit":

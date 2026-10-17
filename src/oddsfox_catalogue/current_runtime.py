@@ -8,12 +8,23 @@ import sys
 import time
 from datetime import UTC, datetime
 
-from .current_config import admit, connect_store
+from .current_config import admit, connect_store, publication_reserve
 from .current_contract import CurrentError
 from .current_store import get_state, initialize, set_state, summary
 from .gamma.http import CaptureStopped, GammaClient, RequestBudgetExceeded
 from .runlock import RunBusy, run_lock
 from .signals import SIGNALS, Terminated
+
+
+def _publishing(settings, conn, operation, options):
+    """A full pass publishes on completion or once the cadence interval has elapsed."""
+    if operation != "reconcile" or not options.get("full_pass"):
+        return True
+    last = get_state(conn, "last_publish_at")
+    if last is None:
+        return True
+    age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+    return age >= settings.limits.full_pass_publish_interval_s
 
 
 def _publish(settings, conn, deadline):
@@ -25,6 +36,7 @@ def _publish(settings, conn, deadline):
     # A cheap no-op must not erase the measured cost of exporting a changed store.
     if not result.get("noop") or get_state(conn, "previous_publish_seconds") is None:
         set_state(conn, "previous_publish_seconds", elapsed)
+    set_state(conn, "last_publish_at", datetime.now(UTC).isoformat())
     return result, elapsed
 
 
@@ -53,10 +65,8 @@ def execute(settings, operation, options, deadline):
             return _publish(settings, conn, deadline)[0]
         from .current_sync import discover, probe_policy, resume_pending
 
-        reserve = max(
-            settings.limits.publication_reserve_s,
-            1.5 * get_state(conn, "previous_publish_seconds", 0),
-        )
+        publishing = _publishing(settings, conn, operation, options)
+        reserve = publication_reserve(settings, conn, publishing=publishing)
         acquisition_deadline = deadline if operation == "probe" else deadline - reserve
         with GammaClient(
             settings.gamma,
@@ -88,8 +98,13 @@ def execute(settings, operation, options, deadline):
                             from .current_reconcile import reconcile, start_full_pass
 
                             if options.get("full_pass"):
+                                before_completed = (get_state(conn, "full_pass") or {}).get(
+                                    "completed_at"
+                                )
                                 start_full_pass(conn)
-                            result = reconcile(settings, conn, client, deadline=deadline)
+                            result = reconcile(
+                                settings, conn, client, deadline=deadline, publishing=publishing
+                            )
                         else:
                             raise CurrentError("unknown current catalogue operation")
                     except (RequestBudgetExceeded, CaptureStopped):
@@ -99,15 +114,29 @@ def execute(settings, operation, options, deadline):
                             "budget_exhausted": True,
                         }
                     acquired = time.monotonic()
-                    published, publication_seconds = _publish(settings, conn, deadline)
-                    result.update(
-                        status="published",
-                        publication=published,
-                        timings={
-                            "acquire_apply_s": acquired - started,
-                            "publish_verify_s": publication_seconds,
-                        },
+                    completed = (get_state(conn, "full_pass") or {}).get("completed_at")
+                    just_completed = options.get("full_pass") and completed not in (
+                        None,
+                        before_completed if options.get("full_pass") else None,
                     )
+                    if publishing or just_completed:
+                        settings.meter.snapshot(settings.root)
+                        published, publication_seconds = _publish(settings, conn, deadline)
+                        result.update(
+                            status="published",
+                            published=True,
+                            publication=published,
+                            timings={
+                                "acquire_apply_s": acquired - started,
+                                "publish_verify_s": publication_seconds,
+                            },
+                        )
+                    else:
+                        result.update(
+                            status="deferred",
+                            published=False,
+                            timings={"acquire_apply_s": acquired - started},
+                        )
                 result.update(
                     http_attempts=client.stats.requests,
                     downloaded_bytes=client.stats.downloaded_bytes,
@@ -133,6 +162,7 @@ def execute(settings, operation, options, deadline):
         result["full_pass"] = full_pass_status(conn)
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         result["peak_rss_bytes"] = peak if sys.platform == "darwin" else peak * 1024
+        settings.meter.snapshot(settings.root)
         result["storage"] = admit(settings)
     return result
 

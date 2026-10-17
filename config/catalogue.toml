@@ -16,3 +16,7 @@ free_reserve_bytes = 8589934592
 active_recheck_s = 72000
 cold_recheck_s = 5011200
 publication_reserve_s = 60.0
+full_pass_publish_interval_s = 21600
+# 6 GiB for this host; the hard maximum is 16 GiB. threads stay at 2.
+duckdb_memory_bytes = 6442450944
+duckdb_threads = 2

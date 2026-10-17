@@ -17,7 +17,7 @@ import duckdb
 from oddsfox_catalogue.capture.writer import atomic_write_bytes, read_regular_bytes
 from oddsfox_catalogue.config import GammaSettings, _build_section
 from oddsfox_catalogue.current_contract import STORE_CONTRACT, CurrentError
-from oddsfox_catalogue.limits import directory_bytes
+from oddsfox_catalogue.limits import StorageMeter, directory_bytes
 
 ACTIVE_FRESHNESS_S = 86400
 COLD_FRESHNESS_S = 60 * 86400
@@ -42,6 +42,9 @@ class CurrentLimits:
     active_recheck_s: int = 20 * 3600
     cold_recheck_s: int = 58 * 86400
     publication_reserve_s: float = 60.0
+    full_pass_publish_interval_s: float = 21600.0
+    duckdb_memory_bytes: int = 2 * GIB
+    duckdb_threads: int = 2
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,7 @@ class CurrentSettings:
         )
     )
     limits: CurrentLimits = field(default_factory=CurrentLimits)
+    meter: StorageMeter = field(default_factory=StorageMeter, compare=False, repr=False)
 
     @property
     def store_path(self) -> Path:
@@ -187,6 +191,13 @@ def load_current_settings(root: Path | None = None, *, env=None) -> CurrentSetti
         raise CurrentError("refresh deadline must be <=1200s with time reserved for publication")
     if limits.publication_reserve_s < MINIMUM_PUBLICATION_RESERVE_S:
         raise CurrentError("publication reserve must be at least 60 seconds")
+    if (
+        limits.duckdb_memory_bytes > 16 * GIB
+        or int(limits.duckdb_memory_bytes) != limits.duckdb_memory_bytes
+    ):
+        raise CurrentError("catalogue duckdb_memory_bytes exceeds its hard maximum")
+    if int(limits.duckdb_threads) != limits.duckdb_threads or not 1 <= limits.duckdb_threads <= 8:
+        raise CurrentError("catalogue duckdb_threads exceeds its hard maximum")
     if not 0 < gamma.requests_per_second <= 10:
         raise CurrentError("Gamma rate must be positive and at most 10 requests/second")
     if gamma.max_retries < 0:
@@ -198,11 +209,31 @@ def load_current_settings(root: Path | None = None, *, env=None) -> CurrentSetti
     return CurrentSettings(root, gamma, limits)
 
 
+def _configure_connection(connection, settings: CurrentSettings) -> None:
+    memory = int(settings.limits.duckdb_memory_bytes)
+    threads = int(settings.limits.duckdb_threads)
+    connection.execute(f"SET memory_limit='{memory}B'")
+    connection.execute("SET enable_progress_bar=false")
+    connection.execute("SET preserve_insertion_order=false")
+    connection.execute(f"SET threads={threads}")
+
+
+def publication_reserve(settings: CurrentSettings, conn, *, publishing: bool) -> float:
+    floor = settings.limits.publication_reserve_s
+    if not publishing:
+        return floor
+    from oddsfox_catalogue.current_store import get_state
+
+    return max(floor, 1.5 * get_state(conn, "previous_publish_seconds", 0))
+
+
 def admit(settings: CurrentSettings, *, additional_bytes: int = 0) -> dict[str, int]:
     validate_root(settings.root)
     if additional_bytes < 0:
         raise CurrentError("negative storage reservation")
-    retained = directory_bytes(settings.root)
+    if settings.meter.retained is None:
+        settings.meter.snapshot(settings.root)
+    retained = settings.meter.retained
     temporary = directory_bytes(settings.temporary_dir)
     free = shutil.disk_usage(settings.root).free
     limits = settings.limits
@@ -222,10 +253,7 @@ def connect_store(settings: CurrentSettings, *, read_only: bool = False):
     settings.temporary_dir.mkdir(exist_ok=True)
     connection = duckdb.connect(str(settings.store_path), read_only=read_only)
     try:
-        connection.execute("SET memory_limit='2GB'")
-        connection.execute("SET enable_progress_bar=false")
-        connection.execute("SET preserve_insertion_order=false")
-        connection.execute("SET threads=2")
+        _configure_connection(connection, settings)
         connection.execute("SET TimeZone='UTC'")
         connection.execute("SET temp_directory=?", [str(settings.temporary_dir)])
         remaining = settings.limits.max_temp_bytes - usage["temporary_bytes"]
@@ -244,10 +272,7 @@ def memory_connection(settings: CurrentSettings):
     settings.temporary_dir.mkdir(exist_ok=True)
     connection = duckdb.connect(":memory:")
     try:
-        connection.execute("SET memory_limit='2GB'")
-        connection.execute("SET enable_progress_bar=false")
-        connection.execute("SET preserve_insertion_order=false")
-        connection.execute("SET threads=2")
+        _configure_connection(connection, settings)
         connection.execute("SET temp_directory=?", [str(settings.temporary_dir)])
         remaining = settings.limits.max_temp_bytes - usage["temporary_bytes"]
         if remaining <= 0:

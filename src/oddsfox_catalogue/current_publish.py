@@ -131,6 +131,24 @@ def _retain_raw(settings, referenced, result):
         result["retention_warning"] = str(exc)
 
 
+def _release_bytes_match(path, manifest):
+    """True when the pointer's files still match the manifest. No semantic read."""
+    try:
+        expected = {"manifest.json", *(f"{table}.parquet" for table in SCHEMAS)}
+        if {child.name for child in path.iterdir()} != expected:
+            return False
+        for table, descriptor in manifest["relations"].items():
+            physical = _physical(path / f"{table}.parquet")
+            if (
+                physical["bytes"] != descriptor["bytes"]
+                or physical["sha256"] != descriptor["sha256"]
+            ):
+                return False
+    except (CurrentError, OSError, ValueError, KeyError):
+        return False
+    return True
+
+
 def _physical(path):
     safe_path(path)
     digest = hashlib.sha256()
@@ -316,6 +334,41 @@ def publish(settings, conn, *, deadline=None):
     try:
         if current.exists():
             pointer = _pointer(settings)
+            release = releases / pointer["release_id"]
+            manifest_file = release / "manifest.json"
+            try:
+                manifest_hash = _physical(manifest_file)["sha256"]
+                unchanged = _json(manifest_file)
+            except (CurrentError, OSError, ValueError, duckdb.Error):
+                unchanged = None
+                manifest_hash = None
+            if (
+                unchanged is not None
+                and unchanged.get("generation") == generation(conn)
+                and manifest_hash == pointer.get("manifest_sha256")
+                and _release_bytes_match(release, unchanged)
+            ):
+                # The Parquet is unchanged, so skip the release re-fingerprint.
+                # The live store is still rejected when its own checks fail.
+                _validate_store(conn)
+                status = full_pass_status(conn)
+                if unchanged.get("full_pass") != status:
+                    unchanged = {**unchanged, "full_pass": status}
+                    manifest_bytes = json.dumps(unchanged, sort_keys=True).encode()
+                    atomic_write_bytes(release / "manifest.json", manifest_bytes)
+                    pointer = {
+                        **pointer,
+                        "manifest_sha256": _physical(release / "manifest.json")["sha256"],
+                    }
+                    atomic_write_bytes(current, json.dumps(pointer, sort_keys=True).encode())
+                    _fsync_dir(published)
+                _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
+                _check_deadline(deadline)
+                referenced = _referenced_raw(conn)
+                conn.execute("COMMIT")
+                result = {**unchanged, "noop": True, "valid": True, "path": str(release)}
+                _retain_raw(settings, referenced, result)
+                return result
             try:
                 verified = verify_current(settings, connection=conn)
             except (CurrentError, OSError, ValueError, duckdb.Error):
@@ -415,6 +468,7 @@ def publish(settings, conn, *, deadline=None):
         if manifest["generation"] != generation(conn):
             raise CurrentError("candidate source generation changed after verification")
         _check_deadline(deadline)
+        settings.meter.snapshot(settings.root)
         admit(settings)
         _fsync_dir(stage)
         final = releases / release_id
