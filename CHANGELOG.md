@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- Synthetic-only full-pass characterization with frozen baseline comparisons and a
+  shared ten-minute performance budget. Incomplete evidence cannot qualify a change.
+
+### Fixed
+
+- Full-pass scheduling preserves the complete accepted 20-digit entity ID range and
+  retries stale events below an exhausted saved cursor on the next invocation.
+- Installed-workflow and capacity tooling reap exited process leaders before signalling
+  their groups, while retaining descendant cleanup and genuine permission failures.
+
 ### Changed
 
 - A forced full pass walks stale events in numeric id order, then markets those events

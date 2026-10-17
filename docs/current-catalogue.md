@@ -120,7 +120,9 @@ uv run catalogue --root /srv/catalogue-v3 verify
   While the pass is active it bypasses the 58-day cold gate and the active freshness
   skip, and it does not schedule historical id-range windows. It loads the stale event
   ids once per invocation and walks them in numeric order from `cursor_after`, 100 ids
-  per request. Nested markets renew from the event response. After those events, a
+  per request. If a legacy cursor has passed unresolved events, one startup sweep from
+  the beginning recovers them without resetting the saved cursor before a batch settles.
+  Nested markets renew from the event response. After those events, a
   markets sweep fetches markets that are still stale, including orphans. An active event
   within two hours of the 24-hour target takes the next slot. The next list request is
   prefetched on a second client that shares the rate limit; a prefetched body is used
@@ -272,3 +274,30 @@ installed-wheel Python for the harness and the CLI, and repeat `--account-root` 
 external root that should be reported. Benchmarks report measured elapsed time, HTTP
 counts, publication time and resource evidence. Acceptance is recorded separately in
 the [acceptance page](current-catalogue-acceptance.md).
+
+The full-pass characterization tool generates its own synthetic seed; it never opens
+operator data or contacts live Gamma:
+
+```sh
+uv run --locked python scripts/benchmark-full-pass.py --profile smoke --output "$HOME/catalogue-benchmarks/full-pass-smoke"
+uv run --locked python scripts/benchmark-full-pass.py --profile perf --output "$HOME/catalogue-benchmarks/full-pass-baseline"
+# After a candidate scheduling change, compare against the locally generated baseline:
+uv run --locked python scripts/benchmark-full-pass.py --profile perf --compare "$HOME/catalogue-benchmarks/full-pass-baseline" --output "$HOME/catalogue-benchmarks/full-pass-candidate"
+```
+
+Every output directory must be fresh, with no symlink ancestors. Use only trusted,
+locally generated comparison directories: their saved Python runtime is executed during
+comparison. Keep the baseline
+seed, runtime inventory, and report unchanged. Smoke exercises correctness and cannot
+qualify an optimization. The performance profile contains 10,000 events and 40,400
+markets; it is an explicit synthetic distribution, not a production traffic model.
+
+Baseline and comparison share a 600-second measurement budget, including preparation,
+validation, and cleanup, with 15 seconds reserved for shutdown. An incomplete comparison
+reports `insufficient_evidence`. A candidate qualifies only with three complete pairs,
+equivalent scheduler and publication results, at least 10% and one second lower median
+acquire/apply time, no more than 5% wall-time or peak-RSS regression, and no increased HTTP
+load. HTTP accounting records served requests and offered response bodies alongside
+client reservations and consumed bytes, including cancellations; neither measure may
+increase. Isolated profiles cannot qualify a change. Results never establish deployment
+acceptance or a production speedup.
