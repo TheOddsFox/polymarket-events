@@ -17,6 +17,9 @@ The first release ships the current Polymarket catalogue as a manual, single-hos
 
 ### Changed
 
+- `metadata refresh` reads `CATALOGUE_ROOT` when `--root` is omitted, and writes an empty
+  `identity_history` when `--catalogue-root` is omitted, so existing producers keep working.
+
 - Storage defaults are 160 GiB retained, 16 GiB temporary and 8 GiB free reserve. Root
   configuration may raise retained, temporary and reserve values up to hard maximums of
   512 GiB, 64 GiB and 256 GiB. Each root is admitted against its own ceilings.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 from dataclasses import asdict
@@ -60,7 +61,9 @@ def build_parser():
     refresh.add_argument("--market-id", action="append", required=True)
     refresh.add_argument("--output", type=Path, required=True)
     refresh.add_argument(
-        "--catalogue-root", type=Path, required=True, help="v1 catalogue root (read-only identity)"
+        "--catalogue-root",
+        type=Path,
+        help="v1 catalogue root; identity_history is empty when omitted",
     )
     refresh.add_argument("--max-output-bytes", type=int, default=128 * 1024**2)
     refresh.add_argument("--max-response-bytes", type=int, default=8 * 1024**2)
@@ -74,10 +77,13 @@ def _metadata(args):
     from .ids import sha256_bytes
     from .metadata import GammaClient, refresh_metadata
 
-    if args.root is None:
+    root = args.root
+    if root is None and os.environ.get("CATALOGUE_ROOT"):
+        root = Path(os.environ["CATALOGUE_ROOT"])
+    if root is None:
         raise CurrentError("metadata refresh requires an explicit isolated --root")
-    producer = load_current_settings(args.root)
-    catalogue = load_current_settings(args.catalogue_root)
+    producer = load_current_settings(root)
+    catalogue = load_current_settings(args.catalogue_root) if args.catalogue_root else None
     locations = [
         producer.root,
         args.output,

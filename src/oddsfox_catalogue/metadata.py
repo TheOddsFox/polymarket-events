@@ -336,7 +336,7 @@ def _catalogue_identity(catalogue: CurrentSettings, market_ids: list[str]) -> li
 
 def refresh_metadata(
     gamma: GammaSettings,
-    catalogue: CurrentSettings,
+    catalogue: CurrentSettings | None,
     producer_root: Path,
     market_ids: list[str],
     output: Path,
@@ -431,7 +431,7 @@ def refresh_metadata(
                     "received_at": record["received_at"],
                 }
             )
-        identity = _catalogue_identity(catalogue, market_ids)
+        identity = _catalogue_identity(catalogue, market_ids) if catalogue is not None else []
         manifest = _write_bundle(
             output,
             _relations(market_ids, observations, coverage, identity),

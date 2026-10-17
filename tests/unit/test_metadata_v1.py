@@ -176,6 +176,16 @@ def test_metadata_refuses_output_inside_a_catalogue_root(tmp_path, capsys):
     assert not (catalogue / "bundle").exists()
 
 
+def test_refresh_without_a_catalogue_writes_empty_identity_history(tmp_path):
+    fixture = CurrentGammaServer()
+    catalogue = seeded_catalogue(tmp_path, fixture)
+    with GammaClient(catalogue.gamma, transport=httpx.MockTransport(fixture.handle)) as client:
+        metadata.refresh_metadata(
+            catalogue.gamma, None, tmp_path / "producer", ["11"], tmp_path / "bundle", client=client
+        )
+    assert json.loads((tmp_path / "bundle" / "identity_history.json").read_text()) == []
+
+
 def test_metadata_requires_an_explicit_producer_root(tmp_path, capsys):
     code = cli.main(
         [
