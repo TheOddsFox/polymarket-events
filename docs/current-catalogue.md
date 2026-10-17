@@ -42,7 +42,8 @@ uv run catalogue --root /srv/catalogue-v3 config show
 inside another root. Every later command requires the stamp.
 
 Configuration is `ROOT/config.toml` (or `CATALOGUE_CONFIG`) with only `[gamma]` and
-`[catalogue]` sections. Unknown keys are rejected. A 0.1.0 config opens unchanged: its
+`[catalogue]` sections. Both sections must be TOML tables; malformed sections and
+unknown keys are rejected. A 0.1.0 config opens unchanged: its
 `[load]` section and its `max_raw_bytes` and `raw_max_age_s` keys are ignored. `config show` prints the
 effective values. Environment overrides use `CATALOGUE_<SECTION>_<NAME>`.
 
@@ -96,8 +97,8 @@ permission to fall back to an unproven query.
 Run each command by hand. Each invocation is bounded by `max_duration_s` (1200 s),
 including publication. Publication time is reserved inside that deadline: the reserve is
 at least 60 seconds, or 1.5 times the previous measured publication if that is larger.
-A `reconcile --full-pass` invocation that is not publishing reserves only
-`publication_reserve_s`.
+Every `reconcile --full-pass` invocation keeps this reserve, including when publication
+is initially deferred by cadence, because the pass may complete during acquisition.
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 refresh
@@ -362,7 +363,7 @@ for baseline acquisition/application and 423.890 seconds for binding; they canno
 an optimization. Raw metrics, complete source inventories and candidate sources remain
 in the private campaign artifacts.
 
-The delivery runtime therefore keeps baseline source unchanged. Outcome grouping and
+No optimization from that campaign was retained. Outcome grouping and
 queue handling were tested in isolated variants but did not reach timed comparison.
 Projection reuse was deferred before timing: a decoded boolean and raw numeric JSON
 can compare equal in Python while fresh and replay validation accept different inputs.

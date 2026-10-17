@@ -442,8 +442,8 @@ class ResponsePrefetcher:
             except BaseException as exc:
                 payload = exc
             with self._lock:
+                self._done.put((request, payload))
                 self._inflight = None
-            self._done.put((request, payload))
         self._abandon()
 
     def _abandon(self):
@@ -455,15 +455,21 @@ class ResponsePrefetcher:
         held = []
         try:
             while True:
-                try:
-                    got, payload = self._done.get_nowait()
-                except queue.Empty:
-                    with self._lock:
+                with self._lock:
+                    try:
+                        got, payload = self._done.get_nowait()
+                    except queue.Empty:
                         waiting = request in self._pending or self._inflight == request
+                        item = None
+                    else:
+                        waiting = False
+                        item = (got, payload)
+                if item is None:
                     if waiting and self._thread.is_alive() and not self._stop.is_set():
                         self._wake.wait(0.01)
                         continue
                     return None
+                got, payload = item
                 if got == request:
                     if isinstance(payload, BaseException):
                         raise payload

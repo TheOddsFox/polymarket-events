@@ -201,7 +201,10 @@ def backoff_delay(
     rng: random.Random,
 ) -> float:
     """Full-jitter exponential backoff: uniform in [0, min(cap, base * 2**attempt)]."""
-    ceiling = min(cap, base * (2**attempt))
+    try:
+        ceiling = min(cap, math.ldexp(base, attempt))
+    except OverflowError:
+        ceiling = cap
     return rng.uniform(0.0, ceiling)
 
 

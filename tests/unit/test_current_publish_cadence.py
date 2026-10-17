@@ -59,8 +59,7 @@ def test_full_pass_cadence(tmp_path, monkeypatch):
     published = []
     seen = {}
 
-    def fake_reconcile(settings, conn, client, *, deadline, publishing=True):
-        seen["publishing"] = publishing
+    def fake_reconcile(settings, conn, client, *, deadline):
         seen["gap"] = deadline - client.deadline
         if seen.get("complete"):
             state = get_state(conn, "full_pass")
@@ -83,8 +82,7 @@ def test_full_pass_cadence(tmp_path, monkeypatch):
     assert result["published"] is False
     assert result["full_pass"]["started_at"]
     assert published == []
-    assert seen["publishing"] is False
-    assert seen["gap"] == 60
+    assert seen["gap"] == 150
 
     with connect_store(settings) as conn:
         set_state(
@@ -94,9 +92,7 @@ def test_full_pass_cadence(tmp_path, monkeypatch):
         )
     execute(settings, "reconcile", {"full_pass": True}, time.monotonic() + 1000)
     assert published == [True]
-    assert seen["publishing"] is True
     assert seen["gap"] == 150
-
     published.clear()
     seen["complete"] = True
     with connect_store(settings) as conn:
@@ -104,3 +100,51 @@ def test_full_pass_cadence(tmp_path, monkeypatch):
         set_state(conn, "full_pass", None)
     execute(settings, "reconcile", {"full_pass": True}, time.monotonic() + 1000)
     assert published == [True]
+
+
+def test_completion_after_deferred_cadence_keeps_measured_publish_reserve(tmp_path, monkeypatch):
+    from oddsfox_catalogue import current_publish, current_reconcile, current_runtime
+
+    settings = _settings(tmp_path)
+    now = [100.0]
+    seen = {}
+    monkeypatch.setattr(current_runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(current_runtime, "GammaClient", _Client)
+
+    def complete_pass(settings, conn, client, *, deadline):
+        apply(
+            conn,
+            ResponseRows(
+                "2026-01-02T00:00:00Z",
+                "completion-reserve",
+                events=[dict(venue="polymarket", event_id="1", title="updated")],
+            ),
+        )
+        seen["reserve"] = deadline - client.deadline
+        state = get_state(conn, "full_pass")
+        state["completed_at"] = datetime.now(UTC).isoformat()
+        set_state(conn, "full_pass", state)
+        now[0] = client.deadline - 1
+        return {"responses": 1, "source_complete": False}
+
+    monkeypatch.setattr(current_reconcile, "reconcile", complete_pass)
+    with connect_store(settings) as conn:
+        set_state(conn, "last_publish_at", datetime.now(UTC).isoformat())
+        set_state(conn, "previous_publish_seconds", 100)
+        set_state(conn, "full_pass", None)
+
+    original_export = current_publish._export
+    exports = [0]
+
+    def slow_export(conn, table, path):
+        original_export(conn, table, path)
+        if exports[0] == 0:
+            now[0] += 100
+        exports[0] += 1
+
+    monkeypatch.setattr(current_publish, "_export", slow_export)
+    result = execute(settings, "reconcile", {"full_pass": True}, 1100)
+
+    assert seen == {"reserve": 150}
+    assert result["published"] is True
+    assert exports[0] > 1

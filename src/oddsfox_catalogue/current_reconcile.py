@@ -345,16 +345,16 @@ def _reconcile_pass(settings, conn, client, stop, counters):
     return {**counters, "source_complete": False}
 
 
-def reconcile(settings, conn, client, *, deadline, publishing=True):
+def reconcile(settings, conn, client, *, deadline):
     """Run bounded reconcile units; a forced pass is recorded complete once remaining hits 0."""
-    result = _reconcile_units(settings, conn, client, deadline=deadline, publishing=publishing)
+    result = _reconcile_units(settings, conn, client, deadline=deadline)
     _complete_pass(conn, _now())
     return result
 
 
-def _reconcile_units(settings, conn, client, *, deadline, publishing=True):
+def _reconcile_units(settings, conn, client, *, deadline):
     """Run 3 active units per cold unit, retaining finite rotation checkpoints."""
-    reserve = publication_reserve(settings, conn, publishing=publishing)
+    reserve = publication_reserve(settings, conn)
     stop = deadline - reserve
     counters = {"responses": 0, "active_batches": 0, "cold_batches": 0}
     if time.monotonic() >= stop:

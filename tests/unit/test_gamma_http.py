@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import sys
 import threading
@@ -33,8 +34,8 @@ def _client(
         base_url="https://gamma.fake.test",
         requests_per_second=1000.0,
         max_retries=overrides.pop("max_retries", 5),
-        backoff_base_s=1.0,
-        backoff_cap_s=60.0,
+        backoff_base_s=overrides.pop("backoff_base_s", 1.0),
+        backoff_cap_s=overrides.pop("backoff_cap_s", 60.0),
         **overrides,
     )
     clock = clock or FakeClock()
@@ -65,6 +66,35 @@ def test_backoff_is_bounded_by_cap_and_grows() -> None:
     assert all(0.0 <= s <= 8.0 for s in samples)
     assert max(backoff_delay(0, 1.0, 8.0, random.Random(i)) for i in range(50)) <= 1.0
     assert max(backoff_delay(5, 1.0, 8.0, random.Random(i)) for i in range(200)) > 4.0
+
+
+@pytest.mark.parametrize(
+    ("attempt", "base", "cap", "expected_ceiling"),
+    [
+        (1024, 5e-324, 1.0, math.ldexp(5e-324, 1024)),
+        (1024, 1.0, 1e-6, 1e-6),
+        (10**100, 1.0, 1e-6, 1e-6),
+        (0, sys.float_info.max, 1.0, 1.0),
+        (2, 1.0, 0.25, 0.25),
+    ],
+)
+def test_backoff_handles_extreme_attempts_and_caps(
+    attempt: int, base: float, cap: float, expected_ceiling: float
+) -> None:
+    assert backoff_delay(attempt, base, cap, random.Random(0)) <= expected_ceiling
+
+
+def test_retry_budget_1025_exhausts_without_backoff_overflow() -> None:
+    client, clock = _client(
+        lambda _: httpx.Response(500),
+        max_retries=1025,
+        backoff_base_s=1e-6,
+        backoff_cap_s=1e-6,
+    )
+    with pytest.raises(RetriesExhausted):
+        client.get("/events/keyset", {})
+    assert client.stats.requests == 1026
+    assert len(clock.sleeps) == 1025
 
 
 def test_token_bucket_spaces_requests() -> None:

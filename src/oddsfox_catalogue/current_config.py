@@ -167,9 +167,12 @@ def load_current_settings(root: Path | None = None, *, env=None) -> CurrentSetti
     catalogue = raw.get("catalogue", {})
     if not isinstance(catalogue, dict):
         raise CurrentError("[catalogue] must be a table")
+    gamma_config = raw.get("gamma", {})
+    if not isinstance(gamma_config, dict):
+        raise CurrentError("[gamma] must be a table")
     catalogue = {name: value for name, value in catalogue.items() if name not in RETIRED_KEYS}
     defaults = asdict(CurrentSettings(root).gamma)
-    gamma = _build_section(GammaSettings, {**defaults, **raw.get("gamma", {})}, "gamma", environ)
+    gamma = _build_section(GammaSettings, {**defaults, **gamma_config}, "gamma", environ)
     limits = _build_section(CurrentLimits, catalogue, "catalogue", environ)
     for name, value in asdict(limits).items():
         if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
@@ -218,10 +221,8 @@ def _configure_connection(connection, settings: CurrentSettings) -> None:
     connection.execute(f"SET threads={threads}")
 
 
-def publication_reserve(settings: CurrentSettings, conn, *, publishing: bool) -> float:
+def publication_reserve(settings: CurrentSettings, conn) -> float:
     floor = settings.limits.publication_reserve_s
-    if not publishing:
-        return floor
     from oddsfox_catalogue.current_store import get_state
 
     return max(floor, 1.5 * get_state(conn, "previous_publish_seconds", 0))

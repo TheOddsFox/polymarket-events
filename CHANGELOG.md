@@ -13,6 +13,12 @@
 
 ### Fixed
 
+- Prefetch handoff keeps completed responses available without a duplicate GET or
+  unnecessary request-budget exhaustion.
+- Full-pass completion keeps the measured publication reserve even when cadence
+  initially defers publication.
+- Malformed Gamma configuration sections return the handled configuration error.
+- Capped retry backoff remains bounded for large accepted retry counts.
 - Interrupted optimization campaigns retain a qualified fallback only after final
   integrity verification within the remaining measurement budget.
 - Full-pass scheduling preserves the complete accepted 20-digit entity ID range and
@@ -28,7 +34,8 @@
 - `reconcile --full-pass` publishes when the pass completes or when
   `full_pass_publish_interval_s` (default 6 hours) has elapsed since the last publication.
   Other invocations still publish every time. A pass invocation that does not publish
-  exits 3 with `published: false` and reserves only `publication_reserve_s`.
+  exits 3 with `published: false`; every pass invocation keeps the measured publication
+  reserve in case it completes.
 - An unchanged publication checks the pointer, the manifest hash, the file inventory, and
   each Parquet size and SHA-256. It still rejects a live store that fails its own checks,
   and it does not recompute the Parquet semantic fingerprint. `verify` and `current` stay

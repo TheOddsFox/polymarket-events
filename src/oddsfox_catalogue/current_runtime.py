@@ -66,7 +66,7 @@ def execute(settings, operation, options, deadline):
         from .current_sync import discover, probe_policy, resume_pending
 
         publishing = _publishing(settings, conn, operation, options)
-        reserve = publication_reserve(settings, conn, publishing=publishing)
+        reserve = publication_reserve(settings, conn)
         acquisition_deadline = deadline if operation == "probe" else deadline - reserve
         with GammaClient(
             settings.gamma,
@@ -102,9 +102,7 @@ def execute(settings, operation, options, deadline):
                                     "completed_at"
                                 )
                                 start_full_pass(conn)
-                            result = reconcile(
-                                settings, conn, client, deadline=deadline, publishing=publishing
-                            )
+                            result = reconcile(settings, conn, client, deadline=deadline)
                         else:
                             raise CurrentError("unknown current catalogue operation")
                     except (RequestBudgetExceeded, CaptureStopped):

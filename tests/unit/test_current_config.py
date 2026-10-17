@@ -15,6 +15,29 @@ from oddsfox_catalogue.current_config import (
 from oddsfox_catalogue.current_contract import CurrentError
 
 
+@pytest.mark.parametrize("gamma", ["3", '"wrong"', "true", "[]"])
+def test_malformed_gamma_section_is_reported_as_blocked_config(
+    tmp_path, monkeypatch, capsys, gamma
+):
+    from oddsfox_catalogue.cli import main
+
+    root = tmp_path / "catalogue"
+    config = tmp_path / "config.toml"
+    config.write_text(f"gamma = {gamma}\n")
+    monkeypatch.setenv("CATALOGUE_CONFIG", str(config))
+
+    assert main(["--root", str(root), "config", "show"]) == 3
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out) == {
+        "status": "blocked",
+        "message": "[gamma] must be a table",
+        "http_attempts": 0,
+        "downloaded_bytes": 0,
+    }
+    assert not root.exists()
+
+
 def test_unknown_and_legacy_roots_are_untouched(tmp_path):
     root = tmp_path / "legacy"
     root.mkdir()
