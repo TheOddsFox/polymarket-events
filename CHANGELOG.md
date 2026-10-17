@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- Interrupted optimization campaigns retain a qualified fallback only after final
+  integrity verification within the remaining measurement budget.
 - Full-pass scheduling preserves the complete accepted 20-digit entity ID range and
   retries stale events below an exhausted saved cursor on the next invocation.
 - Installed-workflow and capacity tooling reap exited process leaders before signalling

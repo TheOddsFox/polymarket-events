@@ -23,6 +23,9 @@ not accepted for deployment.
 ## Probe 2026-10-17
 
 This probe is not a passed v1 bar. The full pass was not run to completion.
+Its timings predate batched application, prefetch and publication-cadence changes.
+The four-day projection below is historical, not a current runtime estimate; a completed
+current full-catalogue measurement remains unavailable.
 
 The seeded root verified: 1,138,596 events and 4,321,358 markets. After the probe, `full_pass.remaining` was 5,439,842, `active_overdue_count` was 21,874, and unresolved memberships were 0.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 from pathlib import Path
 
 import duckdb
@@ -315,10 +316,46 @@ def test_missing_pairs_and_inconsistent_private_semantics_remain_unqualified():
     assert campaign.bench.comparison(baseline, candidate, "perf")["status"] == "invalid"
 
 
-def test_incomplete_combination_falls_back_to_binding_and_integrity_failure_retains_none():
-    assert campaign._failure_retention(True, integrity_failure=False) == ["binding"]
-    assert campaign._failure_retention(True, integrity_failure=True) == []
-    assert campaign._failure_retention(False, integrity_failure=False) == []
+def test_fallback_retention_requires_fresh_integrity_and_harness_checks(tmp_path, monkeypatch):
+    calls = []
+
+    def check(*_args):
+        calls.append("integrity")
+
+    def harness(*_args):
+        calls.append("harness")
+
+    monkeypatch.setattr(campaign, "_integrity_check", check)
+    monkeypatch.setattr(campaign, "_assert_campaign_provenance", harness)
+    assert campaign._failure_retention(True, {}, {}, tmp_path, "seed", {}, object()) == ["binding"]
+    assert calls == ["integrity", "harness"]
+    assert campaign._failure_retention(False, {}, {}, tmp_path, "seed", {}, object()) == []
+
+    def invalid(*_args):
+        raise campaign.CampaignIntegrityError("changed")
+
+    monkeypatch.setattr(campaign, "_integrity_check", invalid)
+    assert campaign._failure_retention(True, {}, {}, tmp_path, "seed", {}, object()) == []
+
+
+@pytest.mark.parametrize("now,expected", [(80, ["binding"]), (85, [])])
+def test_fallback_releases_optional_holdback_but_keeps_shutdown_reserve(
+    tmp_path, monkeypatch, now, expected
+):
+    budget = campaign.bench.Budget(limit_s=100)
+    budget.started = 0
+    budget.holdback_s = 15
+    monkeypatch.setattr(campaign.bench.time, "monotonic", lambda: now)
+    monkeypatch.setattr(
+        campaign,
+        "_integrity_check",
+        lambda *_args: budget.admit(0.001),
+    )
+    monkeypatch.setattr(campaign, "_assert_campaign_provenance", lambda *_args: None)
+    report = {"retained": ["outcome_grouping"]}
+    campaign._record_failure_retention(report, True, {}, {}, tmp_path, "seed", {}, budget)
+    assert report["retained"] == expected
+    assert budget.holdback_s == 0
 
 
 def test_source_integrity_failure_after_primary_gate_retains_no_binding(tmp_path, monkeypatch):
@@ -387,6 +424,132 @@ def test_source_integrity_failure_after_primary_gate_retains_no_binding(tmp_path
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "failed"
     assert report["retained"] == []
+
+
+def test_early_timeout_before_harness_provenance_keeps_partial_report(tmp_path, monkeypatch):
+    baseline = package(tmp_path / "baseline", **{"current_store.py": "VALUE = 1\n"})
+    binding = package(tmp_path / "binding", **{"current_store.py": "VALUE = 2\n"})
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                name: {"path": str(path), "source_hashes": inventory(path)}
+                for name, path in (("baseline", baseline), ("binding", binding))
+            }
+        )
+    )
+
+    def timeout_before_provenance(_budget):
+        raise TimeoutError("budget expired")
+
+    monkeypatch.setattr(campaign, "_campaign_provenance", timeout_before_provenance)
+    args = campaign.parser().parse_args(
+        ["--manifest", str(manifest), "--output", str(tmp_path / "evidence")]
+    )
+    assert campaign.run(args) == 0
+    report = json.loads((tmp_path / "evidence" / "report.json").read_text())
+    assert report["status"] == "insufficient_evidence"
+    assert report["retained"] == []
+
+
+@pytest.mark.parametrize(
+    "failure,mutate,expected_status,expected_retained,expected_code",
+    [
+        ("timeout", "binding", "insufficient_evidence", [], None),
+        ("timeout", "seed", "insufficient_evidence", [], None),
+        ("timeout", "harness", "insufficient_evidence", [], None),
+        ("timeout", None, "insufficient_evidence", ["binding"], None),
+        ("timeout", "budget", "insufficient_evidence", [], None),
+        ("keyboard", None, "partial", ["binding"], 130),
+        ("term", None, "partial", ["binding"], 128 + signal.SIGTERM),
+        ("timeout", "verify_term", "partial", [], 128 + signal.SIGTERM),
+    ],
+)
+def test_optional_failure_revalidates_qualified_binding_before_fallback(
+    tmp_path, monkeypatch, failure, mutate, expected_status, expected_retained, expected_code
+):
+    baseline = package(tmp_path / "baseline", **{"current_store.py": "VALUE = 1\n"})
+    binding = package(tmp_path / "binding", **{"current_store.py": "VALUE = 2\n"})
+    grouping = package(tmp_path / "grouping", **{"current_store.py": "VALUE = 3\n"})
+    manifest = tmp_path / "manifest.json"
+    entries = {
+        name: {"path": str(path), "source_hashes": inventory(path)}
+        for name, path in (
+            ("baseline", baseline),
+            ("binding", binding),
+            ("outcome_grouping", grouping),
+        )
+    }
+    manifest.write_text(json.dumps(entries))
+    output = tmp_path / "evidence"
+    harness_state = {"changed": False}
+    monkeypatch.setattr(
+        campaign,
+        "_campaign_provenance",
+        lambda _budget: {"changed": harness_state["changed"]},
+    )
+    monkeypatch.setattr(campaign.bench, "build_dataset", lambda *_args: (None, None, {"events": 1}))
+
+    def prepare(_argv, output, _budget, _log, *, package_root):
+        seed = output / "seed" / "catalogue.duckdb"
+        seed.parent.mkdir(parents=True)
+        seed.write_bytes(b"seed")
+        return {
+            "status": "prepared",
+            "source_hashes": inventory(package_root),
+            "distribution": {"events": 1},
+            "seed_sha256": campaign._digest_bounded(seed, campaign.bench.Budget()),
+        }
+
+    monkeypatch.setattr(campaign.bench, "supervised_prepare", prepare)
+    comparisons = 0
+
+    def compare(
+        _stage, _left_name, _left, _right_name, _right, _seed, _output, _budget, _warmed, report
+    ):
+        nonlocal comparisons
+        comparisons += 1
+        if comparisons == 1:
+            report["stages"]["binding_vs_baseline"] = {
+                "samples": [{"category": "binding", "wall_s": 1}] * 3
+            }
+            return {"status": "qualified"}
+        if mutate == "binding":
+            target = output / "inputs" / "binding" / "oddsfox_catalogue" / "current_store.py"
+            target.write_text("VALUE = 999\n")
+        elif mutate == "seed":
+            (output / "seed" / "catalogue.duckdb").write_bytes(b"changed")
+        elif mutate == "harness":
+            harness_state["changed"] = True
+        if failure == "keyboard":
+            raise KeyboardInterrupt
+        if failure == "term":
+            raise campaign.bench.Terminated(signal.SIGTERM)
+        raise TimeoutError("optional comparison exhausted its budget")
+
+    monkeypatch.setattr(campaign, "_compare_stage", compare)
+    if mutate in {"budget", "verify_term"}:
+        integrity = campaign._integrity_check
+        checks = 0
+
+        def exhaust_fallback(*args):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                if mutate == "verify_term":
+                    raise campaign.bench.Terminated(signal.SIGTERM)
+                raise TimeoutError("no time remains for fallback verification")
+            return integrity(*args)
+
+        monkeypatch.setattr(campaign, "_integrity_check", exhaust_fallback)
+    args = campaign.parser().parse_args(["--manifest", str(manifest), "--output", str(output)])
+
+    assert campaign.run(args) == (expected_code if expected_code is not None else 0)
+    report = json.loads((output / "report.json").read_text())
+    assert report["status"] == expected_status
+    assert report["retained"] == expected_retained
+    if mutate == "budget":
+        assert report["error"].startswith("optional comparison")
 
 
 @pytest.mark.parametrize("unsafe", ["symlink", "fifo"])

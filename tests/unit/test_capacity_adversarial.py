@@ -7,6 +7,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from argparse import Namespace
 from contextlib import suppress
@@ -49,9 +50,24 @@ def command(tmp_path, code, *, cap=64, timeout=3):
     )
 
 
+def overflow_emitter(source):
+    body = textwrap.indent(textwrap.dedent(source).strip(), "    ")
+    return (
+        "import signal\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "try:\n"
+        f"{body}\n"
+        "except BrokenPipeError:\n"
+        "    pass\n"
+        "while True:\n"
+        "    signal.pause()\n"
+    )
+
+
 @pytest.mark.parametrize("length", [63, 64, 65])
 def test_output_cap_counts_raw_bytes_across_both_streams(tmp_path, length):
-    code = f"import os; os.write(1, bytes(range(32))); os.write(2, bytes(range({length - 32})))"
+    emitter = f"import os; os.write(1, bytes(range(32))); os.write(2, bytes(range({length - 32})))"
+    code = overflow_emitter(emitter) if length > 64 else emitter
     expected = bytes(range(32)) + bytes(range(length - 32))
     if length <= 64:
         command(tmp_path, code)
@@ -79,7 +95,8 @@ def test_unbounded_default_preserves_complete_binary_log(tmp_path):
 @pytest.mark.parametrize("overflow", [False, True])
 def test_bounded_failure_diagnostic_never_echoes_child_credentials(tmp_path, overflow):
     secret = "https://user:synthetic-password@example.invalid?token=private"
-    code = f"import os; os.write(2, {secret.encode()!r}); raise SystemExit(7)"
+    emitter = f"import os; os.write(2, {secret.encode()!r})"
+    code = overflow_emitter(emitter) if overflow else f"{emitter}; raise SystemExit(7)"
     with pytest.raises(ValueError) as error:
         command(tmp_path, code, cap=8 if overflow else 512)
     text = str(error.value)
@@ -250,16 +267,7 @@ def test_real_output_overflow_retains_failed_bounded_log_and_report(tmp_path, mo
     root.mkdir()
     executable = tmp_path / "noisy"
     # Keep the emitter alive through TERM so this test isolates overflow and forced cleanup.
-    noisy = (
-        "import os, signal\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "try:\n"
-        "    os.write(1, b'x' * 32768)\n"
-        "except BrokenPipeError:\n"
-        "    pass\n"
-        "while True:\n"
-        "    signal.pause()\n"
-    )
+    noisy = overflow_emitter("import os\nos.write(1, b'x' * 32768)")
     executable.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-c", noisy]) + "\n")
     executable.chmod(0o700)
     monkeypatch.setattr(capacity, "ANCILLARY_BYTES", 16 * 1024)

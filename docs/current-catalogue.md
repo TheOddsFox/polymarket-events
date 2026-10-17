@@ -331,7 +331,10 @@ compared independently with binding, in grouping, queue, projection order. A sec
 must match the full binding source inventory except for its assigned store, reconciliation
 or sync module. Only individually qualified files are assembled, and that final combination
 must qualify against the unchanged baseline. If final evidence is incomplete or fails,
-only an already qualified binding variant may be retained. All existing semantic,
+only an already qualified binding variant may be retained. Fallback retention also
+requires a final check of the measured sources, seed and harness within the remaining
+measurement budget. Failed or unfinished integrity verification retains no candidate;
+the shutdown reserve remains reserved for cleanup. All existing semantic,
 publication, HTTP-load, wall-time and peak-RSS gates remain required. The oracle also
 compares private identity, claim, repair, attempt and generation state.
 

@@ -236,11 +236,27 @@ def _digest_bounded(path: Path, budget) -> str:
 
 
 def _campaign_provenance(budget) -> dict:
-    provenance = bench.harness_provenance()
-    provenance["source_hashes"][str(Path(__file__).resolve())] = _digest_bounded(
-        Path(__file__).resolve(), budget
-    )
-    return provenance
+    budget.admit(0.001)
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=bench.REPO,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=budget.remaining,
+    ).stdout.strip()
+    paths = [
+        Path(__file__).resolve(),
+        Path(bench.__file__).resolve(),
+        Path(bench.REPO) / "tests" / "fakes" / "world.py",
+        Path(bench.REPO) / "tests" / "fakes" / "capacity_source.py",
+    ]
+    return {
+        "git_revision": revision,
+        "source_hashes": {
+            str(path.relative_to(bench.REPO)): _digest_bounded(path, budget) for path in paths
+        },
+    }
 
 
 def _assert_campaign_provenance(expected: dict, budget) -> None:
@@ -335,10 +351,32 @@ def _integrity_check(packages, provenance, seed, seed_hash, budget):
     budget.admit(0.001)
 
 
-def _failure_retention(binding_qualified: bool, *, integrity_failure: bool) -> list[str]:
-    if integrity_failure:
+def _failure_retention(binding_qualified, packages, provenance, seed, seed_hash, harness, budget):
+    if not binding_qualified:
         return []
-    return ["binding"] if binding_qualified else []
+    try:
+        _integrity_check(packages, provenance, seed, seed_hash, budget)
+        _assert_campaign_provenance(harness, budget)
+    except Exception:
+        return []
+    return ["binding"]
+
+
+def _record_failure_retention(
+    report, binding_qualified, packages, provenance, seed, seed_hash, harness, budget
+):
+    report["retained"] = []
+    budget.holdback_s = 0.0
+    try:
+        report["retained"] = _failure_retention(
+            binding_qualified, packages, provenance, seed, seed_hash, harness, budget
+        )
+    except (KeyboardInterrupt, bench.Terminated) as stop:
+        report["status"] = "partial"
+        report["error"] = "interrupted while verifying fallback integrity"
+        report["interrupted_exit_code"] = (
+            128 + stop.signum if isinstance(stop, bench.Terminated) else 130
+        )
 
 
 def parser():
@@ -376,6 +414,7 @@ def run(args) -> int:
     provenance = {}
     seed = output / "seed"
     seed_hash = None
+    harness = None
     binding_qualified = False
     try:
         harness = _campaign_provenance(budget)
@@ -525,22 +564,28 @@ def run(args) -> int:
     except (TimeoutError, subprocess.TimeoutExpired) as exc:
         report["status"] = "insufficient_evidence"
         report["error"] = str(exc)
-        report["retained"] = _failure_retention(binding_qualified, integrity_failure=False)
+        _record_failure_retention(
+            report, binding_qualified, packages, provenance, seed, seed_hash, harness, budget
+        )
     except (KeyboardInterrupt, bench.Terminated) as exc:
         report["status"] = "partial"
         report["error"] = "interrupted; retained evidence"
-        report["retained"] = _failure_retention(binding_qualified, integrity_failure=False)
         report["interrupted_exit_code"] = (
             128 + exc.signum if isinstance(exc, bench.Terminated) else 130
+        )
+        _record_failure_retention(
+            report, binding_qualified, packages, provenance, seed, seed_hash, harness, budget
         )
     except CampaignIntegrityError as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
-        report["retained"] = _failure_retention(binding_qualified, integrity_failure=True)
+        report["retained"] = []
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
-        report["retained"] = _failure_retention(binding_qualified, integrity_failure=False)
+        _record_failure_retention(
+            report, binding_qualified, packages, provenance, seed, seed_hash, harness, budget
+        )
     finally:
         report["elapsed_seconds"] = budget.elapsed
         bench._save(output / "report.json", report)
