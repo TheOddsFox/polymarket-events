@@ -73,6 +73,9 @@ class ResponseRows:
     memberships: dict[str, list[str] | None] = field(default_factory=dict)
     native_market_ids: set[str] = field(default_factory=set)
     parent_event_ids: set[str] = field(default_factory=set)
+    # Known entities a native 404 confirmed absent; they record a receipt but no data.
+    absent_event_ids: set[str] = field(default_factory=set)
+    absent_market_ids: set[str] = field(default_factory=set)
     raw_path: str | None = None
 
 

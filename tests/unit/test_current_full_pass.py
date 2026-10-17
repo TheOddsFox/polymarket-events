@@ -12,7 +12,7 @@ from oddsfox_catalogue import current_reconcile as reconcile
 from oddsfox_catalogue import current_store, current_sync
 from oddsfox_catalogue.current_config import CurrentLimits, CurrentSettings, validate_root
 from oddsfox_catalogue.current_rows import project_response
-from oddsfox_catalogue.gamma.http import GammaClient
+from oddsfox_catalogue.gamma.http import CaptureStopped, GammaClient, GammaError
 
 NOW = datetime(2026, 10, 14, tzinfo=UTC)
 
@@ -144,3 +144,154 @@ def test_empty_store_pass_completes_on_the_next_reconcile(setup):
     reconcile.start_full_pass(conn, now=NOW)
     run(settings, conn, lambda r: pytest.fail("nothing known to fetch"))
     assert reconcile.full_pass_status(conn, now=NOW)["completed_at"] is not None
+
+
+def market(key):
+    return {
+        "id": str(key),
+        "version": "v1",
+        "conditionId": f"0x{int(key):064x}",
+        "outcomes": ["Yes", "No"],
+        "clobTokenIds": [str(int(key) * 10 + i) for i in (1, 2)],
+    }
+
+
+def bulk_list_omits_event_two(request):
+    if request.url.path == "/events":
+        return httpx.Response(200, json=[event(1)])
+    pytest.fail(f"unexpected request {request.url}")
+
+
+@pytest.mark.parametrize(
+    "native",
+    [
+        lambda request: httpx.Response(404, json={"error": "not found"}),
+        lambda request: httpx.Response(200, json=event(2, closed=True)),
+    ],
+    ids=["native-404-is-absence", "native-200-applies-record"],
+)
+def test_bulk_omission_is_settled_by_one_native_lookup_then_not_refetched(setup, native):
+    settings, conn = setup
+    seed(conn, [event(1), event(2, closed=True)], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if request.url.path == "/events/2":
+            return native(request)
+        return bulk_list_omits_event_two(request)
+
+    run(settings, conn, handler)
+    status = reconcile.full_pass_status(conn, now=NOW)
+    assert status["remaining"] == 0
+    assert status["completed_at"] is not None
+    assert seen.count("/events/2") == 1
+    # The next invocation must not spend requests on the settled entity.
+    run(settings, conn, lambda request: pytest.fail(f"refetched {request.url}"))
+
+
+def test_interrupted_confirmation_resumes_as_absence(setup):
+    settings, conn = setup
+    seed(conn, [event(1), event(2, closed=True)], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+
+    def interrupted(request):
+        if request.url.path == "/events/2":
+            raise CaptureStopped()
+        return bulk_list_omits_event_two(request)
+
+    run(settings, conn, interrupted)
+    assert reconcile.full_pass_status(conn, now=NOW)["completed_at"] is None
+    assert current_store.get_state(conn, "fetch_pending") is not None
+
+    seen = []
+
+    def resumed(request):
+        seen.append(request.url.path)
+        return httpx.Response(404, json={"error": "not found"})
+
+    run(settings, conn, resumed)
+    assert seen == ["/events/2"]
+    assert reconcile.full_pass_status(conn, now=NOW)["completed_at"] is not None
+
+
+def server_error(request):
+    return httpx.Response(500)
+
+
+def connect_refused(request):
+    raise httpx.ConnectError("refused", request=request)
+
+
+@pytest.mark.parametrize("failure", [server_error, connect_refused], ids=["5xx", "transport"])
+def test_server_or_transport_failure_never_counts_as_absent(setup, failure):
+    settings, conn = setup
+    # No retries: a retry penalty would wait on the real clock inside this test.
+    settings = replace(settings, gamma=replace(settings.gamma, max_retries=0))
+    seed(conn, [event(1), event(2, closed=True)], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+
+    def handler(request):
+        if request.url.path == "/events/2":
+            return failure(request)
+        return bulk_list_omits_event_two(request)
+
+    with pytest.raises(GammaError):
+        run(settings, conn, handler)
+    status = reconcile.full_pass_status(conn, now=NOW)
+    assert status["remaining"] == 1
+    assert status["completed_at"] is None
+
+
+def test_omitted_known_market_is_settled_by_native_404(setup):
+    settings, conn = setup
+    old = (NOW - timedelta(seconds=3600)).isoformat()
+    current_store.apply(
+        conn, project_response([market("10")], "markets", received_at=old, response_id="old")
+    )
+    reconcile.start_full_pass(conn, now=NOW)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if request.url.path == "/markets":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/markets/10":
+            return httpx.Response(404, json={"error": "not found"})
+        pytest.fail(f"unexpected request {request.url}")
+
+    run(settings, conn, handler)
+    assert seen == ["/markets", "/markets/10"]
+    assert reconcile.full_pass_status(conn, now=NOW)["completed_at"] is not None
+
+
+def test_native_404_records_absence_only_for_known_entities(setup):
+    settings, conn = setup
+    seed(conn, [event(2)], age=3600)
+    client = GammaClient(
+        settings.gamma,
+        transport=httpx.MockTransport(lambda request: httpx.Response(404, json={})),
+        sleep=lambda _: None,
+    )
+    current_sync.fetch_apply(settings, conn, client, "events", [2, 3], native=True, absence=True)
+    rows = conn.execute("SELECT event_id, receipt FROM _membership ORDER BY event_id").fetchall()
+    assert [row[0] for row in rows] == ["2"]
+    assert rows[0][1] > NOW - timedelta(seconds=3600)
+    assert conn.execute("SELECT count(*) FROM events WHERE event_id='3'").fetchone()[0] == 0
+
+
+def test_window_gaps_cost_no_native_lookup(setup):
+    settings, conn = setup
+    seed(conn, [event(2)], age=3600)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(404, json={})
+
+    client = GammaClient(
+        settings.gamma, transport=httpx.MockTransport(handler), sleep=lambda _: None
+    )
+    reconcile._confirm_omitted(settings, conn, client, "events", ["2", "3"])
+    assert seen == ["/events/2"]

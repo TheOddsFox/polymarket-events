@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from . import current_store
 from .current_config import ACTIVE_FRESHNESS_S, COLD_FRESHNESS_S, admit
-from .current_sync import fetch_apply, resume_pending
+from .current_sync import fetch_apply, fetch_unit, resume_pending
 from .gamma.http import CaptureStopped, RequestBudgetExceeded
 
 
@@ -113,6 +113,25 @@ def _cold(conn, settings, now, state, *, pass_started=None):
                 next_window = {"next": 1, "cycle": started_at}
             return lane, ids, slot, next_window
     return None
+
+
+def _confirm_omitted(settings, conn, client, lane, omitted):
+    """Native lookups settle known entities a bounded list omitted; only a 404 proves absence.
+
+    Unknown IDs (window gaps) are skipped, so a sparse window costs no native requests.
+    """
+    if not omitted:
+        return 0
+    table, key = ("events", "event_id") if lane == "events" else ("markets", "market_id")
+    known = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT {key} FROM {table} WHERE {key} IN (SELECT unnest(?))", [omitted]
+        ).fetchall()
+    ]
+    if not known:
+        return 0
+    return fetch_apply(settings, conn, client, lane, known, native=True, absence=True)["responses"]
 
 
 def _pass_started(conn):
@@ -241,12 +260,21 @@ def _reconcile_units(settings, conn, client, *, deadline):
             break
         admit(settings, additional_bytes=65536)
         try:
-            result = fetch_apply(settings, conn, client, lane, ids, progress={"reconcile": state})
+            result, omitted = fetch_unit(
+                settings, conn, client, lane, ids, progress={"reconcile": state}
+            )
         except (CaptureStopped, RequestBudgetExceeded):
             break
         _attempt(conn, lane, ids, now)
         counters["responses"] += result["responses"]
         counters[counter] += 1
+        # Only a forced pass must settle every known entity, so only it spends native lookups
+        # on omissions; ordinary rechecks keep retrying omitted IDs on their normal schedule.
+        if pass_started is not None and time.monotonic() < stop:
+            try:
+                counters["responses"] += _confirm_omitted(settings, conn, client, lane, omitted)
+            except (CaptureStopped, RequestBudgetExceeded):
+                break
         # Only changed/invalid identities need native confirmation; one ID per budget check.
         repairs = conn.execute(
             """SELECT DISTINCT m.market_id FROM markets m

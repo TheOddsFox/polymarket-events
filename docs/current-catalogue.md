@@ -42,7 +42,8 @@ uv run catalogue --root /srv/catalogue-v3 config show
 inside another root. Every later command requires the stamp.
 
 Configuration is `ROOT/config.toml` (or `CATALOGUE_CONFIG`) with only `[gamma]` and
-`[catalogue]` sections. Unknown or legacy keys are rejected. `config show` prints the
+`[catalogue]` sections. Unknown keys are rejected. A 0.1.0 config opens unchanged: its
+`[load]` section and its `max_raw_bytes` and `raw_max_age_s` keys are ignored. `config show` prints the
 effective values. Environment overrides use `CATALOGUE_<SECTION>_<NAME>`.
 
 Limits have two separate values. Defaults are the starting values. Hard maximums are
@@ -131,8 +132,14 @@ publication manifest:
 | `identity_repair_count` | Markets whose identity is currently unusable |
 | `parent_event_repair_count` | Queued parent-event repairs |
 
-A known entity that upstream no longer returns (for example, a 404) produces no receipt,
-so `remaining` cannot reach 0 for it and the pass stays open. Investigate those entities
+During a forced pass, a bounded list that omits a known entity does not prove it is gone.
+One native lookup decides it: a 404 is a confirmed miss, which counts as that entity's
+receipt for the pass and is not refetched until its normal interval; a 200 applies the
+record. Any other status, or a transport failure, is an error and never counts toward
+`remaining`. Outside a pass, omitted entities keep the normal retry schedule.
+
+A known event whose source member list stays incomplete produces no membership receipt,
+so `remaining` stays above 0 for it and the pass stays open. Investigate those events
 before treating a pass as complete.
 
 A busy invocation exits **3** with `status: busy`. Other blocked failures also exit 3.

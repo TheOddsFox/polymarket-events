@@ -24,6 +24,11 @@ The first release ships the current Polymarket catalogue as a manual, single-hos
   the catalogue lock, on a read-only connection. Metadata refresh no longer depends on
   legacy settings.
 - Benchmarks admit each root against its own ceiling instead of a combined envelope.
+- During a forced full pass, a bounded list that omits a known event or market is settled
+  by one native lookup. A 404 is a confirmed miss and counts toward the pass; a 200 applies
+  the record. Other failures are never counted.
+- A 0.1.0 `config.toml` opens unchanged. The `[load]` section and the `max_raw_bytes` and
+  `raw_max_age_s` keys are ignored; other unknown keys are still rejected.
 
 ### Removed
 
@@ -33,4 +38,5 @@ The first release ships the current Polymarket catalogue as a manual, single-hos
 - The disabled scheduling template and the v2 catalogue document.
 - The seed-pending and seeding guards. Version 1 opens an already-initialized
   `catalogue_store.v4` root without migration.
-- Configuration keys for the removed raw-age and raw-size prune, and the `[load]` section.
+- Configuration keys for the removed raw-age and raw-size prune, and the `[load]` section,
+  as settings. Existing configs that still contain them are read, not refused.

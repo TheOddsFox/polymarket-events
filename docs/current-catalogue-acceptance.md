@@ -22,5 +22,6 @@ not accepted for deployment.
 
 ## Known limit
 
-A known entity that upstream no longer returns produces no receipt, so `remaining` cannot
-reach 0 for it. Such a pass stays open until that entity is resolved.
+A known event whose source member list stays incomplete produces no membership receipt, so
+its pass stays open until the source returns a complete list. A known entity that upstream
+no longer serves is settled by a native 404 during a forced pass and then counts toward it.

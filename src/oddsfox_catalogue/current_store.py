@@ -394,6 +394,20 @@ def apply(conn, response: ResponseRows, progress=None):
             ) or before_outcomes[(venue, market_id)] != _snapshot(
                 conn, "outcomes", "venue=? AND market_id=?", [venue, market_id]
             )
+        # Confirmed absence is a receipt, not data: it never changes rows or the generation.
+        for event_id in sorted(response.absent_event_ids):
+            conn.execute(
+                "UPDATE _membership SET receipt=?,response=? WHERE venue=? AND event_id=? "
+                "AND (receipt IS NULL OR (receipt,response)<(?,?)) AND EXISTS "
+                "(SELECT 1 FROM events e WHERE e.venue=_membership.venue "
+                "AND e.event_id=_membership.event_id)",
+                [*stamp, "polymarket", event_id, *stamp],
+            )
+        for market_id in sorted(response.absent_market_ids):
+            if conn.execute(
+                "SELECT 1 FROM markets WHERE venue=? AND market_id=?", ["polymarket", market_id]
+            ).fetchone():
+                _newer(conn, "market", "polymarket", market_id, stamp)
         for event_id in response.parent_event_ids:
             conn.execute("INSERT OR IGNORE INTO _parent_repairs VALUES (?)", [event_id])
         for key, value in (progress or {}).items():

@@ -59,6 +59,10 @@ class HardMaximums:
 
 HARD_MAXIMUMS = HardMaximums()
 MINIMUM_PUBLICATION_RESERVE_S = 60.0
+# A 0.1.0 root's config.toml may still carry these; v1 ignores them rather than refusing it.
+# Any other unknown key still fails, so typos and future keys stay visible.
+RETIRED_SECTIONS = frozenset({"load"})
+RETIRED_KEYS = frozenset({"max_raw_bytes", "raw_max_age_s"})
 
 
 @dataclass(frozen=True)
@@ -154,11 +158,15 @@ def load_current_settings(root: Path | None = None, *, env=None) -> CurrentSetti
     raw = {}
     if config_path.exists():
         raw = tomllib.loads(read_regular_bytes(config_path, max_bytes=65536).decode())
-    if set(raw) - {"gamma", "catalogue"}:
+    if set(raw) - {"gamma", "catalogue"} - RETIRED_SECTIONS:
         raise CurrentError("legacy or unknown configuration; use catalogue.v3 config.toml")
+    catalogue = raw.get("catalogue", {})
+    if not isinstance(catalogue, dict):
+        raise CurrentError("[catalogue] must be a table")
+    catalogue = {name: value for name, value in catalogue.items() if name not in RETIRED_KEYS}
     defaults = asdict(CurrentSettings(root).gamma)
     gamma = _build_section(GammaSettings, {**defaults, **raw.get("gamma", {})}, "gamma", environ)
-    limits = _build_section(CurrentLimits, raw.get("catalogue", {}), "catalogue", environ)
+    limits = _build_section(CurrentLimits, catalogue, "catalogue", environ)
     for name, value in asdict(limits).items():
         if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
             raise CurrentError(f"catalogue {name} must be positive and finite")

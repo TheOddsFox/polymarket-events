@@ -391,8 +391,20 @@ def _write_response(settings, raw_dir, response, request):
     )
 
 
-def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=False):
+def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=False, absence=False):
     """Persist and apply a bounded repair unit; callers own its scheduling checkpoint."""
+    return fetch_unit(
+        settings, conn, client, kind, ids, progress=progress, native=native, absence=absence
+    )[0]
+
+
+def fetch_unit(settings, conn, client, kind, ids, *, progress=None, native=False, absence=False):
+    """Like ``fetch_apply``, also returning the bulk IDs no listing contained.
+
+    An omission is not absence. A forced pass settles each omitted known entity with a
+    native lookup, where only a 404 proves it. ``absence`` records those 404s as receipts;
+    it is stored with the pending unit, so a resumed unit keeps the mode it started with.
+    """
     validate_root(settings.root)
     lane = {"event": "events", "market": "markets"}.get(kind, kind)
     if lane not in LANES:
@@ -423,10 +435,17 @@ def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=Fals
             for closed in passes
         ]
     )
-    work = existing or {"identity": identity, "remaining": requests, "raw_id": uuid.uuid4().hex}
+    work = existing or {
+        "identity": identity,
+        "remaining": requests,
+        "raw_id": uuid.uuid4().hex,
+        "absence": bool(absence) and native,
+    }
+    absence = work.get("absence", False)
     admit(settings, additional_bytes=65536)
     current_store.set_state(conn, "fetch_pending", work)
     responses = requests_made = record_count = 0
+    listed = set()
     while work["remaining"]:
         request = work["remaining"][0]
         endpoint, params = request["endpoint"], request["params"]
@@ -474,6 +493,8 @@ def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=Fals
                 native=native,
                 closed=params.get("closed"),
             )
+        if not native:
+            listed.update(entity_id(record["id"]) for record in records)
         rows = project_response(
             records,
             lane,
@@ -482,6 +503,9 @@ def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=Fals
             native_market_ids=batch if native and lane == "markets" else (),
         )
         rows.raw_path = str(raw_dir / "p000001.manifest.json")
+        if absence and manifest["status"] == 404:
+            absent = rows.absent_event_ids if lane == "events" else rows.absent_market_ids
+            absent.update(entity_id(key) for key in batch)
         next_work = {**work, "remaining": work["remaining"][1:], "raw_id": uuid.uuid4().hex}
         checkpoint = {"fetch_pending": next_work if next_work["remaining"] else None}
         if not next_work["remaining"]:
@@ -491,7 +515,9 @@ def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=Fals
         responses += 1
         record_count += len(records)
         work = next_work
-    return {"responses": responses, "requests": requests_made, "records": record_count}
+    omitted = [] if native else sorted(set(map(str, wanted)) - listed, key=int)
+    result = {"responses": responses, "requests": requests_made, "records": record_count}
+    return result, omitted
 
 
 def validate_fetch_pending(settings, conn, work):
@@ -500,6 +526,9 @@ def validate_fetch_pending(settings, conn, work):
         identity = work["identity"]
         lane, native = identity["lane"], identity["native"]
         if lane not in LANES or type(native) is not bool or identity["policy"] != POLICY:
+            raise CurrentError("incompatible pending repair policy")
+        absence = work.get("absence", False)
+        if type(absence) is not bool or (absence and not native):
             raise CurrentError("incompatible pending repair policy")
         certificate, passes = (None, [None]) if native else _certificate(settings, conn, lane)
         if identity["certificate"] != certificate or identity["passes"] != passes:

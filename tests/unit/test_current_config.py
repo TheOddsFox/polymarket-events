@@ -55,8 +55,36 @@ def test_limits_and_legacy_config(tmp_path):
     with pytest.raises(CurrentError, match="at most"):
         load_current_settings(root, env={"CATALOGUE_GAMMA_REQUESTS_PER_SECOND": "11"})
     root.mkdir()
-    (root / "config.toml").write_text("[load]\nmax_pages_per_run=1\n")
+    (root / "config.toml").write_text("[paths]\nroot='data'\n")
     with pytest.raises(CurrentError, match="legacy"):
+        load_current_settings(root, env={})
+
+
+def test_zero_one_config_with_retired_keys_loads_and_current_limits_apply(tmp_path):
+    root = tmp_path / "v0"
+    root.mkdir()
+    (root / "config.toml").write_text(
+        "[gamma]\nrequests_per_second = 10.0\nmax_retries = 4\nbackoff_cap_s = 30.0\n\n"
+        "[catalogue]\nmax_retained_bytes = 137438953472\nmax_temp_bytes = 8589934592\n"
+        "free_reserve_bytes = 34359738368\nmax_raw_bytes = 8589934592\n"
+        "raw_max_age_s = 604800\nactive_recheck_s = 72000\ncold_recheck_s = 5011200\n\n"
+        '[load]\ndataset_name = "bronze"\nmax_pages_per_run = 200\n'
+        'duckdb_memory_limit = "2GB"\nduckdb_threads = 2\n'
+    )
+    limits = load_current_settings(root, env={}).limits
+    assert limits.max_retained_bytes == 128 * 1024**3
+    assert limits.max_temp_bytes == 8 * 1024**3
+    assert limits.free_reserve_bytes == 32 * 1024**3
+    assert limits.cold_recheck_s == 58 * 86400
+    retired = {"max_raw_bytes", "raw_max_age_s"}
+    assert retired.isdisjoint(asdict(limits))
+
+
+def test_unknown_future_catalogue_key_still_fails(tmp_path):
+    root = tmp_path / "future"
+    root.mkdir()
+    (root / "config.toml").write_text("[catalogue]\nmax_future_bytes = 1\n")
+    with pytest.raises(ValueError, match=r"unknown keys in \[catalogue\]"):
         load_current_settings(root, env={})
 
 
