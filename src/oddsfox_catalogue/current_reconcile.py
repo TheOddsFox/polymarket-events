@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from . import current_store
 from .current_config import ACTIVE_FRESHNESS_S, COLD_FRESHNESS_S, admit
-from .current_sync import fetch_apply, resume_pending
+from .current_sync import fetch_apply, fetch_unit, resume_pending
 from .gamma.http import CaptureStopped, RequestBudgetExceeded
 
 
@@ -28,7 +28,7 @@ def _entities(lane):
         LEFT JOIN _receipts r ON r.kind='market' AND r.venue=m.venue AND r.id=m.market_id"""
 
 
-def _due(conn, lane, cold, now, interval):
+def _due(conn, lane, cold, now, interval, *, pass_started=None):
     entities = _entities(lane)
     if lane == "events":
         entities = f"""SELECT id,
@@ -39,6 +39,11 @@ def _due(conn, lane, cold, now, interval):
     if lane == "events" and not cold:
         entities += """ UNION ALL SELECT p.event_id,NULL,NULL,true FROM _parent_repairs p
             WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id=p.event_id)"""
+    if pass_started is None:
+        bypass, threshold = lane == "markets" and cold, now - timedelta(seconds=interval)
+    else:
+        # A forced pass visits every known entity, open or closed, until its receipt is newer.
+        bypass, threshold = True, pass_started
     return conn.execute(
         f"""SELECT e.id,e.receipt FROM ({entities}) e
         LEFT JOIN _reconcile_attempts a ON a.kind=? AND a.id=e.id
@@ -47,13 +52,7 @@ def _due(conn, lane, cold, now, interval):
         (a.last_attempt IS NULL OR a.last_attempt<=?)
         ORDER BY a.last_attempt NULLS FIRST,e.receipt NULLS FIRST,try_cast(e.id AS BIGINT)
         LIMIT 100""",
-        [
-            lane,
-            lane == "markets" and cold,
-            cold,
-            now - timedelta(seconds=interval),
-            now - timedelta(hours=1),
-        ],
+        [lane, bypass, cold, threshold, now - timedelta(hours=1)],
     ).fetchall()
 
 
@@ -70,19 +69,27 @@ def _attempt(conn, lane, ids, now):
     )
 
 
-def _cold(conn, settings, now, state):
+def _cold(conn, settings, now, state, *, pass_started=None):
     discovery = current_store.get_state(conn, "discovery", {}).get("lanes", {})
     for offset in range(4):
         slot = (state["cold_slot"] + offset) % 4
         lane = ("events", "markets")[slot % 2]
         if slot < 2:
-            rows = _due(conn, lane, True, now, settings.limits.cold_recheck_s)
+            rows = _due(
+                conn,
+                lane,
+                True,
+                now,
+                settings.limits.cold_recheck_s,
+                pass_started=pass_started,
+            )
             if rows:
                 return lane, [r[0] for r in rows], slot, None
         else:
             window = state["windows"].get(lane, {"next": 1, "cycle": None})
             if (
-                window.get("started_at") is None
+                pass_started is None
+                and window.get("started_at") is None
                 and window["cycle"] is not None
                 and now.timestamp() - window["cycle"]
                 < min(settings.limits.cold_recheck_s, COLD_FRESHNESS_S // 2)
@@ -108,7 +115,93 @@ def _cold(conn, settings, now, state):
     return None
 
 
+def _confirm_omitted(settings, conn, client, lane, omitted):
+    """Native lookups settle known entities a bounded list omitted; only a 404 proves absence.
+
+    Unknown IDs (window gaps) are skipped, so a sparse window costs no native requests.
+    """
+    if not omitted:
+        return 0
+    table, key = ("events", "event_id") if lane == "events" else ("markets", "market_id")
+    known = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT {key} FROM {table} WHERE {key} IN (SELECT unnest(?))", [omitted]
+        ).fetchall()
+    ]
+    if not known:
+        return 0
+    return fetch_apply(settings, conn, client, lane, known, native=True, absence=True)["responses"]
+
+
+def _pass_started(conn):
+    """Start time of an unfinished forced full pass, otherwise None."""
+    state = current_store.get_state(conn, "full_pass") or {}
+    if state.get("pass_started_at") is None or state.get("completed_at") is not None:
+        return None
+    return datetime.fromisoformat(state["pass_started_at"])
+
+
+def start_full_pass(conn, *, now=None):
+    """Begin a forced pass; an unfinished pass keeps its start and resumes from receipts."""
+    if _pass_started(conn) is not None:
+        return
+    started = now or _now()
+    current_store.set_state(
+        conn, "full_pass", {"pass_started_at": started.isoformat(), "completed_at": None}
+    )
+
+
+def _remaining(conn, started):
+    """Known events and markets without a receipt newer than the pass start."""
+    return conn.execute(
+        f"""SELECT count(*) FROM (
+            SELECT receipt FROM ({_entities("events")})
+            UNION ALL SELECT receipt FROM ({_entities("markets")})
+        ) WHERE receipt IS NULL OR receipt<=?""",
+        [started],
+    ).fetchone()[0]
+
+
+def _complete_pass(conn, now):
+    started = _pass_started(conn)
+    if started is None or _remaining(conn, started) != 0:
+        return
+    state = current_store.get_state(conn, "full_pass")
+    state["completed_at"] = now.isoformat()
+    current_store.set_state(conn, "full_pass", state)
+
+
+def full_pass_status(conn, *, now=None):
+    """Forced-pass progress; never a source-completeness claim."""
+    now = now or _now()
+    state = current_store.get_state(conn, "full_pass") or {}
+    started = state.get("pass_started_at")
+    return {
+        "started_at": started,
+        "completed_at": state.get("completed_at"),
+        "remaining": None if started is None else _remaining(conn, datetime.fromisoformat(started)),
+        "overdue": freshness(conn, now=now)["active_overdue_count"],
+        "unresolved": conn.execute("SELECT count(*) FROM _membership WHERE unresolved").fetchone()[
+            0
+        ],
+        "identity_repair_count": conn.execute(
+            "SELECT count(DISTINCT market_id) FROM markets WHERE NOT usable"
+        ).fetchone()[0],
+        "parent_event_repair_count": conn.execute(
+            "SELECT count(*) FROM _parent_repairs"
+        ).fetchone()[0],
+    }
+
+
 def reconcile(settings, conn, client, *, deadline):
+    """Run bounded reconcile units; a forced pass is recorded complete once remaining hits 0."""
+    result = _reconcile_units(settings, conn, client, deadline=deadline)
+    _complete_pass(conn, _now())
+    return result
+
+
+def _reconcile_units(settings, conn, client, *, deadline):
     """Run 3 active units per cold unit, retaining finite rotation checkpoints."""
     reserve = max(
         settings.limits.publication_reserve_s,
@@ -129,9 +222,20 @@ def reconcile(settings, conn, client, *, deadline):
         state = current_store.get_state(
             conn, "reconcile", {"turn": 0, "cold_slot": 0, "windows": {}}
         )
-        rows = _due(conn, "events", False, now, settings.limits.active_recheck_s)
+        pass_started = _pass_started(conn)
+        # A finished forced pass must not keep spending the bypassed window scans.
+        if pass_started is not None and _remaining(conn, pass_started) == 0:
+            break
+        rows = _due(
+            conn,
+            "events",
+            False,
+            now,
+            settings.limits.active_recheck_s,
+            pass_started=pass_started,
+        )
         active = ("events", rows) if rows else None
-        cold = _cold(conn, settings, now, state)
+        cold = _cold(conn, settings, now, state, pass_started=pass_started)
         if active is None and cold is None:
             break
         # A near-target active receipt gets the next slot, even on a cold turn.
@@ -156,12 +260,21 @@ def reconcile(settings, conn, client, *, deadline):
             break
         admit(settings, additional_bytes=65536)
         try:
-            result = fetch_apply(settings, conn, client, lane, ids, progress={"reconcile": state})
+            result, omitted = fetch_unit(
+                settings, conn, client, lane, ids, progress={"reconcile": state}
+            )
         except (CaptureStopped, RequestBudgetExceeded):
             break
         _attempt(conn, lane, ids, now)
         counters["responses"] += result["responses"]
         counters[counter] += 1
+        # Only a forced pass must settle every known entity, so only it spends native lookups
+        # on omissions; ordinary rechecks keep retrying omitted IDs on their normal schedule.
+        if pass_started is not None and time.monotonic() < stop:
+            try:
+                counters["responses"] += _confirm_omitted(settings, conn, client, lane, omitted)
+            except (CaptureStopped, RequestBudgetExceeded):
+                break
         # Only changed/invalid identities need native confirmation; one ID per budget check.
         repairs = conn.execute(
             """SELECT DISTINCT m.market_id FROM markets m

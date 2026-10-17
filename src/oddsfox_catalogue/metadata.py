@@ -1,7 +1,8 @@
-"""Targeted, immutable metadata handoffs, independent of the six catalogue exports."""
+"""Targeted, immutable metadata.v1 handoffs: fresh Gamma reads plus catalogue identity state."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -12,14 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from oddsfox_catalogue.capture.writer import (
-    atomic_write_bytes,
-    read_body,
-    read_regular_bytes,
-    write_marker,
-    write_page,
-)
-from oddsfox_catalogue.config import Settings
+from oddsfox_catalogue.capture.writer import atomic_write_bytes, write_marker, write_page
+from oddsfox_catalogue.config import GammaSettings
+from oddsfox_catalogue.current_config import CurrentSettings, connect_store
 from oddsfox_catalogue.gamma.http import GammaClient, GammaError
 from oddsfox_catalogue.ids import (
     canonical_json,
@@ -27,7 +23,6 @@ from oddsfox_catalogue.ids import (
     iso_utc,
     observation_id,
     sha256_bytes,
-    utc_now,
 )
 from oddsfox_catalogue.normalization import (
     NormalizationError as MetadataError,
@@ -41,6 +36,7 @@ from oddsfox_catalogue.normalization import (
     project,
     validate_market_ids,
 )
+from oddsfox_catalogue.runlock import run_lock
 
 CONTRACT = "oddsfox.polymarket.metadata.v1"
 RELATIONS = ("markets", "outcomes", "memberships", "identity_history", "coverage")
@@ -49,6 +45,7 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 ID_RE = re.compile(r"[1-9][0-9]{0,19}\Z")
 CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
+CONFLICT_ERROR = "native identity has conflicting owners"
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -73,40 +70,6 @@ def _records(payload: Any, key: str) -> list[Any]:
         if isinstance(payload.get(key), list):
             return payload[key]
     raise MetadataError("raw page has an unsupported envelope")
-
-
-def _verified_payload(
-    path: Path, *, trusted_root: Path | None = None
-) -> tuple[dict[str, Any], Any]:
-    """Read only regular local files with a literal sibling payload name."""
-    if path.is_symlink() or not path.is_file():
-        raise MetadataError("raw manifest is not a regular file")
-    try:
-        manifest = _read_json(
-            read_regular_bytes(path, max_bytes=1024**2, trusted_root=trusted_root)
-        )
-    except (OSError, ValueError) as exc:
-        raise MetadataError("invalid raw manifest file") from exc
-    if not isinstance(manifest, dict) or manifest.get("manifest_version") != 1:
-        raise MetadataError("unsupported raw manifest")
-    if (
-        not isinstance(manifest.get("page_id"), str)
-        or not isinstance(manifest.get("observed_at"), str)
-        or _timestamp(manifest["observed_at"]) is None
-        or manifest.get("http_status") not in {200, 404}
-        or not isinstance(manifest.get("body_bytes"), int)
-    ):
-        raise MetadataError("invalid raw manifest fields")
-    try:
-        body = read_body(
-            path.parent,
-            manifest,
-            trusted_root=trusted_root or path.parent,
-            max_body_bytes=MAX_BODY_BYTES,
-        )
-    except (OSError, ValueError, EOFError) as exc:
-        raise MetadataError(str(exc)) from exc
-    return manifest, _read_json(body) if manifest["http_status"] == 200 else None
 
 
 def _observations(
@@ -148,30 +111,97 @@ def _observations(
     return found
 
 
+def _identity_history(conn: Any, market_ids: list[str]) -> list[dict[str, Any]]:
+    """Identity rows from the catalogue's own identity tables, never from fetched observations."""
+    rows = []
+    for market_id in market_ids:
+        identity = conn.execute(
+            "SELECT candidate,accepted,invalidated_at,invalidated_response FROM _identity "
+            "WHERE venue='polymarket' AND market_id=?",
+            [market_id],
+        ).fetchone()
+        receipt = conn.execute(
+            "SELECT receipt,response FROM _receipts "
+            "WHERE kind='market' AND venue='polymarket' AND id=?",
+            [market_id],
+        ).fetchone()
+        market = conn.execute(
+            "SELECT condition_id,source_market_version,usable,identity_error FROM markets "
+            "WHERE venue='polymarket' AND market_id=?",
+            [market_id],
+        ).fetchone()
+        if identity is None or receipt is None or market is None:
+            continue
+        candidate_json, accepted_json, invalidated_at, invalidated_response = identity
+        candidate = json.loads(candidate_json) if candidate_json else None
+        accepted = json.loads(accepted_json) if accepted_json else None
+        identities = candidate or accepted or []
+        conflict = any(
+            {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT market_id FROM _identity_claims "
+                    "WHERE venue='polymarket' AND asset_kind=? AND asset_id=?",
+                    [outcome.get("asset_kind"), outcome.get("asset_id")],
+                ).fetchall()
+            }
+            - {market_id}
+            for outcome in identities
+        )
+        events = [
+            row[0]
+            for row in conn.execute(
+                "SELECT event_id FROM event_markets WHERE venue='polymarket' AND market_id=? "
+                "ORDER BY event_id",
+                [market_id],
+            ).fetchall()
+        ]
+        condition_id, version, usable, error = market
+        received_at, response_id = receipt
+        received = _timestamp(ensure_utc(received_at).isoformat())
+        state = {
+            "candidate": candidate,
+            "accepted": accepted,
+            "invalidated_at": invalidated_at.isoformat() if invalidated_at else None,
+            "invalidated_response": invalidated_response,
+        }
+        rows.append(
+            {
+                "market_id": market_id,
+                "condition_id": condition_id,
+                "source_market_version": version,
+                "raw_clob_token_ids": [o.get("clob_token_id") for o in identities],
+                "raw_position_ids": [o.get("position_id") for o in identities],
+                "raw_outcomes": [o.get("outcome_label") for o in identities],
+                "enclosing_event_id": events[0] if len(events) == 1 else None,
+                "usable": bool(usable) and not conflict,
+                "identity_error": CONFLICT_ERROR if conflict else error,
+                "identities": identities,
+                "observation_id": observation_id(response_id, "/identity"),
+                "page_id": response_id,
+                "capture_id": response_id,
+                "received_at": received,
+                "source_kind": "catalogue_store",
+                "json_pointer": "/identity",
+                "payload_sha256": sha256_bytes(
+                    canonical_json(state, max_bytes=MAX_OUTPUT_BYTES).encode()
+                ),
+            }
+        )
+    return rows
+
+
 def _relations(
-    market_ids: list[str], observations: list[Observation], coverage: list[dict[str, Any]]
+    market_ids: list[str],
+    observations: list[Observation],
+    coverage: list[dict[str, Any]],
+    identity: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     relations: dict[str, list[dict[str, Any]]] = {name: [] for name in RELATIONS}
     allowed = {row["market_id"] for row in coverage if row["status"] == "found"}
     by_id = {market_id: [] for market_id in market_ids}
     for obs in observations:
         by_id[str(obs.market["id"])].append(obs)
-        market, outcomes = project(obs)
-        relations["identity_history"].append(
-            {
-                "market_id": market["market_id"],
-                "condition_id": market["condition_id"],
-                "source_market_version": market["source_market_version"],
-                "raw_clob_token_ids": obs.market.get("clobTokenIds"),
-                "raw_position_ids": obs.market.get("positionIds"),
-                "raw_outcomes": obs.market.get("outcomes"),
-                "enclosing_event_id": obs.enclosing_event_id,
-                "usable": market["usable"],
-                "identity_error": market["identity_error"],
-                "identities": outcomes,
-                **obs.provenance,
-            }
-        )
     for market_id in market_ids:
         candidates = by_id[market_id]
         if not candidates or market_id not in allowed:
@@ -198,10 +228,18 @@ def _relations(
     ]
     for market in relations["markets"]:
         if market["market_id"] in conflicted_markets:
-            market["usable"], market["identity_error"] = (
-                False,
-                "native identity has conflicting owners",
-            )
+            market["usable"], market["identity_error"] = (False, CONFLICT_ERROR)
+    relations["identity_history"] = [
+        {
+            **row,
+            **(
+                {"usable": False, "identity_error": CONFLICT_ERROR}
+                if row["market_id"] in conflicted_markets
+                else {}
+            ),
+        }
+        for row in identity
+    ]
     relations["coverage"] = coverage
     relations["identity_history"].sort(
         key=lambda row: (
@@ -261,89 +299,9 @@ def _write_bundle(
             shutil.rmtree(stage)
 
 
-def export_metadata(
-    settings: Settings, market_ids: list[str], output: Path, *, max_output_bytes=MAX_OUTPUT_BYTES
-) -> dict[str, Any]:
-    """Offline export from immutable raw evidence; absence is never inferred from silence."""
-    market_ids = validate_market_ids(market_ids)
-    requested = set(market_ids)
-    observations: list[Observation] = []
-    coverage_evidence: dict[str, tuple[int, Any, str, str, str | None]] = {}
-    request_markers: dict[Path, dict[str, Any]] = {}
-    for path in sorted((settings.data_dir / "metadata" / "raw").glob("**/_request.json")):
-        if path.is_symlink() or not path.is_file():
-            raise MetadataError("request marker is not a regular file")
-        try:
-            record = _read_json(
-                read_regular_bytes(
-                    path, max_bytes=1024**2, trusted_root=settings.data_dir / "metadata" / "raw"
-                )
-            )
-        except (OSError, ValueError) as exc:
-            raise MetadataError("invalid request marker file") from exc
-        if not isinstance(record, dict) or record.get("status") not in {
-            "found",
-            "absent",
-            "failed",
-        }:
-            raise MetadataError("invalid metadata request marker")
-        request_markers[path.parent] = record
-        market_id = record.get("market_id")
-        if market_id in requested:
-            evidence = (
-                1,
-                parse_timestamp(record["received_at"]),
-                record["capture_id"],
-                record["status"],
-                record.get("error"),
-            )
-            current = coverage_evidence.get(market_id)
-            if current is None or evidence[:3] > current[:3]:
-                coverage_evidence[market_id] = evidence
-    for directory in (settings.raw_dir, settings.data_dir / "metadata" / "raw"):
-        for path in sorted(directory.glob("**/p*.manifest.json")):
-            if directory != settings.raw_dir:
-                record = request_markers.get(path.parent)
-                if record is None or record["status"] == "failed":
-                    continue
-            manifest, payload = _verified_payload(path, trusted_root=directory)
-            record_key = manifest.get("record_key")
-            if record_key is None:
-                record_key = (
-                    "markets" if manifest.get("endpoint", "").startswith("/markets") else "events"
-                )
-            if payload is not None:
-                page_observations = _observations(manifest, payload, record_key, requested)
-                observations.extend(page_observations)
-                for obs in page_observations:
-                    market_id = str(obs.market["id"])
-                    evidence = (*obs.rank, "found", None)
-                    current = coverage_evidence.get(market_id)
-                    if current is None or evidence[:3] > current[:3]:
-                        coverage_evidence[market_id] = evidence
-    found = {str(obs.market["id"]) for obs in observations}
-    coverage = []
-    for market_id in market_ids:
-        evidence = coverage_evidence.get(market_id)
-        status = evidence[3] if evidence else "found" if market_id in found else "failed"
-        error = evidence[4] if evidence else "no_observation" if status == "failed" else None
-        coverage.append(
-            {"market_id": market_id, "requested": True, "status": status, "error": error}
-        )
-    received = max(
-        (obs.provenance["received_at"] for obs in observations), default=iso_utc(utc_now())
-    )
-    return _write_bundle(
-        output,
-        _relations(market_ids, observations, coverage),
-        received,
-        max_output_bytes=max_output_bytes,
-    )
-
-
-def _validate_endpoint(settings: Settings) -> None:
+def _validate_endpoint(gamma: GammaSettings) -> None:
     try:
-        url = urlsplit(settings.gamma.base_url)
+        url = urlsplit(gamma.base_url)
         port = url.port
     except ValueError as exc:
         raise MetadataError("invalid targeted Gamma endpoint") from exc
@@ -351,7 +309,7 @@ def _validate_endpoint(settings: Settings) -> None:
         url.scheme == "https" and url.hostname == "gamma-api.polymarket.com" and port in {None, 443}
     )
     local_test = (
-        settings.gamma.allow_loopback
+        gamma.allow_loopback
         and url.scheme == "http"
         and url.hostname in {"127.0.0.1", "localhost", "::1"}
     )
@@ -368,8 +326,18 @@ def _validate_endpoint(settings: Settings) -> None:
         )
 
 
+def _catalogue_identity(catalogue: CurrentSettings, market_ids: list[str]) -> list[dict[str, Any]]:
+    """Read identity under the catalogue writer lock; the catalogue store is never written here."""
+    if not catalogue.store_path.exists():
+        raise MetadataError("catalogue identity store is not initialized")
+    with run_lock(catalogue.run_lock_path), connect_store(catalogue, read_only=True) as conn:
+        return _identity_history(conn, market_ids)
+
+
 def refresh_metadata(
-    settings: Settings,
+    gamma: GammaSettings,
+    catalogue: CurrentSettings | None,
+    producer_root: Path,
     market_ids: list[str],
     output: Path,
     *,
@@ -390,10 +358,10 @@ def refresh_metadata(
         for limit in (max_requests, max_download_bytes)
     ):
         raise MetadataError("metadata request/download limits must be nonnegative integers")
-    _validate_endpoint(settings)
+    _validate_endpoint(gamma)
     owned_client = client is None
     client = client or GammaClient(
-        settings.gamma,
+        gamma,
         max_body_bytes=max_body_bytes,
         max_requests=max_requests,
         max_download_bytes=max_download_bytes,
@@ -402,7 +370,7 @@ def refresh_metadata(
     initial_attempts = client.stats.requests
     initial_bytes = client.stats.downloaded_bytes
     capture_id = uuid.uuid4().hex
-    directory = settings.data_dir / "metadata" / "raw" / capture_id
+    directory = producer_root / "metadata" / "raw" / capture_id
     observations: list[Observation] = []
     coverage: list[dict[str, Any]] = []
     try:
@@ -432,7 +400,7 @@ def refresh_metadata(
                     "latency_s": response.latency_s,
                 }
                 page = write_page(directory / market_id, 1, response.body, fields)
-                record["manifest_path"] = str(page.manifest_path.relative_to(settings.data_dir))
+                record["manifest_path"] = str(page.manifest_path.relative_to(producer_root))
                 record["received_at"] = received
                 if response.status == 404:
                     record["status"] = "absent"
@@ -463,9 +431,10 @@ def refresh_metadata(
                     "received_at": record["received_at"],
                 }
             )
+        identity = _catalogue_identity(catalogue, market_ids) if catalogue is not None else []
         manifest = _write_bundle(
             output,
-            _relations(market_ids, observations, coverage),
+            _relations(market_ids, observations, coverage, identity),
             iso_utc(client.now()),
             max_output_bytes=max_output_bytes,
         )

@@ -24,7 +24,7 @@ from oddsfox_catalogue.config import GammaSettings
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
-DEFAULT_USER_AGENT = "oddsfox-catalogue/0.1 (+local batch pipeline)"
+DEFAULT_USER_AGENT = "oddsfox-catalogue/1.0.0 (+local batch pipeline)"
 # The longest pause a Retry-After header can impose. A longer header is cut to this, so one
 # response cannot stall the shared bucket for hours. The retry budget still applies.
 RETRY_AFTER_CEILING_S = 900.0

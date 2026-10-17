@@ -33,6 +33,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 from fakes.current_gamma import CurrentGammaServer  # noqa: E402
 from oddsfox_catalogue.current_config import (  # noqa: E402
+    HARD_MAXIMUMS,
+    CurrentLimits,
     CurrentSettings,
     connect_store,
     safe_path,
@@ -762,9 +764,14 @@ def capacity(seed, output, limit, additional=0, *, account_roots=()):
     }
     sizes = {path: value["logical_owned_bytes"] for path, value in usage.items()}
     retained = sum(sizes.values())
-    require(retained + additional <= limit, "combined accounted storage envelope exhausted")
+    # Each root is admitted against its own ceiling; no aggregate envelope is claimed.
+    require(strict[seed] <= limit, "seed retained storage exhausted")
+    require(strict[output] + additional <= limit, "output retained storage exhausted")
     free = shutil.disk_usage(output).free
-    require(free - additional >= 32 * 1024**3, "32 GiB free-space reserve would be exhausted")
+    require(
+        free - additional >= CurrentLimits().free_reserve_bytes,
+        "free-space reserve would be exhausted",
+    )
     return {
         "combined_bytes": retained,
         "free_bytes": free,
@@ -784,7 +791,7 @@ def parser():
         action="append",
         type=Path,
         default=[],
-        help="additional read-only legacy/artifact directory counted in the combined ceiling; repeat for every operator root outside repo/data (repo/data is counted automatically when present)",
+        help="additional read-only directory reported in accounting; repeat for every operator root outside repo/data (repo/data is reported automatically when present)",
     )
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--delta-markets", type=int, default=1000)
@@ -796,8 +803,8 @@ def parser():
     p.add_argument(
         "--max-retained-bytes",
         type=int,
-        default=256 * 1024**3,
-        help="combined seed/output/accounted roots envelope; cannot exceed 256 GiB",
+        default=CurrentLimits().max_retained_bytes,
+        help="per-root retained ceiling for the seed and the output; cannot exceed the hard maximum",
     )
     return p
 
@@ -816,7 +823,10 @@ def run(args):
     require(
         math.isfinite(args.delay_s) and args.delay_s >= 0, "delay must be finite and nonnegative"
     )
-    require(0 < args.max_retained_bytes <= 256 * 1024**3, "combined ceiling must be <=256 GiB")
+    require(
+        0 < args.max_retained_bytes <= HARD_MAXIMUMS.max_retained_bytes,
+        "retained ceiling must be positive and within the hard maximum",
+    )
     account_roots = [safe_path(path) for path in args.account_root]
     require(
         all(path.is_dir() for path in account_roots),
@@ -933,12 +943,13 @@ def run(args):
             row = {"run": index + 1}
             report["runs"].append(row)
             row["copy_bytes"] = seed_size
-            # Reserve the full canonical run ceiling, including publication/spill.
+            # Output must admit the next run's starting copy under its own ceiling. The run
+            # root is bounded separately by its own admission inside each canonical command.
             row["capacity_before"] = capacity(
                 seed,
                 output,
                 args.max_retained_bytes,
-                settings.limits.max_retained_bytes,
+                seed_size,
                 account_roots=account_roots,
             )
             root = output / f"run-{index + 1}"

@@ -5,9 +5,8 @@ from datetime import UTC, datetime
 
 import duckdb
 import pytest
-from test_current_import import release_fixture
 
-from oddsfox_catalogue import current_backup, current_import, current_publish
+from oddsfox_catalogue import current_publish
 from oddsfox_catalogue import current_store as store
 from oddsfox_catalogue.current_config import CurrentSettings, connect_store, validate_root
 from oddsfox_catalogue.current_contract import CurrentError
@@ -62,30 +61,6 @@ def test_repeated_same_maps_keep_one_claim_per_role_and_asset(conn):
         assert store.validate_store(conn)["valid"]
 
 
-def test_repeated_seed_keeps_identical_candidate_and_accepted_roles(tmp_path):
-    release, checksum, conn = release_fixture(tmp_path, usable=True)
-    settings = CurrentSettings(tmp_path / "current")
-    try:
-        for resumed in (False, True, True):
-            result = current_import.import_release(
-                settings, conn, release, manifest_sha256=checksum, raw_root=tmp_path / "raw"
-            )
-            while not result["complete"]:
-                result = current_import.import_release(
-                    settings, conn, release, manifest_sha256=checksum, raw_root=tmp_path / "raw"
-                )
-            assert result["resumed"] is resumed
-            assert claims(conn) == [("2", "accepted", "123", 1), ("2", "candidate", "123", 1)]
-            candidate, accepted = conn.execute(
-                "SELECT candidate,accepted FROM _identity"
-            ).fetchone()
-            assert candidate == accepted
-            assert json.loads(accepted)[0]["asset_id"] == "123"
-            assert store.validate_store(conn)["valid"]
-    finally:
-        conn.close()
-
-
 def test_candidate_change_and_malformed_map_keep_accepted_reservation_until_native(conn):
     store.apply(conn, response())
     store.apply(conn, response(2, assets=("21", "22")))
@@ -133,20 +108,18 @@ def test_candidate_change_and_malformed_map_keep_accepted_reservation_until_nati
     assert store.validate_store(conn)["valid"]
 
 
-@pytest.mark.parametrize("gate", ["validate", "publish", "backup"])
+@pytest.mark.parametrize("gate", ["validate", "publish"])
 @pytest.mark.parametrize("role", ["candidate", "accepted"])
-def test_duplicate_claim_corruption_is_rejected_before_publication_or_backup(tmp_path, gate, role):
+def test_duplicate_claim_corruption_is_rejected_before_publication(tmp_path, gate, role):
     settings = CurrentSettings(tmp_path / "current")
     validate_root(settings.root, initialize=True)
     with connect_store(settings) as conn:
         store.initialize(conn)
         store.apply(conn, response())
         current_publish.publish(settings, conn)
-    good_backup = current_backup.create_backup(settings)
     pointer = settings.published_dir / "current.json"
     before = pointer.read_bytes()
     with connect_store(settings) as conn:
-        last_backup = store.get_state(conn, "last_backup")
         conn.execute(
             "INSERT INTO _identity_claims SELECT * FROM _identity_claims WHERE role=? LIMIT 1",
             [role],
@@ -155,17 +128,11 @@ def test_duplicate_claim_corruption_is_rejected_before_publication_or_backup(tmp
         if gate == "validate":
             with pytest.raises(CurrentError, match="integrity|duplicate"):
                 store.validate_store(conn)
-        elif gate == "publish":
+        else:
             with pytest.raises(CurrentError, match="integrity|duplicate"):
                 current_publish.publish(settings, conn)
-    if gate == "backup":
-        with pytest.raises(CurrentError, match="integrity|duplicate"):
-            current_backup.create_backup(settings)
     assert pointer.read_bytes() == before
     assert current_publish.verify_current(settings)["valid"]
-    assert {str(path) for path in settings.backups_dir.iterdir()} == {good_backup["path"]}
-    with connect_store(settings, read_only=True) as conn:
-        assert store.get_state(conn, "last_backup") == last_backup
 
 
 @pytest.mark.parametrize("column", range(5), ids=["venue", "market", "role", "kind", "asset"])

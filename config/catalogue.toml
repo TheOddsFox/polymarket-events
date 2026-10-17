@@ -1,4 +1,4 @@
-# Copy to a fresh catalogue.v3 root as config.toml. Schedules are disabled templates.
+# Copy to a fresh catalogue root as config.toml. Schedules are disabled templates.
 [gamma]
 base_url = "https://gamma-api.polymarket.com"
 requests_per_second = 10.0
@@ -10,11 +10,9 @@ max_duration_s = 1200.0
 max_requests = 25000
 max_download_bytes = 4294967296
 max_response_bytes = 16777216
-max_retained_bytes = 103079215104
-max_temp_bytes = 8589934592
-free_reserve_bytes = 34359738368
-max_raw_bytes = 8589934592
-raw_max_age_s = 604800
+max_retained_bytes = 171798691840
+max_temp_bytes = 17179869184
+free_reserve_bytes = 8589934592
 active_recheck_s = 72000
 cold_recheck_s = 5011200
 publication_reserve_s = 60.0

@@ -124,8 +124,8 @@ def capacity(roots, root, output):
         + ANCILLARY_BYTES
         - ancillary
     )
-    if candidate > limits.max_retained_bytes or total + reserved > 256 * 1024**3:
-        raise ValueError("combined retained capacity exhausted")
+    if candidate > limits.max_retained_bytes:
+        raise ValueError("retained capacity exhausted")
     if shutil.disk_usage(output).free < limits.free_reserve_bytes + reserved:
         raise ValueError("free disk reserve unavailable")
     return {"roots": usage, "total_bytes": total, "reserved_bytes": reserved}
@@ -208,7 +208,6 @@ def parser():
     p.add_argument("--account-root", type=Path, action="append", required=True)
     p.add_argument("--invocations", type=int, default=3)
     p.add_argument("--cadence-seconds", type=float, default=3600)
-    p.add_argument("--backup-every", type=int, default=0)
     p.add_argument(
         "--max-total-seconds",
         type=float,
@@ -220,7 +219,7 @@ def parser():
 
 
 def run(args):
-    if not 1 <= args.invocations <= 1000 or not 0 <= args.backup_every <= 1000:
+    if not 1 <= args.invocations <= 1000:
         raise ValueError("invalid finite invocation bounds")
     if not math.isfinite(args.max_total_seconds) or not 1 <= args.max_total_seconds <= 48 * 3600:
         raise ValueError("invalid wall-clock cap")
@@ -229,10 +228,6 @@ def run(args):
     if not args.characterize:
         raise ValueError(
             "true scheduler cadence is not implemented; select --characterize explicitly"
-        )
-    if args.backup_every:
-        raise ValueError(
-            "backup requires an explicitly accounted external verification temporary root"
         )
     seed, root, output, roots = paths(args)
     args.executable = safe_path(args.executable)

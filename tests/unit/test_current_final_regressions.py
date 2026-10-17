@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -16,7 +16,6 @@ import httpx
 import pytest
 
 from oddsfox_catalogue import (
-    current_backup,
     current_publish,
     current_reconcile,
     current_runtime,
@@ -213,7 +212,6 @@ def test_refresh_http_deadline_reserves_publication(
     settings, conn = catalogue
     current_store.set_state(conn, "previous_publish_seconds", previous_seconds)
     monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
-    monkeypatch.setattr("oddsfox_catalogue.current_backup.prune", lambda *a, **kw: {})
     deadline = time.monotonic() + 60
     calls = []
 
@@ -232,35 +230,6 @@ def test_refresh_http_deadline_reserves_publication(
     assert result["status"] == "published"
     assert len(calls) == 2
     assert current_publish.verify_current(settings)["valid"]
-
-
-@pytest.mark.parametrize("operation", ["import-release", "publish"])
-@pytest.mark.parametrize("noop", [False, True])
-def test_initial_publish_routes_record_actual_elapsed(catalogue, monkeypatch, operation, noop):
-    settings, conn = catalogue
-    clock = [100.0]
-    published = {"noop": noop, "release_id": "initial"}
-    monkeypatch.setattr(current_runtime.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
-
-    def publish(given_settings, given_conn, *, deadline):
-        assert (given_settings, given_conn, deadline) == (settings, conn, 1000)
-        clock[0] += 80
-        return published
-
-    def seed(*args, **kwargs):
-        current_store.set_state(conn, "seed", {"frontiers": {"events": 0, "markets": 0}})
-        return {"valid": True, "complete": True}
-
-    monkeypatch.setattr(current_publish, "publish", publish)
-    monkeypatch.setattr("oddsfox_catalogue.current_import.import_release", seed)
-    result = current_runtime.execute(settings, operation, {}, 1000)
-    assert current_store.get_state(conn, "previous_publish_seconds") == 80
-    if operation == "import-release":
-        assert result["publication"] is published
-        assert result["publish_verify_s"] == 80
-    else:
-        assert result is published
 
 
 def test_publish_noop_preserves_changed_cost_and_next_change_updates_it(catalogue, monkeypatch):
@@ -318,7 +287,6 @@ def test_publish_measurement_after_noop_drives_acquisition_reserve(catalogue, mo
     current_runtime._publish(settings, conn, 1000)
     current_runtime._publish(settings, conn, 1000)
     monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
-    monkeypatch.setattr(current_backup, "prune", lambda *args, **kwargs: {})
 
     class AcquisitionStarted(Exception):
         pass
@@ -350,7 +318,6 @@ def test_refresh_repairs_existing_parent_discovered_in_market_tail(catalogue, mo
         },
     )
     monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
-    monkeypatch.setattr("oddsfox_catalogue.current_backup.prune", lambda *a, **kw: {})
     calls = []
 
     def handler(request):
@@ -387,7 +354,6 @@ def test_run_reports_live_parent_queue_when_noop_publication_retains_old_backlog
     apply(conn, [{"id": "3", "events": [{"id": "1"}, {"id": "7"}]}], "markets")
     publication = {"noop": True, "backlog": {"parent_event_repair_count": 0}}
     monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
-    monkeypatch.setattr(current_backup, "prune", lambda *args, **kwargs: {})
     monkeypatch.setattr(current_runtime, "_publish", lambda *args: (publication, 0))
     requests = []
 
@@ -535,92 +501,6 @@ def test_supervisor_launch_interrupt_stops_worker_and_closes_pipes(tmp_path, mon
                 process.join(timeout=5)
         for pipe in pipes:
             pipe.close()
-
-
-def test_backup_private_restore_and_old_release_share_remaining_spill_budget(
-    catalogue, monkeypatch
-):
-    settings, conn = catalogue
-    apply(conn, [{"id": "1", "title": "old"}])
-    current_publish.publish(settings, conn)
-    apply(conn, [{"id": "1", "title": "new"}], day=2)
-    conn.close()
-    backup = current_backup.create_backup(settings)
-    validated, connections, borrowed = [], [], []
-    validate = current_backup._validate
-    connect = current_backup.connect_store
-    verify = current_backup._verify_release_on_connection
-
-    def validate_private(private, deadline, **kwargs):
-        validated.append(private)
-        assert str(kwargs["evidence_root"]) == backup["path"]
-        return validate(private, deadline, **kwargs)
-
-    @contextmanager
-    def private_connection(private, **kwargs):
-        with connect(private, **kwargs) as connection:
-            connections.append((private, connection))
-            yield connection
-
-    def same_connection(path, connection, **kwargs):
-        borrowed.append(connection)
-        return verify(path, connection, **kwargs)
-
-    monkeypatch.setattr(current_backup, "_validate", validate_private)
-    monkeypatch.setattr(current_backup, "connect_store", private_connection)
-    monkeypatch.setattr(current_backup, "_verify_release_on_connection", same_connection)
-    monkeypatch.setattr(
-        current_publish,
-        "memory_connection",
-        lambda *args: pytest.fail("old release opened a second spill allowance"),
-    )
-    verified = current_backup.verify_backup(backup["path"])
-    assert verified["valid"]
-    assert len(validated) == len(connections) == len(borrowed) == 1
-    assert connections[0] == (validated[0], borrowed[0])
-    private_bytes = sum(
-        verified["files"][name]["bytes"] for name in ("catalogue.duckdb", "catalogue.json")
-    )
-    assert validated[0].limits.max_temp_bytes + private_bytes == CurrentLimits().max_temp_bytes
-
-
-@pytest.mark.parametrize("excess", [0, 1])
-def test_backup_copy_at_temporary_ceiling_is_rejected_before_copy(tmp_path, monkeypatch, excess):
-    monkeypatch.setattr(
-        current_backup,
-        "_inventory",
-        lambda *args: {
-            "files": {"catalogue.duckdb": {"bytes": CurrentLimits().max_temp_bytes + excess}}
-        },
-    )
-    monkeypatch.setattr(current_backup, "_copy", lambda *args: pytest.fail("over-budget copy"))
-    with pytest.raises(CurrentError, match="temporary allowance exhausted"):
-        current_backup.verify_backup(tmp_path)
-
-
-@pytest.mark.parametrize("age", [None, 0, 86399, 86400, 86401])
-def test_status_reports_backup_age_and_daily_recovery_point_boundary(catalogue, monkeypatch, age):
-    settings, conn = catalogue
-    now = datetime(2026, 10, 14, tzinfo=UTC)
-
-    class FrozenDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return now
-
-    monkeypatch.setattr(current_runtime, "datetime", FrozenDatetime)
-    monkeypatch.setattr(current_runtime, "connect_store", lambda _: nullcontext(conn))
-    if age is not None:
-        current_store.set_state(
-            conn,
-            "last_backup",
-            {"valid": True, "created_at": (now - timedelta(seconds=age)).isoformat()},
-        )
-    result = current_runtime.execute(settings, "status", {}, time.monotonic() + 30)
-    assert result["recovery_scope"] == "local_only"
-    assert result["disk_failure_protection"] is False
-    assert result["backup_age_s"] == age
-    assert result["recovery_point_overdue"] is (age is None or age > 86400)
 
 
 @pytest.mark.parametrize("phase", ["before", "after"])

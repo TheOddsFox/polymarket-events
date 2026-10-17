@@ -19,7 +19,7 @@ from oddsfox_catalogue.capture.writer import (
     verify_page,
     write_page,
 )
-from oddsfox_catalogue.config import GammaSettings, load_settings
+from oddsfox_catalogue.config import GammaSettings
 from oddsfox_catalogue.gamma.http import (
     GammaClient,
     GammaError,
@@ -27,7 +27,6 @@ from oddsfox_catalogue.gamma.http import (
     RequestBudgetExceeded,
     RetriesExhausted,
 )
-from oddsfox_catalogue.limits import enforce_storage_limits
 
 
 def _page(root, body=b"{}"):
@@ -326,57 +325,3 @@ def test_endpoint_cannot_escape_the_fixed_origin_or_leak_embedded_query(endpoint
             client.get(endpoint)
         assert client.stats.requests == 0
     assert calls == []
-
-
-def test_retained_limit_counts_old_releases_and_state_without_counting_nested_warehouse_twice(
-    tmp_path,
-):
-    settings = load_settings(root=tmp_path, env={})
-    old_release = settings.published_dir / "releases" / "old" / "retained"
-    old_release.parent.mkdir(parents=True)
-    old_release.write_bytes(b"1234")
-    settings.warehouse_path.parent.mkdir(parents=True)
-    settings.warehouse_path.write_bytes(b"5678")
-    settings.state_dir.mkdir(parents=True)
-    (settings.state_dir / "retained").write_bytes(b"90")
-    settings = replace(settings, capture=replace(settings.capture, max_retained_bytes=10))
-    enforce_storage_limits(settings)
-    with pytest.raises(RequestBudgetExceeded):
-        enforce_storage_limits(settings, additional_bytes=1)
-    assert old_release.read_bytes() == b"1234"
-    assert settings.warehouse_path.read_bytes() == b"5678"
-
-
-def test_temporary_storage_limit_counts_partial_work(tmp_path):
-    settings = load_settings(root=tmp_path, env={})
-    settings.temporary_dir.mkdir(parents=True)
-    partial = settings.temporary_dir / "partial.tmp"
-    partial.write_bytes(b"12345")
-    settings = replace(settings, capture=replace(settings.capture, max_temp_bytes=5))
-    enforce_storage_limits(settings)
-    partial.write_bytes(b"123456")
-    with pytest.raises(RequestBudgetExceeded):
-        enforce_storage_limits(settings)
-
-
-def test_retained_storage_symlink_is_rejected_even_when_target_is_under_root(tmp_path):
-    settings = load_settings(root=tmp_path, env={})
-    settings.data_dir.mkdir(parents=True)
-    target = settings.data_dir / "target"
-    target.write_bytes(b"small")
-    (settings.data_dir / "alias").symlink_to(target)
-    with pytest.raises(RequestBudgetExceeded):
-        enforce_storage_limits(settings)
-
-
-def test_operation_defaults_are_finite_and_shared_across_installed_roots(tmp_path):
-    settings = load_settings(root=tmp_path, env={})
-    assert settings.capture.workers == 1
-    assert settings.gamma.requests_per_second == 2
-    assert settings.capture.max_requests == 25_000
-    assert settings.capture.max_download_bytes == 4 * 1024**3
-    assert settings.capture.max_duration_s == 14_400
-    assert settings.capture.max_response_bytes == 16 * 1024**2
-    assert settings.capture.max_retained_bytes == 64 * 1024**3
-    assert settings.capture.max_temp_bytes == 8 * 1024**3
-    assert settings.load.duckdb_memory_limit == "2GB"

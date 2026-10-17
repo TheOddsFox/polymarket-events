@@ -1,9 +1,9 @@
-# Current catalogue.v3
+# Current catalogue v1 operator guide
 
 This is a current-state catalogue, not an observation warehouse. Its public contract is
 `oddsfox.polymarket.catalogue.v3` (`PROJECTION_VERSION = 1`), defined in
 `src/oddsfox_catalogue/current_contract.py`. Each publication contains exactly these
-four Parquet relations, `manifest.json`, and a root-level `published/current.json`
+four Parquet relations, a `manifest.json`, and a root-level `published/current.json`
 pointer. Consumers must verify the manifest and contract before reading.
 
 | Relation | Key | Columns in contract order (DuckDB types) |
@@ -17,314 +17,230 @@ IDs are strings. Outcomes retain native asset identifiers, including CLOB token 
 and position IDs where available. An unusable market has an identity error; consumers
 must respect `usable` rather than inventing outcome identity. Event membership is
 independent from market identity. No odds or historical metrics are exported.
-New snapshots use Parquet ZSTD level 3. Readers must support that codec; older
-releases remain readable in their stored encoding and are never rewritten solely
-to change compression. metadata.v1 keeps its existing encoding.
+New snapshots use Parquet ZSTD level 3.
 
-## Fresh root and verified seed
+## Scope of version 1.0.0
 
-Use a separate external root and preserve the old root, configuration, and matching
-runtime unchanged. `--root` is a global option and must precede every command.
-`CATALOGUE_ROOT` is the environment alternative. Current configuration is
-`ROOT/config.toml` (or `CATALOGUE_CONFIG`) with only `[gamma]` and `[catalogue]` sections;
-inspect effective values with `config show`.
+Version 1.0.0 is a manual, single-host tool. It has no scheduler, no import of earlier
+catalogues, no backup or restore command, and no metadata export. It opens only a root
+that was initialized with `init` (store contract `oddsfox.polymarket.catalogue_store.v4`)
+and never migrates or mutates other data. There is no supported path from the earlier
+v2 release; preserve any old root and runtime yourself if you need them.
+
+## Root and configuration
+
+Use an external root. `--root` is a global option and must precede the command.
+`CATALOGUE_ROOT` is the environment alternative.
 
 ```sh
 uv sync --locked
 uv run catalogue --root /srv/catalogue-v3 init
 uv run catalogue --root /srv/catalogue-v3 config show
-uv run catalogue --root /srv/catalogue-v3 import-release /archive/releases/RELEASE \
-  --manifest-sha256 PINNED_MANIFEST_SHA256 --raw-root /archive/raw
 ```
 
-`init` writes `catalogue.json` with store contract
-`oddsfox.polymarket.catalogue_store.v4`. It rejects legacy roots, nonempty unstamped
-roots, and roots nested inside legacy or current roots. There is no in-place migration.
-Import requires a pristine current store and verifies the pinned v2 release plus
-original event raw pages. It preserves original observation ages; it does not refresh
-them to import time. Original response IDs are unrecoverable: the recorded seed tie
-adaptation orders `legacy-baseline:<observation_id>` before `legacy-event:<page_id>`.
-Membership comes from independently verified event pages, not the old bridge table.
-Event evidence supplies memberships only; it does not overwrite imported entity
-descriptions, native mappings, or entity receipts. If a latest complete membership
-references a market excluded by the legacy capture cutoff, import supplements that
-missing market from its latest verified event-source record. This exception adds only
-markets required by those memberships, preserves original receipt ages, and leaves
-discovery frontiers unchanged. Global native ownership checks include the supplements;
-a genuine collision makes every affected owner unavailable. The seed records the
-supplement count and SHA-256 of lexically sorted canonical IDs, each followed by a
-newline (the empty set hashes empty bytes).
-Import commits private baseline,
-membership, and validation phases, reopening DuckDB between phases to release index
-memory. Until validation commits, only status and an import with the same frozen
-source are allowed; publication and normal work remain blocked. Rerun the same import
-command after an interruption to resume the last committed phase.
-Private import protocol 2 includes this supplementation. A checkpoint from the stopped
-protocol 1 import requires a fresh root; preserve that failed root as evidence.
-A repeated completed import verifies its pinned seed identity. Import is offline and
-makes no source-completeness claim. Never delete the old runtime/root to make room.
-Rollback means returning consumers and scheduling to that preserved pair.
-Do not deploy a copy of the benchmark seed directly: it retains an older measured
-publication cost whose 50% reserve exceeds the 20-minute budget. Provision a fresh
-root through the pinned import with the current installed runtime, then measure its
-actual publication and acquisition headroom before deployment. An unchanged publish,
-completed import rerun or restore does not recalibrate publication cost. Preserve
-the measured cost and reserve; insufficient headroom remains an unmet deployment gate.
-Select the old root explicitly with the preserved executable, and retain the original
-`CATALOGUE_CONFIG` if one was used:
+`init` writes `catalogue.json` and refuses nonempty unstamped roots and roots nested
+inside another root. Every later command requires the stamp.
 
-```sh
-CATALOGUE_ROOT=/archive/legacy-root /archive/rollback/catalogue config show
-```
+Configuration is `ROOT/config.toml` (or `CATALOGUE_CONFIG`) with only `[gamma]` and
+`[catalogue]` sections. Unknown keys are rejected. A 0.1.0 config opens unchanged: its
+`[load]` section and its `max_raw_bytes` and `raw_max_age_s` keys are ignored. `config show` prints the
+effective values. Environment overrides use `CATALOGUE_<SECTION>_<NAME>`.
 
-Check the resolved raw, warehouse and publication paths before redirecting consumers.
-The preserved environment must import the preserved source snapshot independently of
-the new checkout; verify this before cutover.
+Limits have two separate values. Defaults are the starting values. Hard maximums are
+the largest values any root configuration may set.
 
-## Provider gate and bounded operations
+| Setting | Default | Hard maximum |
+| --- | --- | --- |
+| `max_duration_s` (per invocation) | 1200 s | 1200 s |
+| `max_requests` | 25,000 | 25,000 |
+| `max_download_bytes` | 4 GiB | 4 GiB |
+| `max_response_bytes` | 16 MiB | 16 MiB |
+| `max_retained_bytes` | 160 GiB | 512 GiB |
+| `max_temp_bytes` | 16 GiB | 64 GiB |
+| `free_reserve_bytes` | 8 GiB | 256 GiB |
+| `active_recheck_s` | 72,000 s (20 h) | — |
+| `cold_recheck_s` | 58 days | — |
+| `publication_reserve_s` | 60 s (minimum) | — |
+
+Each root is admitted against its own ceilings. No combined envelope across roots
+is claimed. Ceilings are set from measured peaks; they are not a promise that any
+corpus fits.
+
+## Provider gate
 
 Before discovery or reconciliation, certify each event and market lane against known
-open, closed, and absent controls, using IDs independently established by the operator:
+open, closed, and absent controls. Use IDs you established independently:
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 probe \
   --open-event-id OPEN_EVENT --closed-event-id CLOSED_EVENT --absent-event-id ABSENT_EVENT \
   --open-market-id OPEN_MARKET --closed-market-id CLOSED_MARKET --absent-market-id ABSENT_MARKET
+```
+
+The probe compares bounded bulk retrieval with native by-ID responses and records a
+policy certificate bound to the provider origin. Both lanes require controls; repeated
+flags add controls. If an unfiltered pass omits known controls, the probe certifies
+explicit `closed=false` and `closed=true` passes only when their combined native
+identities match. Pending work freezes its exact requests and certificate. A changed
+provider or policy requires a new probe. An unsupported lane blocks use; it is not
+permission to fall back to an unproven query.
+
+## Operations
+
+Run each command by hand. Each invocation is bounded by `max_duration_s` (1200 s),
+including publication. Publication time is reserved inside that deadline: the reserve is
+at least 60 seconds, or 1.5 times the previous measured publication if that is larger.
+
+```sh
 uv run catalogue --root /srv/catalogue-v3 refresh
 uv run catalogue --root /srv/catalogue-v3 reconcile
+uv run catalogue --root /srv/catalogue-v3 reconcile --full-pass
 uv run catalogue --root /srv/catalogue-v3 status
+uv run catalogue --root /srv/catalogue-v3 publish
 uv run catalogue --root /srv/catalogue-v3 current
 uv run catalogue --root /srv/catalogue-v3 verify
 ```
 
-The probe compares bounded bulk retrieval to native by-ID responses and records a
-policy certificate bound to the provider origin. Both lanes require controls; repeated
-flags add controls. The probe prefers an unfiltered pass. If it omits known controls, it certifies explicit
-`closed=false` and `closed=true` passes only when their combined native identities match.
-Both passes and all deterministic split requests must commit before a window advances.
-Pending work freezes its exact requests and certificate. A changed provider/policy
-requires a new probe; incompatible pending work fails with a recovery instruction.
-Unsupported behavior remains blocked. Lifecycle transitions can cause omissions between
-passes, and the boolean controls do not prove coverage of unknown lifecycle values.
-Known entities remain retained and historical ranges are revisited.
-`refresh` advances durable discovery frontiers. `reconcile` prioritizes active/unknown
-events, then rotates closed events, all known markets, and historical ID windows every 60 days.
-Event responses also update their embedded markets. Unlinked market corrections may
-wait for the 60-day cold rotation. Work survives between invocations.
-Historical rotations pin their ID bounds and measure the next cycle from the prior
-cycle's start. Completed historical cycles become eligible again after 30 days
-(or a stricter configured cold interval), leaving time to finish before the
-60-day target. Individual cold entities remain due at 58 days. In-progress
-windows retain their frozen bounds; status reports range ages separately from
-entity receipt ages.
-`publish` explicitly builds a verified release; `current` and `verify` verify the pointer.
-`status` reports progress, backlog/freshness, unstarted or overdue historical ranges,
-last run, verified backup age, and a
-`recovery_point_overdue` flag when no backup exists or the last success exceeds 24 hours.
-Its `ready` status means seed initialization is complete; inspect freshness and
-recovery fields separately before deployment.
+- `refresh` advances durable discovery frontiers and repairs at most 100 parent events
+  per invocation. Follow-up invocations may be needed before every newly discovered
+  market has a verified event relationship. Never infer those links from market-side
+  references.
+- `reconcile` runs bounded units of work. Active and unknown events are checked first.
+  Closed events, known markets and historical ID windows rotate on the cold schedule.
+  Work survives between invocations.
+- `reconcile --full-pass` starts a forced full pass, or resumes an unfinished one.
+  While the pass is active it bypasses the 58-day cold gate, the 30-day window gate and
+  the active freshness skip. It visits every known event and market until each has a
+  receipt newer than the pass start. Each invocation stops at `max_duration_s`; the next
+  invocation resumes. When no known entity is left, the pass records `completed_at`. The
+  pass never changes `source_complete`, which stays `false`.
+- `status` reports progress, freshness, the `full_pass` object, the discovery state and
+  the last run.
+- `current` and `verify` verify the publication pointer and release. `verify` is the
+  acceptance check for an existing release.
 
-In refresh output, `backlog` describes discovery only. The top-level
-`parent_event_repair_count` reports the live queued event checks, including
-highwater rechecks whose memberships may already be complete. A no-op release
-retains its original manifest backlog snapshot; use the live counter and `status`
-for current work. A single refresh repairs at most 100 parents. Follow-up
-invocations may be needed before every newly discovered market has a verified
-event relationship; never infer those links from market-side references.
+The `full_pass` object appears in `status`, in every invocation result and in the
+publication manifest:
 
-One supervised HTTP worker, one root writer lock, and at most 10 requests/second are
-allowed. The worker holds that lock through database and filesystem changes, so
-killing its CLI parent cannot admit a second canonical writer while it finishes.
-Default per-invocation ceilings are 1200 seconds, 25,000 HTTP attempts,
-4 GiB downloaded, and 16 MiB per response. Publication time is reserved inside the
-refresh deadline (at least 60 seconds). Import and backup operations have separate
-four-hour supervision. The approved full-store refresh and standalone verification
-target is 20 minutes each; the previous five-minute target was not met.
-See the [acceptance record](current-catalogue-acceptance.md). A deadline can stop work before a new
-publication; inspect the result and verify the existing pointer.
+| Field | Meaning |
+| --- | --- |
+| `started_at` | Start of the active or most recent pass; `null` if none has started |
+| `completed_at` | Set when `remaining` reaches 0; `null` while open |
+| `remaining` | Known events and markets without a receipt newer than `started_at` |
+| `overdue` | Active memberships that are unresolved or older than the active threshold |
+| `unresolved` | Memberships currently marked unresolved (missing or incomplete member arrays) |
+| `identity_repair_count` | Markets whose identity is currently unusable |
+| `parent_event_repair_count` | Queued parent-event repairs |
 
-Active/unknown event membership freshness within 24 hours, and closed events and all
-known markets within 60 days,
-are conditional targets, requiring compatible provider behavior and adequate cadence
-and capacity. Default due thresholds are 20 hours and 58 days, leaving scheduling
-margin. Active checks become urgent at 22 hours. Neither a completed scan nor an
-empty response establishes source completeness.
+During a forced pass, a bounded list that omits a known entity does not prove it is gone.
+One native lookup decides it: a 404 is a confirmed miss, which counts as that entity's
+receipt for the pass and is not refetched until its normal interval; a 200 applies the
+record. Any other status, or a transport failure, is an error and never counts toward
+`remaining`. Outside a pass, omitted entities keep the normal retry schedule.
 
-Existing roots with explicit 300-second or 64 GiB configuration retain those stricter
-values. Inspect `config show` and update the root's `config.toml` deliberately while
-idle to adopt the new sample limits; do not overwrite provider settings or modify
-immutable seed and legacy roots. The combined retained acceptance envelope remains
-256 GiB, including legacy evidence and benchmark roots.
+A known event whose source member list stays incomplete produces no membership receipt,
+so `remaining` stays above 0 for it and the pass stays open. Investigate those events
+before treating a pass as complete.
 
-A busy invocation exits **3** with `status: busy`; other blocked failures also exit 3.
-Inspect the status/message before retrying. For a busy lock, allow the current worker
-to finish, then retry at most twice with a bounded delay (for example 60 seconds).
-Persistent busy or blocked results require operator investigation, not an infinite loop.
+A busy invocation exits **3** with `status: busy`. Other blocked failures also exit 3.
+Read the status and message before retrying. Persistent busy or blocked results need
+operator investigation, not a retry loop.
 
-## Storage and recovery
+One supervised HTTP worker, one root writer lock, and at most 10 requests per second are
+allowed. The worker holds the lock through database and filesystem changes. Killing its
+CLI parent cannot admit a second writer while it finishes.
 
-Admission limits: 96 GiB retained root, 8 GiB raw, raw age at most seven days,
-8 GiB temporary space, and 32 GiB free-space reserve. Keep seven daily backups;
-backup creation retains one verified backup per day. Pending responses are protected
-from pruning, so an exhausted allowance blocks progress rather than discarding needed
-recovery data. These are ceilings, not a promise that any corpus fits.
-Backups use `catalogue_backup.v4`: the checkpointed database is gzip-compressed;
-publication and pending-evidence files retain their original bytes. The inventory
-binds both compressed and expanded database sizes and hashes. Verification expands
-only the database and root stamp into a fresh directory outside every catalogue and
-legacy root, reopens that database, and checks the inventoried publication and pending
-evidence through the same bounded connection. Those copied bytes plus SQL spill must
-fit the separate 8 GiB temporary ceiling. Restore admits the full expanded bundle.
-Verification uses a private owned directory below the external system temporary
-directory and a shared fail-fast verification lock. Surviving workspace bytes reduce
-the next copy/spill allowance. Keep the selected system temporary directory consistent
-across invocations and count this private base in host storage accounting.
-The supervisor cleans only its own invocation directory
-after its worker has stopped. A whole-process crash can leave charged artifacts;
-the private base is `oddsfox-catalogue-verification-<uid>` below that temporary
-directory, containing `invocation-<id>` directories. Stop canonical and recovery jobs,
-inspect ownership and contents, and confirm no verifier is active before operator recovery.
-Legacy flat `catalogue-verify-*` directories block verification until explicitly
-recovered when owned by the current user. Foreign-owned entries are ignored.
-No automatic prefix cleanup is performed.
-Seven retained backups plus the next staging copy must fit the retained ceiling.
-They must also leave the normal changed-publication admission reserve available;
-fitting the backups alone does not establish an operable root. The measured
-mixed-codec checkpoint exceeded the former 64 GiB ceiling. Revalidate it against
-the approved 96 GiB ceiling; see the acceptance record.
-A full root fails explicitly rather than deleting verified recovery points before
-their replacement is ready.
+## Raw retention
 
-```sh
-uv run catalogue --root /srv/catalogue-v3 backup create
-uv run catalogue --root /srv/catalogue-v3 backup verify /archive/BACKUP
-uv run catalogue --root /srv/catalogue-v3 backup restore /archive/BACKUP \
-  --destination /srv/catalogue-v3-restored
-uv run catalogue --root /srv/catalogue-v3-restored verify
-uv run catalogue --root /srv/catalogue-v3-restored status
-```
+Raw responses are retained by reference. After every publication, including one that
+is a no-op because the current release is unchanged, the publisher deletes raw response
+directories that nothing references. A raw response is kept if any of these reference it:
 
-An additional offline copy is optional; verify any copy before relying on it. Restore
-only to a fresh destination. Backup verification checks its inventory and checksums; recovery
-includes the store, pending progress/raw dependencies, and last publication pointer.
-Recovery is explicitly local-only: disk-failure protection has been waived. Status
-reports `recovery_scope: local_only` and `disk_failure_protection: false`; backup age
-and `recovery_point_overdue` measure the daily verified local recovery point only.
-Losing the catalogue device can lose both the database and its local backups.
-Verify the restored pointer before redirecting consumers or scheduling. Interrupted
-work resumes from committed progress and pending responses; a failed publication keeps
-the last verified pointer. Raw retention is bounded: there is no permanent replay
-archive and no promise of reconstruction from arbitrarily old raw data. Preserve the
-old runtime/root for rollback.
+- `_receipts.response`, `_membership.response` or `_membership.latest_response`, or
+  `_identity.invalidated_response`, in the store;
+- a pending durable response or any other sync-state pin, including nested ones.
 
-## Isolated metadata.v1
+Pending raw is never deleted. Raw that is not named by a reference is deleted only
+after the publication commits, whether that promotes a new release or confirms the
+unchanged one; a failed deletion is reported as `retention_warning` and does not undo the
+publication. The manifest records `raw.referenced_count` and
+`raw.referenced_bytes`. Non-matching names in the raw directory are left alone.
 
-The existing targeted CLI and `oddsfox.polymarket.metadata.v1` contract remain separate:
+There is no age-based or size-based raw prune and no permanent replay archive.
+
+## Metadata.v1
+
+The targeted handoff uses a separate, isolated producer root:
 
 ```sh
 uv run catalogue --root /srv/metadata-producer metadata refresh \
-  --market-id MARKET_ID --output /srv/handoffs/metadata-release \
+  --market-id MARKET_ID --catalogue-root /srv/catalogue-v3 \
+  --output /srv/handoffs/metadata-release \
   --max-output-bytes 134217728 --max-response-bytes 8388608 \
   --max-requests 500 --max-download-bytes 134217728
-uv run catalogue --root /srv/metadata-producer metadata export \
-  --market-id MARKET_ID --output /srv/handoffs/metadata-export \
-  --max-output-bytes 134217728
 ```
 
-Repeat `--market-id` for more IDs. Preserve metadata.v1 validation and consumer behavior;
-use an isolated producer root. A v3 root is rejected and refresh rejects an existing
-legacy warehouse/ledger producer root. Export is offline; refresh calls Gamma.
-Producer and output paths must also stay outside v3 root descendants. Refresh checks
-its configured raw-evidence and lock paths too, including resolved symlink targets,
-before creating directories or making requests. Offline export from legacy evidence
-remains supported.
+Repeat `--market-id` for more IDs. The command fetches only the named markets from Gamma.
+Identity comes from the catalogue store's identity tables (`_identity` and
+`_identity_claims`), read under the catalogue lock on a read-only connection. The store
+is never written. Conflicting asset claims mark a market unusable.
 
-New targeted request and response receipts retain sub-millisecond precision so
-offline export preserves their order against older raw observations. Existing
-millisecond receipts remain readable as recorded; lost precision cannot be recovered.
+The output directory is a new, immutable bundle containing `manifest.json` and
+`markets.json`, `outcomes.json`, `memberships.json`, `identity_history.json` and
+`coverage.json`. The contract is `oddsfox.polymarket.metadata.v1`.
 
-## Verification and deployment evidence
+Producer and output paths must be outside every catalogue root, including resolved
+symlink targets. A producer, output or raw path inside a catalogue root is rejected
+before any directory is created or request is made.
 
-The [acceptance record](current-catalogue-acceptance.md) distinguishes measured
-results from outstanding performance, freshness and recovery gates.
+## Storage and recovery
+
+Admission checks each root against its retained and temporary ceilings and the free-space
+reserve before work starts and before publication. A full root fails explicitly.
+Pending responses are never discarded to make room.
+
+Version 1 creates no backups and has no restore command. The root's publication pointer
+and its referenced release are the recovery state. Protecting the root with copies or
+snapshots, and verifying those copies, is the operator's responsibility while no
+invocation is running. Losing the device loses the catalogue unless you have made such a
+copy.
+
+Interrupted work resumes from committed progress and pending responses. A failed
+publication keeps the last verified pointer. Verify the pointer before redirecting
+consumers.
+
+## Verification
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion.
-Tests and installed-workflow checks use synthetic loopback fixtures, never live Gamma.
+Tests use synthetic loopback fixtures and never contact live Gamma. The offline
+environment is `CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9` with
+`CATALOGUE_GAMMA_ALLOW_LOOPBACK=1`.
+
+The compatibility integration test initializes a minimal root, then runs refresh and
+`reconcile --full-pass` against the fake Gamma server. It confirms that `import-release`
+is not available.
+
 Build and audit the distribution, then exercise an installed executable outside the
-checkout using `uv run python scripts/verify-installed-workflow.py --output /tmp/catalogue-installed-proof`
-as the deployment check (the output destination must not exist). Audit built archives
-with `uv run python scripts/verify-distribution.py dist/*.whl dist/*.tar.gz`. Use
-`uv run python scripts/benchmark-current.py --help` for the full-store synthetic-delta
-benchmark interface. For example:
+checkout:
 
 ```sh
-/opt/catalogue/venv/bin/python scripts/benchmark-current.py --seed-root /srv/catalogue-v3-seed \
-  --output /srv/catalogue-v3-benchmark --runs 3 --delta-markets 1000 --delay-s 0.1 \
-  --executable /opt/catalogue/venv/bin/catalogue \
-  --account-root /archive/legacy-catalogue
+uv build
+uv run python scripts/verify-distribution.py dist/*.whl dist/*.tar.gz
+uv run python scripts/verify-installed-workflow.py --output /tmp/catalogue-installed-proof
 ```
 
-Use a fresh output directory and an idle, checkpointed, verified seed with no pending
-work. Use the same installed-wheel Python for the harness and CLI; `--executable`
-alone pins only the CLI children. Repeat `--account-root` for every external
-legacy/operator root; repository data
-is counted automatically. The harness freezes a controlled loopback HTTP provider,
-includes new memberships on existing events, checks exact content independently, and
-measures each verified refresh, bounded parent-repair follow-ups and the complete
-sequence separately, then checks unchanged refreshes after those repairs drain.
-The exact seed-plus-delta comparison remains mandatory. Stalled or unexpected
-repair work fails the frozen follow-up bound. Unchanged highwater requests may
-queue already-complete parents again; those live counts are disclosed separately.
-The harness does not reproduce historical
-network delays or prove 24-hour/60-day reconciliation capacity. Measure sustained
-reconciliation, initial catch-up, import, backup and restore separately. Retain elapsed
-time, HTTP/download counts, publication time, freshness/backlog and resource evidence
-before making performance claims.
+The output destination must not exist. The installed-workflow check runs the same
+commands an operator would run, including `reconcile --full-pass`.
 
-For bounded full-population reconciliation characterization, use
-`uv run python scripts/benchmark-capacity.py --help`. Supply an immutable verified
-`--seed-root`, a separate idle `--root` imported with the current runtime, a fresh
-`--output`, the installed `--executable`, and every external `--account-root`.
-The explicit `--characterize` mode probes a disk-backed loopback provider, runs a
-refresh and bounded reconciliation invocations, and reports successful receipt
-renewals across the original active and cold populations. It preserves original
-receipt ages and counts unresolved memberships separately. The provider reconstructs
-current domain responses, including exact native identifiers and complete event
-memberships; it does not reproduce original raw response bytes. Unsupported invalid
-identity forms fail closed.
-Market lists deliberately default to open status so the actual probe requires
-both open and closed passes, matching the frozen production request policy.
+Benchmarks are characterization tools and never claim sustained acceptance:
 
-This checkout-only harness runs invocations consecutively. Its result is always
-characterization, never sustained acceptance: it does not exercise real hourly
-cadence, daily backups, long-term churn or genuine repeated active renewal.
-Backup mode is refused until its external verification workspace is accounted for.
-SQL spill is disabled; the complete source audit is capped at 128 MiB, and bounded
-audit, logs and reports are included in admission. Audit exhaustion fails the run;
-evidence is never truncated to fit.
-`--max-total-seconds` bounds admission of child commands; accounting, SQL snapshots
-and cleanup can extend total elapsed time beyond it.
-Run it serially with other large workloads, retain partial reports after failure,
-and independently check domain content before claiming full acceptance.
+```sh
+uv run python scripts/benchmark-current.py --help
+uv run python scripts/benchmark-capacity.py --help
+```
 
-The Makefile frontends wrap this CLI; inspect the Makefile for current targets. Historical
-capture/load/dbt/replay/rebuild/validate commands are retired and reject use here.
-[The cron example](../ops/catalogue.cron.example) is **disabled template text only**:
-all lines are comments. It illustrates hourly refresh, offset hourly reconcile,
-and one daily backup attempt with an external root and absolute installed executable
-placeholders. The operator selected one slot at 03:55, avoiding Europe/Zurich's
-skipped or repeated 02:00 hour. Backup retention keeps seven daily archives, one
-per date. Variable runtimes, failed or busy attempts can produce recovery-point
-gaps above 24 hours; report those misses and require operator attention. The slot
-does not prove the recovery-point target or reconciliation capacity.
-Do not activate it until import/probe, recovery, installed verification, and representative
-benchmark evidence support the chosen provider and cadence.
-
-## Historical warehouse documentation
-
-The retired warehouse acceptance reports are preserved at Git revision
-`a03d7cb1910530358df40180bd7a5caae3da41fd` under
-`docs/acceptance-2026-10-10.md` and `docs/completion-storage-2026-10-12.md`.
-They describe the retired dlt/dbt workflow. Use this guide and the
-[current acceptance record](current-catalogue-acceptance.md) for the current runtime.
-The [v2 contract](catalogue-v2.md) remains available for legacy import and rollback.
+Use a fresh output directory and an idle, verified seed with no pending work. Pass the
+installed-wheel Python for the harness and the CLI, and repeat `--account-root` for every
+external root that should be reported. Benchmarks report measured elapsed time, HTTP
+counts, publication time and resource evidence. Acceptance is recorded separately in
+the [acceptance page](current-catalogue-acceptance.md).

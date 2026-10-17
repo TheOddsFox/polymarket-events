@@ -23,7 +23,7 @@ def test_required_arguments_and_defaults():
         benchmark.parser().parse_args([])
     args = benchmark.parser().parse_args(["--seed-root", "seed", "--output", "output"])
     assert (args.runs, args.delta_markets, args.delay_s) == (3, 1000, 0.1)
-    assert args.max_retained_bytes == 256 * 1024**3
+    assert args.max_retained_bytes == 160 * 1024**3
 
 
 def test_independent_exact_assets_nulls_and_frozen_source():
@@ -60,10 +60,16 @@ def test_independent_exact_assets_nulls_and_frozen_source():
         assert client.get("/markets/11").json()["question"] is None
 
 
-def test_failed_envelope_does_not_raise_limits(tmp_path, monkeypatch):
+def test_each_root_is_admitted_against_its_own_ceiling(tmp_path, monkeypatch):
     monkeypatch.setattr(benchmark, "directory_bytes", lambda _: 100)
-    with pytest.raises(ValueError, match="envelope"):
-        benchmark.capacity(tmp_path / "seed", tmp_path / "output", 199)
+    monkeypatch.setattr(
+        benchmark.shutil, "disk_usage", lambda _: type("Usage", (), {"free": 128 * 1024**3})()
+    )
+    assert benchmark.capacity(tmp_path / "seed", tmp_path / "output", 100)["strict_root_bytes"]
+    with pytest.raises(ValueError, match="seed retained storage exhausted"):
+        benchmark.capacity(tmp_path / "seed", tmp_path / "output", 99)
+    with pytest.raises(ValueError, match="output retained storage exhausted"):
+        benchmark.capacity(tmp_path / "seed", tmp_path / "output", 100, additional=1)
 
 
 @pytest.mark.parametrize("count", [12, 1000])
@@ -239,8 +245,8 @@ def test_cli_pins_canonical_limits_and_preserves_failure_output(tmp_path, monkey
     assert result["stderr"] == "capacity"
     assert captured["env"]["CATALOGUE_CATALOGUE_MAX_DURATION_S"] == "1200.0"
     assert captured["timeout"] == 1210
-    assert captured["env"]["CATALOGUE_CATALOGUE_MAX_RETAINED_BYTES"] == str(96 * 1024**3)
-    assert captured["env"]["CATALOGUE_CATALOGUE_FREE_RESERVE_BYTES"] == str(32 * 1024**3)
+    assert captured["env"]["CATALOGUE_CATALOGUE_MAX_RETAINED_BYTES"] == str(160 * 1024**3)
+    assert captured["env"]["CATALOGUE_CATALOGUE_FREE_RESERVE_BYTES"] == str(8 * 1024**3)
     assert captured["env"]["CATALOGUE_GAMMA_REQUESTS_PER_SECOND"] == "10.0"
     with pytest.raises(ValueError, match="capacity"):
         benchmark.successful(result)
@@ -273,8 +279,10 @@ def test_accounting_deduplicates_ancestor_overlap_and_counts_legacy(tmp_path, mo
     assert result["combined_bytes"] == 100
     assert set(walks) == {tmp_path / "seed", tmp_path / "output"}
     assert len(walks) == 2
-    with pytest.raises(ValueError, match="envelope"):
-        benchmark.capacity(tmp_path / "seed", tmp_path / "output", 99, account_roots=roots)
+    # Accounted legacy bytes are reported but never count against the seed or output ceilings.
+    assert benchmark.capacity(tmp_path / "seed", tmp_path / "output", 20, account_roots=roots)
+    with pytest.raises(ValueError, match="seed retained storage exhausted"):
+        benchmark.capacity(tmp_path / "seed", tmp_path / "output", 19, account_roots=roots)
 
 
 def test_repeatable_account_root_argument():
@@ -287,10 +295,10 @@ def test_repeatable_account_root_argument():
             "--account-root",
             "legacy",
             "--account-root",
-            "backups",
+            "archive",
         ]
     )
-    assert args.account_root == [Path("legacy"), Path("backups")]
+    assert args.account_root == [Path("legacy"), Path("archive")]
 
 
 def test_realistic_market_default_omission_and_two_pass_native_parity():
@@ -384,7 +392,7 @@ def test_preflight_uses_bounded_readonly_connection_before_validation(
         )
         assert (
             conn.execute("SELECT current_setting('max_temp_directory_size')").fetchone()[0]
-            == "8.0 GiB"
+            == "16.0 GiB"
         )
         with pytest.raises(duckdb.InvalidInputException, match="read-only"):
             conn.execute("INSERT INTO evidence VALUES (43)")
@@ -789,8 +797,9 @@ def test_capacity_deduplicates_aggregate_ancestor_but_validates_strict_children(
     assert result["symlink_count"] == 1
     assert result["strict_root_bytes"] == {str(seed): 3, str(output): 5}
     assert result["accounted_root_usage"][str(tmp_path)]["symlink_count"] == 1
-    with pytest.raises(ValueError, match="envelope"):
-        benchmark.capacity(seed, output, expected - 1, account_roots=[tmp_path])
+    # Output's strict child is 5 bytes, so a 4-byte ceiling must fail on that root alone.
+    with pytest.raises(ValueError, match="output retained storage exhausted"):
+        benchmark.capacity(seed, output, 4, account_roots=[tmp_path])
 
 
 def test_aggregate_usage_rejects_symlink_root_and_symlink_ancestors(tmp_path):

@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from oddsfox_catalogue.contract import NORMALIZATION_REVISION as NORMALIZATION_REVISION
 from oddsfox_catalogue.ids import (
     MAX_CANONICAL_BYTES,
     canonical_json,
@@ -17,6 +16,7 @@ from oddsfox_catalogue.ids import (
     validate_exact_size,
 )
 
+NORMALIZATION_REVISION = "2"
 MAX_MARKETS = 100
 ID_RE = re.compile(r"[1-9][0-9]{0,19}\Z")
 CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")

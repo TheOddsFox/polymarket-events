@@ -49,6 +49,9 @@ jobs:
       - name: Complete offline test suite
         run: uv run --locked pytest -q
 
+      - name: Build distribution
+        run: uv build
+
       - name: Audited installed package and full offline workflow
         env:
           UV_LINK_MODE: copy

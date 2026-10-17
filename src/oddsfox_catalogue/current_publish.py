@@ -22,10 +22,13 @@ from .current_contract import (
     CurrentError,
     projection,
 )
+from .current_reconcile import full_pass_status
 from .current_store import _validate_store, generation, summary
 from .current_store import validate_public as _integrity
 from .fingerprints import semantic_fingerprint
 from .limits import directory_bytes
+
+_RAW_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
 def _check_deadline(deadline):
@@ -33,11 +36,99 @@ def _check_deadline(deadline):
         raise CurrentError("publication deadline exhausted")
 
 
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def _json(path):
-    value = json.loads(read_regular_bytes(path, max_bytes=4 * 1024**2))
+    value = json.loads(
+        read_regular_bytes(path, max_bytes=4 * 1024**2), object_pairs_hook=_unique_pairs
+    )
     if not isinstance(value, dict):
         raise CurrentError("release metadata must be an object")
     return value
+
+
+def _pinned(conn):
+    """Raw response IDs that pending durable work still needs to resume."""
+    ids = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "raw_id":
+                    if not isinstance(item, str) or not _RAW_ID.fullmatch(item):
+                        raise CurrentError("unsafe pending raw identity")
+                    ids.add(item)
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for (value,) in conn.execute("SELECT value FROM sync_state").fetchall():
+        walk(json.loads(value))
+    return ids
+
+
+def _referenced_raw(conn):
+    """Raw responses that explain current store state or pending work; all else is garbage."""
+    ids = _pinned(conn)
+    for query in (
+        "SELECT response FROM _receipts",
+        "SELECT response FROM _membership",
+        "SELECT latest_response FROM _membership",
+        "SELECT invalidated_response FROM _identity",
+    ):
+        ids.update(row[0] for row in conn.execute(query).fetchall() if row[0] is not None)
+    return ids
+
+
+def _raw_directories(settings):
+    raw = safe_path(settings.raw_dir)
+    if not raw.exists():
+        return {}
+    directories = {}
+    for child in raw.iterdir():
+        safe_path(child)
+        if child.is_dir() and _RAW_ID.fullmatch(child.name):
+            directories[child.name] = child
+    return directories
+
+
+def _raw_reference_summary(settings, referenced):
+    kept = [path for name, path in _raw_directories(settings).items() if name in referenced]
+    return {
+        "referenced_count": len(kept),
+        "referenced_bytes": sum(directory_bytes(path) for path in kept),
+    }
+
+
+def _prune_unreferenced_raw(settings, referenced):
+    """Delete raw directories that neither the store nor pending work references."""
+    deleted = freed = 0
+    for name, path in _raw_directories(settings).items():
+        if name in referenced:
+            continue
+        freed += directory_bytes(path)
+        shutil.rmtree(path)
+        deleted += 1
+    if deleted:
+        _fsync_dir(settings.raw_dir)
+    return {"deleted_count": deleted, "deleted_bytes": freed}
+
+
+def _retain_raw(settings, referenced, result):
+    """Prune after the pointer is settled; a failed deletion is reported, never fatal."""
+    try:
+        result["raw_retention"] = _prune_unreferenced_raw(settings, referenced)
+    except Exception as exc:
+        result["retention_warning"] = str(exc)
 
 
 def _physical(path):
@@ -152,7 +243,7 @@ def _pointer(settings):
         or previous == release_id
     ):
         raise CurrentError(
-            "invalid previous release identity; preserve this root and restore a verified backup"
+            "invalid previous release identity; preserve this root for manual recovery"
         )
     return pointer
 
@@ -223,10 +314,6 @@ def publish(settings, conn, *, deadline=None):
     pinned = _pointer(settings) if current.exists() else {}
     conn.execute("BEGIN TRANSACTION")
     try:
-        if conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone():
-            raise CurrentError(
-                "seed import incomplete; resume import-release with its frozen source"
-            )
         if current.exists():
             pointer = _pointer(settings)
             try:
@@ -251,7 +338,7 @@ def publish(settings, conn, *, deadline=None):
                     except (CurrentError, OSError, ValueError, duckdb.Error) as exc:
                         raise CurrentError(
                             "current and previous releases could not be verified; "
-                            "preserve this root and restore a verified backup into a fresh root"
+                            "preserve this root for manual recovery"
                         ) from exc
                     previous = fallback
             else:
@@ -261,8 +348,11 @@ def publish(settings, conn, *, deadline=None):
                         settings, {pinned.get("release_id"), pinned.get("previous_release_id")}
                     )
                     _check_deadline(deadline)
+                    referenced = _referenced_raw(conn)
                     conn.execute("COMMIT")
-                    return {**verified, "noop": True}
+                    result = {**verified, "noop": True}
+                    _retain_raw(settings, referenced, result)
+                    return result
         _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
         # Existing failed staging and orphan releases are counted by admit as retained bytes.
         estimate = 2 * (settings.store_path.stat().st_size if settings.store_path.exists() else 0)
@@ -277,6 +367,7 @@ def publish(settings, conn, *, deadline=None):
         stage = safe_path(published / f".staging-{release_id}")
         stage.mkdir()
         state = summary(conn)
+        referenced = _referenced_raw(conn)
         manifest = {
             "contract": CONTRACT,
             "projection_version": PROJECTION_VERSION,
@@ -290,6 +381,8 @@ def publish(settings, conn, *, deadline=None):
             "backlog": {
                 key: value for key, value in state.items() if key not in {"generation", "counts"}
             },
+            "full_pass": full_pass_status(conn),
+            "raw": _raw_reference_summary(settings, referenced),
             "relations": {},
         }
         for table in SCHEMAS:
@@ -343,11 +436,12 @@ def publish(settings, conn, *, deadline=None):
         _fsync_dir(published)
         conn.execute("COMMIT")
         result = {**manifest, "valid": True, "path": str(final), "noop": False}
+        # Promotion is the commit point; cleanup failures cannot undo a valid pointer.
         try:
             _cleanup(settings, {release_id, previous})
         except Exception as exc:
-            # Promotion is the commit point; a cleanup failure cannot undo a valid pointer.
-            result["retention_warning"] = str(exc)
+            result["cleanup_warning"] = str(exc)
+        _retain_raw(settings, referenced, result)
         return result
     except BaseException:
         conn.execute("ROLLBACK")

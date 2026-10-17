@@ -258,7 +258,7 @@ def verify(output: Path) -> dict:
     package = origin.parent
     before = resource_inventory(package)
     freeze_resources(package)
-    root, restored = runtime / "catalogue", runtime / "restored"
+    root = runtime / "catalogue"
     steps = []
     executable = venv / "bin/catalogue"
 
@@ -302,28 +302,29 @@ def verify(output: Path) -> dict:
         refresh = call("refresh", ["refresh"], source=fixture.url)
         call("verify", ["verify"])
         call("reconcile", ["reconcile"], source=fixture.url)
+        call("full_pass", ["reconcile", "--full-pass"], source=fixture.url)
         bundle = runtime / "metadata-bundle"
         call(
             "metadata_refresh",
-            ["metadata", "refresh", "--market-id", "11", "--market-id", "12", "--output", bundle],
+            [
+                "metadata",
+                "refresh",
+                "--market-id",
+                "11",
+                "--market-id",
+                "12",
+                "--output",
+                bundle,
+                "--catalogue-root",
+                root,
+            ],
             source=fixture.url,
             selected_root=runtime / "metadata-producer",
         )
         measured = json.loads(json.dumps(fixture.stats))
-    baseline = call("published", ["current"])
-    backup = call("backup", ["backup", "create"])
-    call("verify_backup", ["backup", "verify", backup["path"]])
-    call("restore", ["backup", "restore", backup["path"], "--destination", restored])
-    call("restored_verify", ["verify"], selected_root=restored)
-    # Rebuild from the restored database rather than trusting copied Parquet bytes.
-    import shutil
-
-    shutil.rmtree(restored / "published")
-    rebuilt = call("restored_rebuild", ["publish"], selected_root=restored)
-    for table, descriptor in baseline["relations"].items():
-        for field in ("rows", "schema", "semantic_sha256"):
-            if descriptor[field] != rebuilt["relations"][table][field]:
-                raise ValueError("offline restored rebuild differs from published current state")
+    current = call("published", ["current"])
+    if current.get("valid") is not True:
+        raise ValueError("installed current pointer did not verify")
     attempts = sum(step["result"].get("http_attempts", 0) for step in steps)
     downloaded = sum(step["result"].get("downloaded_bytes", 0) for step in steps)
     if attempts != measured["http_attempts"] or downloaded != measured["downloaded_bytes"]:

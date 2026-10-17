@@ -1,6 +1,6 @@
 [project]
 name = "oddsfox-catalogue"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local batch pipeline for an OddsFox catalogue of public Polymarket events."
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -21,7 +21,7 @@ def test_http_client_does_not_log_request_urls() -> None:
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["version"]) == 0
-    assert capsys.readouterr().out.strip() == "0.1.0"
+    assert capsys.readouterr().out.strip() == "1.0.0"
 
 
 def test_config_show_reads_root_from_environment(
