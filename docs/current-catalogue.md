@@ -198,6 +198,20 @@ publication. The manifest records `raw.referenced_count` and
 
 There is no age-based or size-based raw prune and no permanent replay archive.
 
+Optional post-commit maintenance stops starting work when fewer than 15 seconds
+remain before the supplied publication deadline. Fresh-release cleanup reports
+`cleanup_warning`; raw retention on fresh and unchanged publications reports
+`retention_warning`. Completed deletion counts and bytes remain available when
+later work is deferred or fails. A later publication rescans the remaining garbage.
+Without a deadline, cleanup runs to completion as before.
+
+These checks are cooperative: a recursive filesystem operation can overrun the
+cutoff. Mandatory pre-commit cleanup, exact referenced-raw accounting, verification
+and storage admission remain required. Deferred garbage still counts toward storage
+ceilings. Post-commit maintenance cannot roll back a committed publication, and
+operator termination still propagates. Publication-result phase timings describe
+pre-commit work, release cleanup and raw cleanup; they are not release-manifest fields.
+
 ## Metadata.v1
 
 The targeted handoff uses a separate, isolated producer root:
@@ -306,6 +320,19 @@ client reservations and consumed bytes, including cancellations; neither measure
 increase. Isolated profiles cannot qualify a change. Results never establish deployment
 acceptance or a production speedup.
 
+New reports and samples use `measurement_version: 2`. The additive
+`worker_setup_wall_s` ends immediately before the first reconciliation;
+`runtime_sequence_wall_s` covers the interrupted/resumed sequence and its intermediate
+checks; `oracle_wall_s` covers final snapshots through semantic hashing. The existing
+`setup_wall_s` remains the provider-probe timing. `worker_peak_before_oracle_bytes`
+is the worker's lifetime peak sampled before the oracle, including setup and provider
+allocations; it is not isolated runtime RSS. Whole-worker supervised wall time and
+lifetime peak RSS remain qualification guards. These phases do not replace the
+whole-worker total: provider shutdown, trace writing and supervisor overhead remain
+visible there. Missing measurement versions mean
+legacy version 1; comparisons across versions require a fresh baseline. Scored runs
+are unprofiled, and warm-up profiles cannot establish a qualifying speedup.
+
 For a fixed-budget comparison of multiple locally prepared optimization variants:
 
 ```sh
@@ -343,6 +370,79 @@ The report records stage results, source inventories, retained variants and expl
 deferrals. Missing pairs or budget exhaustion never qualify a change. Campaign results
 are synthetic characterization, not deployment acceptance or a million-event runtime
 estimate. Do not replace failed or incomplete samples with selectively repeated runs.
+
+An additive version 2 manifest removes the binding prerequisite:
+
+```json
+{
+  "version": 2,
+  "baseline": {"path": "/trusted/baseline/oddsfox_catalogue", "source_hashes": {}},
+  "candidates": {
+    "outcome_grouping": {"path": "/trusted/grouping/oddsfox_catalogue", "source_hashes": {}},
+    "queue": {"path": "/trusted/queue/oddsfox_catalogue", "source_hashes": {}}
+  }
+}
+```
+
+Replace each empty illustrative inventory with every package-relative Python source
+and its SHA-256 hash. Only these two candidate names are accepted. Each candidate
+must differ from the common baseline only in its assigned store or reconciliation
+module. Unknown fields and executable configuration are rejected. Legacy manifests
+keep their binding-first behavior.
+
+Version 2 evaluates outcome grouping first, then queue handling, directly against
+the common baseline. Each distinct runtime receives one unscored warm-up; scoring
+uses three fresh-worker pairs in AB, BA, AB order. Scored work is admitted only when
+warm-up-based estimates fit with 25% headroom and a separate 15-second final-integrity
+reserve, in addition to the shutdown reserve. After the first candidate qualifies,
+admitting the second also protects 125% of the first comparison's duration for a final
+combination comparison. One qualified candidate reuses its independent evidence.
+Two qualified candidates require that exact combination to qualify; otherwise the
+proven individual with greater absolute median acquire/apply savings is retained,
+preferring outcome grouping on a tie. Final source, seed and harness verification
+must finish within budget or no optimization is retained.
+
+The same 10% and one-second acquire/apply improvement, 5% wall/RSS guards, semantic
+equivalence and four per-pair HTTP-load guards apply. Version 2 also guards the
+pre-oracle peak against more than 5% regression. Samples with deferred or failed
+cleanup cannot qualify by doing less maintenance. Preparation, copies and all
+measurement stages share the 1,800-second budget; ordinary correctness tests are
+outside that budget.
+
+The version 2 characterization on 2026-10-17 used a corrected scalar-binding baseline
+derived from `e1e4cc8`, with the measurement and cooperative cleanup changes above.
+The clock started before private package copies and candidate preparation; the driver
+received that existing `Budget` through `run(args, budget=budget)`. The run finished at
+1,383.81 seconds. A further independent source, seed and harness integrity check
+completed within the same budget at 1,402.03 seconds. No algorithm was retained.
+
+Only the three unscored warm-ups completed:
+
+| Runtime | Supervised wall | Acquire/apply | Oracle | Pre-oracle peak | Whole-worker peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Common baseline | 255.812 s | 247.176 s | 5.764 s | 211,484,672 bytes | 1,007,288,320 bytes |
+| Outcome grouping | 207.413 s | 200.973 s | 3.907 s | 213,909,504 bytes | 1,013,284,864 bytes |
+| Queue handling | 230.558 s | 223.131 s | 4.577 s | 214,843,392 bytes | 1,008,041,984 bytes |
+
+Setup took 1.448, 1.422 and 1.385 seconds respectively; runtime sequence time was
+248.230, 201.740 and 224.035 seconds. All warm-ups completed the fixed work with the
+same semantic hash and verified publication, without deferred cleanup. Each served
+and reserved 123 HTTP attempts and offered 19,780,648 response bytes. Client-consumed
+bytes were 19,653,534, 19,653,683 and 19,653,534 respectively; warm-ups do not establish
+the per-pair HTTP gate.
+
+The projected scored comparisons, including 25% headroom, required 1,737.09 seconds
+for grouping and 1,823.89 seconds for queue handling, exceeding the remaining budget.
+Zero scored pairs were admitted. These warm-up differences establish no qualifying
+median improvement, end-to-end runtime estimate or cable benefit. Both candidates
+remain deferred for insufficient evidence; their sources, tests and raw artifacts
+remain outside Git. The delivered runtime matches the measured common baseline.
+
+The original raw report used aggregate `deferred` while its individual admission
+reasons correctly said `insufficient_evidence`. The driver now reports the latter
+when eligible candidates lack complete comparisons. That reporting-only correction
+was tested after characterization; the raw report and measured harness snapshot were
+preserved, and no performance sample was rerun.
 
 The first optimization campaign (2026-10-17) used baseline commit
 `1f2d4dade321aacc4e07d5ebecfd0a09124ec530`. It ended after 1,790.02 seconds,

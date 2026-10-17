@@ -106,6 +106,44 @@ def test_comparison_requires_three_semantically_equivalent_pairs_and_gate():
     )
 
 
+def test_measurement_versions_cannot_be_compared_without_a_fresh_baseline():
+    baseline = [row(pair) for pair in (1, 2, 3)]
+    current = [
+        {
+            **row(pair, acquire=18),
+            "measurement_version": 2,
+            "worker_peak_before_oracle_bytes": 900,
+        }
+        for pair in (1, 2, 3)
+    ]
+    result = benchmark.comparison(baseline, current, "perf")
+    assert result["status"] == "invalid"
+    assert "fresh baseline" in result["reason"]
+
+
+def test_phase_attribution_uses_disjoint_worker_boundaries():
+    assert benchmark.phase_attribution(2, 5, 11, 13, 17) == {
+        "worker_setup_wall_s": 3,
+        "runtime_sequence_wall_s": 6,
+        "oracle_wall_s": 4,
+    }
+    with pytest.raises(ValueError, match="overlap"):
+        benchmark.phase_attribution(2, 5, 11, 10, 17)
+
+
+def test_cleanup_warnings_are_attributed_to_each_runtime_invocation():
+    result = {
+        "publication": {
+            "cleanup_warning": "release cleanup deferred",
+            "retention_warning": "raw cleanup deferred",
+        }
+    }
+    assert benchmark.publication_cleanup_warnings(result, 0) == [
+        {"step": 0, "kind": "cleanup_warning", "message": "release cleanup deferred"},
+        {"step": 0, "kind": "retention_warning", "message": "raw cleanup deferred"},
+    ]
+
+
 def test_source_accounting_accepts_cancelled_prefetch_partial_body():
     assert benchmark.validate_source_accounting(
         {"faults": 0, "http_attempts": 4, "downloaded_bytes": 110},
@@ -202,6 +240,8 @@ def test_run_sample_wall_includes_supervisor_startup_and_cleanup(tmp_path, monke
         clock[0] += 5.0
         return {
             **row(1, wall=3.0),
+            "measurement_version": 2,
+            "worker_peak_before_oracle_bytes": 900,
             "worker_wall_s": 3.0,
             "runtime_source": str(runtime),
             "source_stats": {"http_attempts": 10, "downloaded_bytes": 100, "faults": 0},

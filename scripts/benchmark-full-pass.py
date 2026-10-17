@@ -53,6 +53,7 @@ from oddsfox_catalogue.signals import SIGNALS, Terminated  # noqa: E402
 BASE_TIME = datetime(2026, 10, 14, tzinfo=UTC)
 BUDGET_S = 600.0
 SHUTDOWN_RESERVE_S = 15.0
+MEASUREMENT_VERSION = 2
 PROFILES = {
     "smoke": (250, 1010),
     "perf": (10_000, 40_400),
@@ -138,8 +139,20 @@ def comparison(baseline: list[dict], candidate: list[dict], profile: str) -> dic
             "status": "insufficient_evidence",
             "reason": "paired sample identities are incomplete",
         }
+    versions = {measurement_version(row) for row in baseline + candidate}
+    if len(versions) != 1:
+        return {
+            "status": "invalid",
+            "reason": "measurement versions differ; create a fresh baseline with the current harness",
+        }
+    version = versions.pop()
     if any(row["semantic_hash"] != baseline[0]["semantic_hash"] for row in baseline + candidate):
         return {"status": "invalid", "reason": "scheduler or publication semantics differ"}
+    if any(row.get("cleanup_deferred") for row in baseline + candidate):
+        return {
+            "status": "deferred",
+            "reason": "publication cleanup was deferred; equal completed maintenance is required",
+        }
     import statistics
 
     numeric = (
@@ -151,6 +164,8 @@ def comparison(baseline: list[dict], candidate: list[dict], profile: str) -> dic
         "runtime_reserved_attempts",
         "runtime_downloaded_bytes",
     )
+    if version >= 2:
+        numeric = (*numeric, "worker_peak_before_oracle_bytes")
     require(
         all(
             type(row.get(key)) in (int, float) and math.isfinite(row[key]) and row[key] >= 0
@@ -181,6 +196,16 @@ def comparison(baseline: list[dict], candidate: list[dict], profile: str) -> dic
     new_wall = statistics.median(row["wall_s"] for row in candidate)
     old_rss = statistics.median(row["peak_rss_bytes"] for row in baseline)
     new_rss = statistics.median(row["peak_rss_bytes"] for row in candidate)
+    old_preoracle_rss = (
+        statistics.median(row["worker_peak_before_oracle_bytes"] for row in baseline)
+        if version >= 2
+        else old_rss
+    )
+    new_preoracle_rss = (
+        statistics.median(row["worker_peak_before_oracle_bytes"] for row in candidate)
+        if version >= 2
+        else new_rss
+    )
     candidate_by_pair = {row["pair"]: row for row in candidate}
     saved = old - new
     qualifies = (
@@ -190,6 +215,7 @@ def comparison(baseline: list[dict], candidate: list[dict], profile: str) -> dic
         and saved / old >= 0.10
         and new_wall <= old_wall * 1.05
         and new_rss <= old_rss * 1.05
+        and new_preoracle_rss <= old_preoracle_rss * 1.05
         and all(
             candidate_by_pair[row["pair"]]["http_attempts"] <= row["http_attempts"]
             and candidate_by_pair[row["pair"]]["downloaded_bytes"] <= row["downloaded_bytes"]
@@ -209,8 +235,50 @@ def comparison(baseline: list[dict], candidate: list[dict], profile: str) -> dic
         "candidate_median_wall_s": new_wall,
         "baseline_median_peak_rss_bytes": old_rss,
         "candidate_median_peak_rss_bytes": new_rss,
+        "baseline_median_worker_peak_before_oracle_bytes": old_preoracle_rss,
+        "candidate_median_worker_peak_before_oracle_bytes": new_preoracle_rss,
         "reason": "performance gate passed" if qualifies else "performance gate not met",
     }
+
+
+def measurement_version(row: dict) -> int:
+    version = row.get("measurement_version", 1)
+    require(
+        type(version) is int and version in (1, MEASUREMENT_VERSION),
+        "unsupported measurement version",
+    )
+    return version
+
+
+def phase_attribution(
+    setup_started: float,
+    runtime_started: float,
+    runtime_ended: float,
+    oracle_started: float,
+    oracle_ended: float,
+) -> dict[str, float]:
+    boundaries = (setup_started, runtime_started, runtime_ended, oracle_started, oracle_ended)
+    require(
+        all(math.isfinite(value) for value in boundaries)
+        and tuple(sorted(boundaries)) == boundaries,
+        "benchmark phase boundaries overlap or are invalid",
+    )
+    return {
+        "worker_setup_wall_s": runtime_started - setup_started,
+        "runtime_sequence_wall_s": runtime_ended - runtime_started,
+        "oracle_wall_s": oracle_ended - oracle_started,
+    }
+
+
+def publication_cleanup_warnings(result: dict, step: int) -> list[dict]:
+    publication = result.get("publication")
+    if not isinstance(publication, dict):
+        return []
+    return [
+        {"step": step, "kind": key, "message": str(publication[key])}
+        for key in ("cleanup_warning", "retention_warning")
+        if publication.get(key)
+    ]
 
 
 def validate_source_accounting(
@@ -317,6 +385,13 @@ def validate_report_metrics(rows: object) -> None:
                 type(value) in (int, float) and math.isfinite(value) and value >= 0,
                 f"invalid baseline metric: {key}",
             )
+        version = measurement_version(row)
+        if version >= 2:
+            value = row.get("worker_peak_before_oracle_bytes")
+            require(
+                type(value) in (int, float) and math.isfinite(value) and value >= 0,
+                "invalid baseline metric: worker_peak_before_oracle_bytes",
+            )
         for key in (
             "http_attempts",
             "downloaded_bytes",
@@ -332,6 +407,10 @@ def validate_report_metrics(rows: object) -> None:
             row["downloaded_bytes"] >= row["runtime_downloaded_bytes"],
             "baseline runtime byte total exceeds source response bodies",
         )
+    require(
+        len({measurement_version(row) for row in rows}) == 1,
+        "baseline samples mix measurement versions; create a fresh baseline",
+    )
 
 
 def validate_semantic_samples(rows: list[dict]) -> str:
@@ -678,6 +757,10 @@ def validate_baseline(baseline: Path, profile: str, candidate_package: Path) -> 
         "baseline is incomplete or profile differs",
     )
     validate_report_metrics(report.get("samples"))
+    require(
+        measurement_version(report) == measurement_version(report["samples"][0]),
+        "baseline report and samples use different measurement versions; create a fresh baseline",
+    )
     expected_distribution = build_dataset(*PROFILES[profile])[2]
     require(
         report.get("distribution") == expected_distribution,
@@ -913,6 +996,11 @@ def run_sample(
     )
     result["worker_wall_s"] = reported_worker_wall
     result["wall_s"] = supervised_wall_s
+    require(
+        result.get("measurement_version") == MEASUREMENT_VERSION,
+        "worker omitted current measurement attribution; rerun with the current harness",
+    )
+    result["cleanup_deferred"] = bool(result.get("cleanup_warnings"))
     if warmup:
         profiles = [output / f"profile-{label}-part{part}.prof" for part in (0, 1)]
         result["profile_files"] = [str(path) for path in profiles]
@@ -957,6 +1045,7 @@ def worker(
     actual_package = Path(__import__("oddsfox_catalogue").__file__).resolve().parent
     if actual_package != expected_package:
         raise ValueError("worker imported a different runtime than requested")
+    worker_setup_started = time.monotonic()
     copy_root(seed, root)
     trace = output / f"trace-{label}.jsonl"
     audit = output / f"source-{label}.jsonl"
@@ -964,6 +1053,7 @@ def worker(
     http_attempts = downloaded_bytes = 0
     peak_rss_bytes = 0
     settled = []
+    cleanup_warnings = []
     clock = {"now": BASE_TIME}
     original_fetch = current_reconcile.fetch_unit
     original_gamma = current_runtime.GammaClient
@@ -1039,6 +1129,7 @@ def worker(
             )
             setup_http_attempts = probe_result.get("http_attempts", 0)
             setup_downloaded_bytes = probe_result.get("downloaded_bytes", 0)
+            runtime_sequence_started = time.monotonic()
             profiler = None
             for step, limit in ((0, stop_after), (1, 0)):
                 clock["now"] = BASE_TIME + timedelta(seconds=step)
@@ -1076,6 +1167,8 @@ def worker(
                     profiler.dump_stats(
                         profile.with_name(f"{profile.stem}-part{step}{profile.suffix}")
                     )
+                cleanup_warnings.extend(publication_cleanup_warnings(result, step))
+            runtime_sequence_ended = time.monotonic()
             stats = source.stats
             measured_attempts, measured_bytes = validate_source_accounting(
                 stats,
@@ -1086,6 +1179,12 @@ def worker(
         with trace.open("w") as stream:
             for item in settled:
                 stream.write(json.dumps(item, sort_keys=True) + "\n")
+        worker_peak_before_oracle_bytes = max(
+            peak_rss_bytes,
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            * (1 if sys.platform == "darwin" else 1024),
+        )
+        oracle_started = time.monotonic()
         snapshot = public_snapshot(root)
         expected_counts = {
             "events": PROFILES[profile_name][0],
@@ -1098,6 +1197,15 @@ def worker(
             "final entity counts differ from the synthetic oracle",
         )
         semantic = semantic_snapshot(snapshot, settled)
+        semantic_hash = canonical_hash(semantic)
+        oracle_ended = time.monotonic()
+        phases = phase_attribution(
+            worker_setup_started,
+            runtime_sequence_started,
+            runtime_sequence_ended,
+            oracle_started,
+            oracle_ended,
+        )
         print(
             json.dumps(
                 {
@@ -1108,6 +1216,12 @@ def worker(
                     "runtime_reserved_attempts": http_attempts + setup_http_attempts,
                     "runtime_downloaded_bytes": downloaded_bytes + setup_downloaded_bytes,
                     "setup_wall_s": setup_wall_s,
+                    "measurement_version": MEASUREMENT_VERSION,
+                    **phases,
+                    "worker_peak_before_oracle_bytes": worker_peak_before_oracle_bytes,
+                    "worker_peak_before_oracle_includes_setup_provider_and_runtime": True,
+                    "cleanup_warnings": cleanup_warnings,
+                    "cleanup_deferred": bool(cleanup_warnings),
                     "setup_http_attempts": setup_http_attempts,
                     "setup_downloaded_bytes": setup_downloaded_bytes,
                     "peak_rss_bytes": max(
@@ -1115,7 +1229,7 @@ def worker(
                         resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                         * (1 if sys.platform == "darwin" else 1024),
                     ),
-                    "semantic_hash": canonical_hash(semantic),
+                    "semantic_hash": semantic_hash,
                     "cursor": snapshot["state"].get("full_pass", {}).get("cursor_after"),
                     "settled_units": len(settled),
                     "settled_requests": settled,
@@ -1214,6 +1328,7 @@ def run(args) -> int:
     output.mkdir(parents=True)
     report = {
         "kind": "synthetic-full-pass",
+        "measurement_version": MEASUREMENT_VERSION,
         "profile": args.profile,
         "status": "failed",
         "started_at": datetime.now(UTC).isoformat(),

@@ -4,6 +4,10 @@
 
 ### Added
 
+- Versioned full-pass phase measurements and independent outcome/queue campaign
+  comparisons, preserving legacy manifests and whole-worker performance guards.
+  The bounded characterization retained neither candidate: no scored pairs fit.
+
 - A synthetic optimization campaign with frozen source inventories, private-state
   comparison, strict performance gates and one shared thirty-minute budget.
 
@@ -27,6 +31,10 @@
   their groups, while retaining descendant cleanup and genuine permission failures.
 
 ### Changed
+
+- Post-commit publication maintenance cooperatively defers work near its deadline,
+  preserving completed deletion statistics and warnings for later resumption.
+  Mandatory admission cleanup and referenced-raw accounting remain fail-closed.
 
 - A forced full pass walks stale events in numeric id order, then markets those events
   did not renew. It skips historical id-range windows. The next list request is fetched

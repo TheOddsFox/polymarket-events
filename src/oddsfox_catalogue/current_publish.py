@@ -89,46 +89,180 @@ def _referenced_raw(conn):
     return ids
 
 
-def _raw_directories(settings):
+def _iter_raw_directories(settings, cutoff=None):
+    """Yield safe generated raw directories without materializing the inventory."""
     raw = safe_path(settings.raw_dir)
+    if cutoff is not None and time.monotonic() >= cutoff:
+        return
     if not raw.exists():
-        return {}
-    directories = {}
-    for child in raw.iterdir():
-        safe_path(child)
-        if child.is_dir() and _RAW_ID.fullmatch(child.name):
-            directories[child.name] = child
-    return directories
+        return
+    if cutoff is not None and time.monotonic() >= cutoff:
+        return
+    with os.scandir(raw) as entries:
+        while cutoff is None or time.monotonic() < cutoff:
+            try:
+                entry = next(entries)
+            except StopIteration:
+                return
+            child = Path(entry.path)
+            safe_path(child)
+            if entry.is_dir() and _RAW_ID.fullmatch(entry.name):
+                yield entry.name, child
 
 
 def _raw_reference_summary(settings, referenced):
-    kept = [path for name, path in _raw_directories(settings).items() if name in referenced]
+    kept = [path for name, path in _iter_raw_directories(settings) if name in referenced]
     return {
         "referenced_count": len(kept),
         "referenced_bytes": sum(directory_bytes(path) for path in kept),
     }
 
 
-def _prune_unreferenced_raw(settings, referenced):
+def _prune_unreferenced_raw(settings, referenced, cutoff=None, progress=None):
     """Delete raw directories that neither the store nor pending work references."""
-    deleted = freed = 0
-    for name, path in _raw_directories(settings).items():
-        if name in referenced:
-            continue
-        freed += directory_bytes(path)
-        shutil.rmtree(path)
-        deleted += 1
-    if deleted:
-        _fsync_dir(settings.raw_dir)
-    return {"deleted_count": deleted, "deleted_bytes": freed}
-
-
-def _retain_raw(settings, referenced, result):
-    """Prune after the pointer is settled; a failed deletion is reported, never fatal."""
+    progress = progress if progress is not None else {"deleted_count": 0, "deleted_bytes": 0}
+    deferred = cutoff is not None and time.monotonic() >= cutoff
+    before = progress["deleted_count"]
+    directories = _iter_raw_directories(settings, cutoff)
     try:
-        result["raw_retention"] = _prune_unreferenced_raw(settings, referenced)
+        for name, path in directories:
+            if cutoff is not None and time.monotonic() >= cutoff:
+                deferred = True
+                break
+            if name in referenced:
+                continue
+            if cutoff is not None and time.monotonic() >= cutoff:
+                deferred = True
+                break
+            size = directory_bytes(path)
+            if cutoff is not None and time.monotonic() >= cutoff:
+                deferred = True
+                break
+            shutil.rmtree(path)
+            progress["deleted_count"] += 1
+            progress["deleted_bytes"] += size
+    except BaseException as primary:
+        _fsync_completed(settings.raw_dir, before, progress["deleted_count"], primary)
+        raise
+    else:
+        _fsync_completed(settings.raw_dir, before, progress["deleted_count"])
+    finally:
+        directories.close()
+    if cutoff is not None and time.monotonic() >= cutoff:
+        deferred = True
+    return {**progress, "deferred": deferred}
+
+
+def _retain_raw(settings, referenced, result, *, deadline=None):
+    """Prune after the pointer is settled; a failed deletion is reported, never fatal."""
+    progress = {"deleted_count": 0, "deleted_bytes": 0}
+    started = time.monotonic()
+    try:
+        outcome = _prune_unreferenced_raw(
+            settings, referenced, _maintenance_cutoff(deadline), progress
+        )
+        result["raw_retention"] = {**progress}
+        if outcome["deferred"]:
+            result["retention_warning"] = "raw retention deferred by publication deadline"
     except Exception as exc:
+        result["raw_retention"] = {**progress}
         result["retention_warning"] = str(exc)
+    finally:
+        result.setdefault("publication_timings", {})["raw_cleanup_s"] = time.monotonic() - started
+
+
+def _maintenance_cutoff(deadline):
+    return None if deadline is None else deadline - 15
+
+
+def _fsync_completed(directory, before, after, primary=None):
+    if after <= before:
+        return
+    try:
+        _fsync_dir(directory)
+    except BaseException:
+        if primary is not None and not isinstance(primary, Exception):
+            return
+        raise
+
+
+def _cleanup_cooperative(settings, keep, cutoff, progress):
+    """Clean settled generated artifacts, stopping before optional work expires."""
+    deferred = False
+    for directory, prefix in (
+        (settings.published_dir / "releases", ""),
+        (settings.published_dir, ".staging-"),
+    ):
+        if cutoff is not None and time.monotonic() >= cutoff:
+            deferred = True
+            break
+        if not directory.exists():
+            continue
+        if cutoff is not None and time.monotonic() >= cutoff:
+            deferred = True
+            break
+        before = progress["deleted_count"]
+        try:
+            if cutoff is not None and time.monotonic() >= cutoff:
+                deferred = True
+                break
+            with os.scandir(directory) as entries:
+                while cutoff is None or time.monotonic() < cutoff:
+                    try:
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    child = Path(entry.path)
+                    name = entry.name.removeprefix(prefix)
+                    if (
+                        not entry.name.startswith(prefix)
+                        or not re.fullmatch(r"[0-9a-f]{32}", name)
+                        or name in keep
+                    ):
+                        continue
+                    safe_path(child)
+                    if not entry.is_dir():
+                        continue
+                    if cutoff is not None and time.monotonic() >= cutoff:
+                        deferred = True
+                        break
+                    size = directory_bytes(child)
+                    if cutoff is not None and time.monotonic() >= cutoff:
+                        deferred = True
+                        break
+                    shutil.rmtree(child)
+                    progress["deleted_count"] += 1
+                    progress["deleted_bytes"] += size
+        except BaseException as primary:
+            _fsync_completed(directory, before, progress["deleted_count"], primary)
+            raise
+        else:
+            _fsync_completed(directory, before, progress["deleted_count"])
+        if deferred:
+            break
+    if cutoff is not None and time.monotonic() >= cutoff:
+        deferred = True
+    return deferred
+
+
+def _postcommit_maintenance(settings, keep, referenced, result, deadline, *, cleanup_releases=True):
+    result["release_cleanup"] = {"deleted_count": 0, "deleted_bytes": 0}
+    progress = result["release_cleanup"]
+    started = time.monotonic()
+    if cleanup_releases:
+        try:
+            deferred = _cleanup_cooperative(settings, keep, _maintenance_cutoff(deadline), progress)
+            if deferred:
+                result["cleanup_warning"] = "release cleanup deferred by publication deadline"
+        except Exception as exc:
+            result["cleanup_warning"] = str(exc)
+        finally:
+            result.setdefault("publication_timings", {})["release_cleanup_s"] = (
+                time.monotonic() - started
+            )
+    else:
+        result.setdefault("publication_timings", {})["release_cleanup_s"] = 0.0
+    _retain_raw(settings, referenced, result, deadline=deadline)
 
 
 def _release_bytes_match(path, manifest):
@@ -323,6 +457,7 @@ def _cleanup(settings, keep):
 
 def publish(settings, conn, *, deadline=None):
     """Publish one read snapshot. The caller must hold the catalogue writer lock."""
+    publication_started = time.monotonic()
     validate_root(settings.root)
     _check_deadline(deadline)
     published = safe_path(settings.published_dir)
@@ -331,6 +466,7 @@ def publish(settings, conn, *, deadline=None):
     previous = None
     pinned = _pointer(settings) if current.exists() else {}
     conn.execute("BEGIN TRANSACTION")
+    committed = False
     try:
         if current.exists():
             pointer = _pointer(settings)
@@ -365,9 +501,25 @@ def publish(settings, conn, *, deadline=None):
                 _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
                 _check_deadline(deadline)
                 referenced = _referenced_raw(conn)
-                conn.execute("COMMIT")
+                pre_commit_s = time.monotonic() - publication_started
+                try:
+                    conn.execute("COMMIT")
+                except BaseException as exc:
+                    if not isinstance(exc, Exception):
+                        committed = True
+                    raise
+                else:
+                    committed = True
                 result = {**unchanged, "noop": True, "valid": True, "path": str(release)}
-                _retain_raw(settings, referenced, result)
+                result["publication_timings"] = {"pre_commit_s": pre_commit_s}
+                _postcommit_maintenance(
+                    settings,
+                    {pinned.get("release_id"), pinned.get("previous_release_id")},
+                    referenced,
+                    result,
+                    deadline,
+                    cleanup_releases=False,
+                )
                 return result
             try:
                 verified = verify_current(settings, connection=conn)
@@ -402,9 +554,25 @@ def publish(settings, conn, *, deadline=None):
                     )
                     _check_deadline(deadline)
                     referenced = _referenced_raw(conn)
-                    conn.execute("COMMIT")
+                    pre_commit_s = time.monotonic() - publication_started
+                    try:
+                        conn.execute("COMMIT")
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception):
+                            committed = True
+                        raise
+                    else:
+                        committed = True
                     result = {**verified, "noop": True}
-                    _retain_raw(settings, referenced, result)
+                    result["publication_timings"] = {"pre_commit_s": pre_commit_s}
+                    _postcommit_maintenance(
+                        settings,
+                        {pinned.get("release_id"), pinned.get("previous_release_id")},
+                        referenced,
+                        result,
+                        deadline,
+                        cleanup_releases=False,
+                    )
                     return result
         _cleanup(settings, {pinned.get("release_id"), pinned.get("previous_release_id")})
         # Existing failed staging and orphan releases are counted by admit as retained bytes.
@@ -488,15 +656,21 @@ def publish(settings, conn, *, deadline=None):
         _check_deadline(deadline)
         os.replace(pending_pointer, current)
         _fsync_dir(published)
-        conn.execute("COMMIT")
-        result = {**manifest, "valid": True, "path": str(final), "noop": False}
-        # Promotion is the commit point; cleanup failures cannot undo a valid pointer.
+        pre_commit_s = time.monotonic() - publication_started
         try:
-            _cleanup(settings, {release_id, previous})
-        except Exception as exc:
-            result["cleanup_warning"] = str(exc)
-        _retain_raw(settings, referenced, result)
+            conn.execute("COMMIT")
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                committed = True
+            raise
+        else:
+            committed = True
+        result = {**manifest, "valid": True, "path": str(final), "noop": False}
+        result["publication_timings"] = {"pre_commit_s": pre_commit_s}
+        # Promotion is the commit point; maintenance cannot undo a valid pointer.
+        _postcommit_maintenance(settings, {release_id, previous}, referenced, result, deadline)
         return result
     except BaseException:
-        conn.execute("ROLLBACK")
+        if not committed:
+            conn.execute("ROLLBACK")
         raise
