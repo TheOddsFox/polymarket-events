@@ -28,7 +28,7 @@ The seeded root verified: 1,138,596 events and 4,321,358 markets. After the prob
 
 Reconcile held about 20 entities per second. A 1,200-second invocation that keeps about 255 seconds for publish clears about 18,900 entities, so the remainder is about 4 days. A 480-second invocation committed 3,938 entities and was cut off by the deadline during publish. `previous_publish_seconds` was 170.
 
-Observed retained storage was 8.13 GiB and peak RSS was 4.19 GiB. The probe floor is 1.5 times those peaks: 12.2 GiB retained and 6.3 GiB RSS. The sample `config/catalogue.toml` allows 160 GiB retained, which is above that floor. That 160 GiB value is not a measured full-run ceiling.
+Observed retained storage was 7.57 GiB (8,125,747,037 bytes) and peak RSS was 4.19 GiB. The probe floor is 1.5 times those peaks: 11.4 GiB retained and 6.3 GiB RSS. The sample `config/catalogue.toml` allows 160 GiB retained, which is above that floor. That 160 GiB value is not a measured full-run ceiling.
 
 ## Known limit
 
