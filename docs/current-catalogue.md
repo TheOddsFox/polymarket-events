@@ -297,7 +297,10 @@ validation, and cleanup, with 15 seconds reserved for shutdown. An incomplete co
 reports `insufficient_evidence`. A candidate qualifies only with three complete pairs,
 equivalent scheduler and publication results, at least 10% and one second lower median
 acquire/apply time, no more than 5% wall-time or peak-RSS regression, and no increased HTTP
-load. HTTP accounting records served requests and offered response bodies alongside
+load. Publication comparisons use row fingerprints, schemas, and counts. Each release's
+physical hashes and sizes are verified before comparison and excluded from cross-run
+equality, so Parquet layout differences do not imply changed catalogue contents.
+HTTP accounting records served requests and offered response bodies alongside
 client reservations and consumed bytes, including cancellations; neither measure may
 increase. Isolated profiles cannot qualify a change. Results never establish deployment
 acceptance or a production speedup.

@@ -95,7 +95,7 @@ def normalize(value):
 
 
 def normalized_publication(manifest: dict) -> dict:
-    """Compare the release contract and row fingerprints, excluding raw-capture byte accounting."""
+    """Compare semantic publication content, independent of Parquet encoding."""
     keys = (
         "contract",
         "projection_version",
@@ -106,7 +106,12 @@ def normalized_publication(manifest: dict) -> dict:
         "full_pass",
         "relations",
     )
-    return normalize({key: manifest[key] for key in keys if key in manifest})
+    result = normalize({key: manifest[key] for key in keys if key in manifest})
+    for descriptor in result.get("relations", {}).values():
+        if isinstance(descriptor, dict):
+            descriptor.pop("sha256", None)
+            descriptor.pop("bytes", None)
+    return result
 
 
 def canonical_hash(value) -> str:

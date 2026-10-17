@@ -6,6 +6,7 @@
 
 - Synthetic-only full-pass characterization with frozen baseline comparisons and a
   shared ten-minute performance budget. Incomplete evidence cannot qualify a change.
+  Verified publication comparisons use semantic row fingerprints independently of Parquet layout.
 
 ### Fixed
 
