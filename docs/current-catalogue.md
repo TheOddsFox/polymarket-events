@@ -304,3 +304,66 @@ HTTP accounting records served requests and offered response bodies alongside
 client reservations and consumed bytes, including cancellations; neither measure may
 increase. Isolated profiles cannot qualify a change. Results never establish deployment
 acceptance or a production speedup.
+
+For a fixed-budget comparison of multiple locally prepared optimization variants:
+
+```sh
+uv run --locked python scripts/benchmark-optimization-campaign.py --manifest /absolute/path/variants.json --output /absolute/path/fresh-campaign
+```
+
+The data-only manifest requires `baseline` and `binding` entries and accepts optional
+`outcome_grouping`, `queue`, and `projection` entries. Each entry contains `path` (the
+trusted local `oddsfox_catalogue` package directory) and `source_hashes` (the complete
+mapping of package-relative Python filenames to their SHA-256 hashes). Relative package
+paths resolve beside the manifest. Saved package code is executed: hashes establish
+integrity, not trust. Use only locally prepared, reviewed sources, with no symlinks or
+special files. Keep snapshots, manifests and evidence outside Git and outside existing
+catalogue or legacy roots.
+
+The campaign uses one 1,800-second budget, including preparation, source copies,
+unscored warm-ups, paired fresh workers, validation and cleanup, with 15 seconds reserved
+for shutdown. Existing full-pass commands retain their shared 600-second budget. Every
+stage uses the same frozen 10,000-event/40,400-market seed and the production limits.
+Each complete sample includes the deterministic 50-unit interruption and resumption.
+
+Binding is compared with the unchanged baseline first. Eligible secondary variants are
+compared independently with binding, in grouping, queue, projection order. A secondary
+must match the full binding source inventory except for its assigned store, reconciliation
+or sync module. Only individually qualified files are assembled, and that final combination
+must qualify against the unchanged baseline. If final evidence is incomplete or fails,
+only an already qualified binding variant may be retained. All existing semantic,
+publication, HTTP-load, wall-time and peak-RSS gates remain required. The oracle also
+compares private identity, claim, repair, attempt and generation state.
+
+The report records stage results, source inventories, retained variants and explicit
+deferrals. Missing pairs or budget exhaustion never qualify a change. Campaign results
+are synthetic characterization, not deployment acceptance or a million-event runtime
+estimate. Do not replace failed or incomplete samples with selectively repeated runs.
+
+The first optimization campaign (2026-10-17) used baseline commit
+`1f2d4dade321aacc4e07d5ebecfd0a09124ec530`. It ended after 1,790.02 seconds,
+including supervised shutdown, with `insufficient_evidence` and no retained candidates.
+Only one complete scored pair and one additional binding sample finished:
+
+| Scored sample | Acquire/apply | Supervised wall | Fresh-worker peak RSS | Served HTTP attempts |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline, pair 1 | 164.861 s | 170.756 s | 666,058,752 bytes | 123 |
+| Binding, pair 1 | 412.259 s | 418.955 s | 668,221,440 bytes | 122 |
+| Binding, pair 2 (unpaired) | 204.317 s | 212.720 s | 673,431,552 bytes | 124 |
+
+The second baseline sample reached the shared deadline. Three complete pairs are
+required, so these results establish no qualifying median improvement. The completed
+pair showed a binding slowdown. Completed samples had identical semantic hashes,
+including private state and verified publication. Unscored warm-ups took 147.148 seconds
+for baseline acquisition/application and 423.890 seconds for binding; they cannot qualify
+an optimization. Raw metrics, complete source inventories and candidate sources remain
+in the private campaign artifacts.
+
+The delivery runtime therefore keeps baseline source unchanged. Outcome grouping and
+queue handling were tested in isolated variants but did not reach timed comparison.
+Projection reuse was deferred before timing: a decoded boolean and raw numeric JSON
+can compare equal in Python while fresh and replay validation accept different inputs.
+Urgency caching, more HTTP workers, publication redesign and reduced integrity checks
+remain deferred. A future investigation should explain full-pass JSON relation cost and
+sample variation before proposing another transport change. No production runtime or
+USB cable speedup follows from this campaign.

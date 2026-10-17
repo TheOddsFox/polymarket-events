@@ -4,6 +4,9 @@
 
 ### Added
 
+- A synthetic optimization campaign with frozen source inventories, private-state
+  comparison, strict performance gates and one shared thirty-minute budget.
+
 - Synthetic-only full-pass characterization with frozen baseline comparisons and a
   shared ten-minute performance budget. Incomplete evidence cannot qualify a change.
   Verified publication comparisons use semantic row fingerprints independently of Parquet layout.

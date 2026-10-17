@@ -249,11 +249,18 @@ def test_real_output_overflow_retains_failed_bounded_log_and_report(tmp_path, mo
     seed.mkdir()
     root.mkdir()
     executable = tmp_path / "noisy"
-    executable.write_text(
-        "#!/bin/sh\nexec "
-        + shlex.join([sys.executable, "-c", "import os; os.write(1, b'x' * 32768)"])
-        + "\n"
+    # Keep the emitter alive through TERM so this test isolates overflow and forced cleanup.
+    noisy = (
+        "import os, signal\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "try:\n"
+        "    os.write(1, b'x' * 32768)\n"
+        "except BrokenPipeError:\n"
+        "    pass\n"
+        "while True:\n"
+        "    signal.pause()\n"
     )
+    executable.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-c", noisy]) + "\n")
     executable.chmod(0o700)
     monkeypatch.setattr(capacity, "ANCILLARY_BYTES", 16 * 1024)
     monkeypatch.setattr(capacity, "REPORT_BYTES", 4 * 1024)

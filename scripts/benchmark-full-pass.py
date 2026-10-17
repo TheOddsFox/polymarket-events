@@ -29,7 +29,13 @@ from pathlib import Path
 import duckdb
 
 REPO = Path(__file__).resolve().parents[1]
+_expected_package = os.environ.get("FULL_PASS_EXPECTED_PACKAGE")
+if _expected_package:
+    sys.path.insert(0, str(Path(_expected_package).resolve().parent))
+else:
+    sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "tests"))
+import oddsfox_catalogue  # noqa: E402
 from fakes.capacity_source import CapacitySource  # noqa: E402
 from fakes.world import make_event, make_market  # noqa: E402
 from oddsfox_catalogue.current_config import (  # noqa: E402
@@ -82,6 +88,8 @@ def normalize(value):
         "acquire_apply_s",
         "publish_verify_s",
         "publication_s",
+        "request_elapsed_s",
+        "duration_s",
     }
     if isinstance(value, dict):
         return {
@@ -238,12 +246,18 @@ def validate_source_accounting(
 
 
 class Budget:
-    def __init__(self, inherited=0.0):
+    def __init__(self, inherited=0.0, *, limit_s=BUDGET_S):
+        require(
+            type(limit_s) in (int, float) and math.isfinite(limit_s) and limit_s > 0,
+            "invalid budget limit",
+        )
         self.started = time.monotonic()
         self.inherited = inherited
+        self.limit_s = float(limit_s)
+        self.holdback_s = 0.0
 
     def add_inherited(self, seconds: float):
-        self.inherited = validate_elapsed(seconds)
+        self.inherited = validate_elapsed(seconds, limit_s=self.limit_s)
 
     @property
     def elapsed(self):
@@ -251,16 +265,21 @@ class Budget:
 
     @property
     def remaining(self):
-        return max(0.0, BUDGET_S - self.elapsed - SHUTDOWN_RESERVE_S)
+        return max(
+            0.0,
+            self.limit_s - self.elapsed - SHUTDOWN_RESERVE_S - self.holdback_s,
+        )
 
     def admit(self, estimated=0.0):
         if estimated > self.remaining:
-            raise TimeoutError("insufficient_evidence: shared 600-second budget is exhausted")
+            raise TimeoutError(
+                f"insufficient_evidence: shared {self.limit_s:g}-second budget is exhausted"
+            )
 
 
-def validate_elapsed(value) -> float:
+def validate_elapsed(value, *, limit_s=BUDGET_S) -> float:
     require(
-        type(value) in (int, float) and math.isfinite(value) and 0 <= value <= BUDGET_S,
+        type(value) in (int, float) and math.isfinite(value) and 0 <= value <= limit_s,
         "invalid baseline budget",
     )
     return float(value)
@@ -437,8 +456,8 @@ def create_seed(root: Path, event_count: int, market_count: int) -> dict:
     return distribution
 
 
-def copy_runtime(target: Path) -> str:
-    source = REPO / "src" / "oddsfox_catalogue"
+def copy_runtime(target: Path, source: Path | None = None) -> str:
+    source = source or REPO / "src" / "oddsfox_catalogue"
     target.mkdir(parents=True)
     for path in sorted(source.rglob("*.py")):
         destination = target / path.relative_to(source)
@@ -603,7 +622,13 @@ def supervised(
     return command_result(log)
 
 
-def supervised_prepare(command: list[str], output: Path, budget: Budget, log: Path) -> dict:
+def supervised_prepare(
+    command: list[str],
+    output: Path,
+    budget: Budget,
+    log: Path,
+    package_root: Path | None = None,
+) -> dict:
     budget.admit(1)
     timeout = budget.remaining
     from importlib.util import module_from_spec, spec_from_file_location
@@ -615,10 +640,14 @@ def supervised_prepare(command: list[str], output: Path, budget: Budget, log: Pa
     spec.loader.exec_module(installed)
     env = base_environment()
     env.update(
-        PYTHONPATH=os.pathsep.join((str(REPO / "src"), str(REPO / "tests"))),
+        PYTHONPATH=os.pathsep.join(
+            (str(package_root.parent if package_root else REPO / "src"), str(REPO / "tests"))
+        ),
         PYTHONNOUSERSITE="1",
         PYTHONDONTWRITEBYTECODE="1",
     )
+    if package_root:
+        env["FULL_PASS_EXPECTED_PACKAGE"] = str(package_root.resolve())
     try:
         installed.run_command(
             command, output, env, log, timeout=timeout, max_output_bytes=4 * 1024**2
@@ -689,6 +718,69 @@ def validate_baseline(baseline: Path, profile: str, candidate_package: Path) -> 
     }
 
 
+def private_state_snapshot(conn) -> dict:
+    raw_state = {
+        key: json.loads(value)
+        for key, value in conn.execute("SELECT key,value FROM sync_state ORDER BY key").fetchall()
+    }
+    state_keys = (
+        "store_contract",
+        "projection_version",
+        "generation",
+        "full_pass",
+        "fetch_pending",
+        "bulk_policy",
+        "discovery",
+        "reconcile",
+        "last_publish_at",
+    )
+    state = {key: raw_state[key] for key in state_keys if key in raw_state}
+    policy = state.get("bulk_policy")
+    if isinstance(policy, dict) and "origin" in policy:
+        if not str(policy["origin"]).startswith("http://127.0.0.1:"):
+            raise ValueError("synthetic bulk policy origin is not loopback")
+        policy = {**policy, "origin": "http://127.0.0.1:<ephemeral>"}
+        state["bulk_policy"] = policy
+    last_run = raw_state.get("last_run")
+    if isinstance(last_run, dict):
+        semantic_keys = (
+            "operation",
+            "status",
+            "published",
+            "pending",
+            "source_complete",
+            "budget_exhausted",
+            "parent_event_repair_count",
+        )
+        state["last_run"] = {key: last_run[key] for key in semantic_keys if key in last_run}
+    existing_tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+    tables = {}
+    for table in (
+        "_receipts",
+        "_membership",
+        "_identity",
+        "_identity_claims",
+        "_parent_repairs",
+        "_reconcile_attempts",
+    ):
+        if table not in existing_tables:
+            continue
+        columns = [row[0] for row in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+        rows = []
+        for row in conn.execute(f'SELECT * FROM "{table}" ORDER BY ALL').fetchall():
+            item = dict(zip(columns, row, strict=True))
+            for generated_reference in (
+                "response",
+                "latest_response",
+                "invalidated_response",
+            ):
+                if generated_reference in item and item[generated_reference] is not None:
+                    item[generated_reference] = "<generated-response-reference>"
+            rows.append(item)
+        tables[table] = rows
+    return {"state": state, "tables": tables}
+
+
 def public_snapshot(root: Path) -> dict:
     with duckdb.connect(str(root / "catalogue.duckdb"), read_only=True) as conn:
         tables = {}
@@ -696,12 +788,7 @@ def public_snapshot(root: Path) -> dict:
             columns = [row[0] for row in conn.execute(f"DESCRIBE {table}").fetchall()]
             rows = conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall()
             tables[table] = [dict(zip(columns, row, strict=True)) for row in rows]
-        state = {
-            key: json.loads(value)
-            for key, value in conn.execute(
-                "SELECT key,value FROM sync_state WHERE key IN ('full_pass','last_run') ORDER BY key"
-            ).fetchall()
-        }
+        private_state = private_state_snapshot(conn)
         receipt_state = {
             "memberships": [
                 dict(zip(("venue", "event_id", "receipt", "unresolved"), row, strict=True))
@@ -717,7 +804,7 @@ def public_snapshot(root: Path) -> dict:
             ],
         }
         publication = verify_current(CurrentSettings(root), connection=conn)
-        full_pass = state.get("full_pass") or {}
+        full_pass = private_state["state"].get("full_pass") or {}
         started = datetime.fromisoformat(full_pass["pass_started_at"])
         receipt_gaps = {
             "events": conn.execute(
@@ -743,13 +830,27 @@ def public_snapshot(root: Path) -> dict:
         )
         return {
             "tables": tables,
-            "state": state,
+            "state": private_state["state"],
             "receipt_state": receipt_state,
+            "private_state": private_state["tables"],
             "counts": {name: len(rows) for name, rows in tables.items()},
             "receipt_gaps": receipt_gaps,
             "publication_verified": verified,
             "publication": normalized_publication(publication),
         }
+
+
+def semantic_snapshot(snapshot: dict, settled_requests: list[dict]) -> dict:
+    return {
+        "tables": snapshot["tables"],
+        "state": snapshot["state"],
+        "private_state": snapshot["private_state"],
+        "receipt_state": snapshot["receipt_state"],
+        "full_pass": snapshot["state"].get("full_pass"),
+        "settled_requests": settled_requests,
+        "publication_verified": snapshot["publication_verified"],
+        "publication": snapshot["publication"],
+    }
 
 
 def run_sample(
@@ -996,14 +1097,7 @@ def worker(
             snapshot["counts"] == expected_counts,
             "final entity counts differ from the synthetic oracle",
         )
-        semantic = {
-            "tables": snapshot["tables"],
-            "receipt_state": snapshot["receipt_state"],
-            "full_pass": snapshot["state"].get("full_pass"),
-            "settled_requests": settled,
-            "publication_verified": snapshot["publication_verified"],
-            "publication": snapshot["publication"],
-        }
+        semantic = semantic_snapshot(snapshot, settled)
         print(
             json.dumps(
                 {
@@ -1081,7 +1175,7 @@ def run(args) -> int:
             distribution = create_seed(seed, events, markets)
             runtime = Path(args.output) / "runtime" / "oddsfox_catalogue"
             runtime.parent.mkdir(parents=True, exist_ok=True)
-            runtime_hash = copy_runtime(runtime)
+            runtime_hash = copy_runtime(runtime, Path(oddsfox_catalogue.__file__).resolve().parent)
             print(
                 json.dumps(
                     {
