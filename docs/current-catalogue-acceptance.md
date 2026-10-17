@@ -20,6 +20,16 @@ elapsed seconds for `refresh` and `verify`, and the `status` and `verify` output
 measured values here only after a real run. Until a run meets every item above, v1 is
 not accepted for deployment.
 
+## Probe 2026-10-17
+
+This probe is not a passed v1 bar. The full pass was not run to completion.
+
+The seeded root verified: 1,138,596 events and 4,321,358 markets. After the probe, `full_pass.remaining` was 5,439,842, `active_overdue_count` was 21,874, and unresolved memberships were 0.
+
+Reconcile held about 20 entities per second. A 1,200-second invocation that keeps about 255 seconds for publish clears about 18,900 entities, so the remainder is about 4 days. A 480-second invocation committed 3,938 entities and was cut off by the deadline during publish. `previous_publish_seconds` was 170.
+
+Observed retained storage was 8.13 GiB and peak RSS was 4.19 GiB. The probe floor is 1.5 times those peaks: 12.2 GiB retained and 6.3 GiB RSS. The sample `config/catalogue.toml` allows 160 GiB retained, which is above that floor. That 160 GiB value is not a measured full-run ceiling.
+
 ## Known limit
 
 A known event whose source member list stays incomplete produces no membership receipt, so
