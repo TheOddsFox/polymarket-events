@@ -189,15 +189,13 @@ def test_pending_native_receipt_resumes_frozen_capture_without_http(tmp_path, mo
         assert client.stats.requests == 0
 
 
-def test_cli_current_metadata_reconcile_backup_restore_offline(tmp_path):
+def test_cli_current_metadata_and_full_pass_offline(tmp_path):
     root = tmp_path.resolve() / "catalogue"
     assert cli(root, "init")["status"] == "initialized"
-    unprotected = cli(root, "status")
-    assert unprotected["recovery_scope"] == "local_only"
-    assert unprotected["disk_failure_protection"] is False
-    assert unprotected["last_backup"] is None
-    assert unprotected["backup_age_s"] is None
-    assert unprotected["recovery_point_overdue"] is True
+    initial = cli(root, "status")
+    assert "last_backup" not in initial
+    assert initial["full_pass"]["started_at"] is None
+    assert initial["full_pass"]["completed_at"] is None
     with CurrentGammaServer() as source:
         certificate = probe(root, source.url)
         assert all(lane["supported"] for lane in certificate["lanes"].values())
@@ -229,6 +227,8 @@ def test_cli_current_metadata_reconcile_backup_restore_offline(tmp_path):
             "11",
             "--market-id",
             "12",
+            "--catalogue-root",
+            str(root),
             "--output",
             bundle,
             source=source.url,
@@ -242,25 +242,42 @@ def test_cli_current_metadata_reconcile_backup_restore_offline(tmp_path):
         assert reconciled["status"] == "published"
         assert reconciled["http_attempts"] >= 2
         assert reconciled["source_complete"] is False
+        full = cli(root, "reconcile", "--full-pass", source=source.url)
+        assert full["full_pass"]["started_at"] is not None
+        assert full["source_complete"] is False
+        remaining = full["full_pass"]["remaining"]
+        assert isinstance(remaining, int) and remaining >= 0
+        assert (full["full_pass"]["completed_at"] is not None) == (remaining == 0)
         requests = source.stats["http_attempts"]
-        backup = cli(root, "backup", "create")
-        local_backup = cli(root, "status")
-        assert local_backup["recovery_scope"] == "local_only"
-        assert local_backup["disk_failure_protection"] is False
-        assert local_backup["last_backup"] == {
-            key: value for key, value in backup.items() if key != "retention"
-        }
-        assert 0 <= local_backup["backup_age_s"] < 86400
-        assert local_backup["recovery_point_overdue"] is False
+        status = cli(root, "status")
+        assert status["full_pass"]["started_at"] == full["full_pass"]["started_at"]
         assert source.stats["http_attempts"] == requests
-    backup_path = Path(backup["path"])
-    assert cli(root, "backup", "verify", backup_path)["valid"] is True
-    restored = tmp_path / "restored"
-    cli(root, "backup", "restore", backup_path, "--destination", restored)
-    restored_release = cli(restored, "verify")
-    assert restored_release["valid"] is True
-    assert restored_release["relations"] == cli(root, "verify")["relations"]
-    assert cli(restored, "current")["release_id"] == restored_release["release_id"]
+    assert cli(root, "verify")["valid"] is True
+
+
+def test_minimal_v1_root_refresh_and_full_pass_without_import(tmp_path):
+    root = tmp_path.resolve() / "catalogue"
+    assert cli(root, "init")["status"] == "initialized"
+    help_text = subprocess.run(
+        [sys.executable, "-m", "oddsfox_catalogue", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    assert "import-release" not in help_text
+    assert "backup" not in help_text
+    with CurrentGammaServer() as source:
+        probe(root, source.url)
+        refreshed = cli(root, "refresh", source=source.url)
+        assert refreshed["status"] == "published"
+        full = cli(root, "reconcile", "--full-pass", source=source.url)
+        assert full["full_pass"]["remaining"] == 0
+        assert full["full_pass"]["completed_at"] is not None
+        assert full["source_complete"] is False
+    verified = cli(root, "verify")
+    assert verified["valid"] is True
+    assert verified["coverage"]["complete"] is False
 
 
 def test_source_change_failed_publication_retains_verified_previous_pointer(tmp_path, monkeypatch):

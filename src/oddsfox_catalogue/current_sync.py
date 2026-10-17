@@ -13,7 +13,6 @@ from .current_contract import PROJECTION_VERSION, CurrentError
 from .current_rows import _incomplete, entity_id, project_response
 from .gamma.http import CaptureStopped, MalformedResponse, RequestBudgetExceeded, ResponseTooLarge
 from .gamma.paginators import _window_params, unpack
-from .limits import directory_bytes
 
 LANES = ("events", "markets")
 POLICY = {
@@ -379,10 +378,7 @@ def discover(settings, conn, client, *, deadline):
 def _write_response(settings, raw_dir, response, request):
     if len(response.body) > settings.limits.max_response_bytes:
         raise CurrentError("response body allowance exceeded")
-    reservation = 2 * len(response.body) + 65536
-    admit(settings, additional_bytes=reservation)
-    if directory_bytes(settings.raw_dir) + reservation > settings.limits.max_raw_bytes:
-        raise CurrentError("raw storage allowance exhausted")
+    admit(settings, additional_bytes=2 * len(response.body) + 65536)
     write_page(
         raw_dir,
         1,

@@ -21,22 +21,44 @@ from oddsfox_catalogue.limits import directory_bytes
 
 ACTIVE_FRESHNESS_S = 86400
 COLD_FRESHNESS_S = 60 * 86400
+GIB = 1024**3
 
 
 @dataclass(frozen=True)
 class CurrentLimits:
+    """Operator-tunable limits. Defaults are starting points; a root's config.toml sets them.
+
+    Ceilings are set from measured peaks, so every value is bounded by ``HARD_MAXIMUMS``
+    rather than by these defaults.
+    """
+
     max_duration_s: float = 1200.0
     max_requests: int = 25_000
-    max_download_bytes: int = 4 * 1024**3
+    max_download_bytes: int = 4 * GIB
     max_response_bytes: int = 16 * 1024**2
-    max_retained_bytes: int = 96 * 1024**3
-    max_temp_bytes: int = 8 * 1024**3
-    free_reserve_bytes: int = 32 * 1024**3
-    max_raw_bytes: int = 8 * 1024**3
-    raw_max_age_s: int = 7 * 86400
+    max_retained_bytes: int = 160 * GIB
+    max_temp_bytes: int = 16 * GIB
+    free_reserve_bytes: int = 8 * GIB
     active_recheck_s: int = 20 * 3600
     cold_recheck_s: int = 58 * 86400
     publication_reserve_s: float = 60.0
+
+
+@dataclass(frozen=True)
+class HardMaximums:
+    """Upper bounds no root configuration may exceed."""
+
+    max_duration_s: float = 1200.0
+    max_requests: int = 25_000
+    max_download_bytes: int = 4 * GIB
+    max_response_bytes: int = 16 * 1024**2
+    max_retained_bytes: int = 512 * GIB
+    max_temp_bytes: int = 64 * GIB
+    free_reserve_bytes: int = 256 * GIB
+
+
+HARD_MAXIMUMS = HardMaximums()
+MINIMUM_PUBLICATION_RESERVE_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -64,10 +86,6 @@ class CurrentSettings:
     @property
     def temporary_dir(self) -> Path:
         return self.root / "tmp"
-
-    @property
-    def backups_dir(self) -> Path:
-        return self.root / "backups"
 
     @property
     def run_lock_path(self) -> Path:
@@ -144,26 +162,22 @@ def load_current_settings(root: Path | None = None, *, env=None) -> CurrentSetti
     for name, value in asdict(limits).items():
         if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
             raise CurrentError(f"catalogue {name} must be positive and finite")
-    ceilings = CurrentLimits()
     for name in (
         "max_requests",
         "max_download_bytes",
         "max_response_bytes",
         "max_retained_bytes",
         "max_temp_bytes",
-        "max_raw_bytes",
-        "raw_max_age_s",
+        "free_reserve_bytes",
     ):
-        if getattr(limits, name) > getattr(ceilings, name):
-            raise CurrentError(f"catalogue {name} exceeds the accepted ceiling")
+        if getattr(limits, name) > getattr(HARD_MAXIMUMS, name):
+            raise CurrentError(f"catalogue {name} exceeds its hard maximum")
     if (
-        limits.max_duration_s > ceilings.max_duration_s
+        limits.max_duration_s > HARD_MAXIMUMS.max_duration_s
         or limits.publication_reserve_s >= limits.max_duration_s
     ):
         raise CurrentError("refresh deadline must be <=1200s with time reserved for publication")
-    if limits.free_reserve_bytes < ceilings.free_reserve_bytes:
-        raise CurrentError("free-space reserve must be at least 32 GiB")
-    if limits.publication_reserve_s < ceilings.publication_reserve_s:
+    if limits.publication_reserve_s < MINIMUM_PUBLICATION_RESERVE_S:
         raise CurrentError("publication reserve must be at least 60 seconds")
     if not 0 < gamma.requests_per_second <= 10:
         raise CurrentError("Gamma rate must be positive and at most 10 requests/second")

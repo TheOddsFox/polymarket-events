@@ -50,7 +50,7 @@ def test_limits_and_legacy_config(tmp_path):
     root = tmp_path / "new"
     settings = load_current_settings(root, env={})
     assert settings.gamma.requests_per_second == 10
-    with pytest.raises(CurrentError, match="ceiling"):
+    with pytest.raises(CurrentError, match="hard maximum"):
         load_current_settings(root, env={"CATALOGUE_CATALOGUE_MAX_REQUESTS": "25001"})
     with pytest.raises(CurrentError, match="at most"):
         load_current_settings(root, env={"CATALOGUE_GAMMA_REQUESTS_PER_SECOND": "11"})
@@ -67,11 +67,9 @@ def test_approved_defaults_and_sample_config_match(tmp_path):
         "max_requests": 25_000,
         "max_download_bytes": 4 * 1024**3,
         "max_response_bytes": 16 * 1024**2,
-        "max_retained_bytes": 96 * 1024**3,
-        "max_temp_bytes": 8 * 1024**3,
-        "free_reserve_bytes": 32 * 1024**3,
-        "max_raw_bytes": 8 * 1024**3,
-        "raw_max_age_s": 7 * 86400,
+        "max_retained_bytes": 160 * 1024**3,
+        "max_temp_bytes": 16 * 1024**3,
+        "free_reserve_bytes": 8 * 1024**3,
         "active_recheck_s": 20 * 3600,
         "cold_recheck_s": 58 * 86400,
         "publication_reserve_s": 60.0,
@@ -85,8 +83,8 @@ def test_approved_defaults_and_sample_config_match(tmp_path):
     assert sample == settings
 
 
-@pytest.mark.parametrize("duration,retained_gib", [(1200, 96), (300, 64)])
-def test_approved_resource_boundaries_and_legacy_values_accepted(tmp_path, duration, retained_gib):
+@pytest.mark.parametrize("duration,retained_gib", [(1200, 160), (300, 512)])
+def test_root_config_accepts_values_up_to_hard_maximums(tmp_path, duration, retained_gib):
     settings = load_current_settings(
         tmp_path / "root",
         env={
@@ -102,14 +100,12 @@ def test_approved_resource_boundaries_and_legacy_values_accepted(tmp_path, durat
     "name,value",
     [
         ("max_duration_s", 1200.001),
-        ("max_retained_bytes", 96 * 1024**3 + 1),
+        ("max_retained_bytes", 512 * 1024**3 + 1),
         ("max_requests", 25_001),
         ("max_download_bytes", 4 * 1024**3 + 1),
         ("max_response_bytes", 16 * 1024**2 + 1),
-        ("max_temp_bytes", 8 * 1024**3 + 1),
-        ("max_raw_bytes", 8 * 1024**3 + 1),
-        ("raw_max_age_s", 7 * 86400 + 1),
-        ("free_reserve_bytes", 32 * 1024**3 - 1),
+        ("max_temp_bytes", 64 * 1024**3 + 1),
+        ("free_reserve_bytes", 256 * 1024**3 + 1),
         ("publication_reserve_s", 59.999),
         ("publication_reserve_s", 1200),
     ],

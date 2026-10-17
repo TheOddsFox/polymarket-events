@@ -6,9 +6,8 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from test_current_import import add_event_page, release_fixture
 
-from oddsfox_catalogue import current_backup, current_import, current_publish
+from oddsfox_catalogue import current_publish
 from oddsfox_catalogue import current_store as store
 from oddsfox_catalogue.current_config import CurrentSettings, connect_store, validate_root
 from oddsfox_catalogue.current_contract import CurrentError, projection
@@ -135,34 +134,6 @@ def test_same_market_can_belong_to_two_events_without_false_duplicate_detection(
         assert store.validate_store(conn)["valid"]
 
 
-@pytest.mark.parametrize("gate", ["validate", "publish", "backup"])
-def test_duplicate_pair_corruption_cannot_validate_publish_or_backup(settings, gate):
-    with connect_store(settings) as conn:
-        store.apply(conn, response([event([2])]))
-        current_publish.publish(settings, conn)
-    good = current_backup.create_backup(settings)
-    pointer = settings.published_dir / "current.json"
-    before = pointer.read_bytes()
-    with connect_store(settings) as conn:
-        last_backup = store.get_state(conn, "last_backup")
-        conn.execute("INSERT INTO event_markets SELECT * FROM event_markets")
-        assert links(conn) == [("polymarket", "1", "2", 2)]
-        if gate != "backup":
-            with pytest.raises(CurrentError, match="integrity|duplicate"):
-                if gate == "validate":
-                    store.validate_store(conn)
-                else:
-                    current_publish.publish(settings, conn)
-    if gate == "backup":
-        with pytest.raises(CurrentError, match="integrity|duplicate"):
-            current_backup.create_backup(settings)
-    assert pointer.read_bytes() == before
-    assert current_publish.verify_current(settings)["valid"]
-    assert {str(path) for path in settings.backups_dir.iterdir()} == {good["path"]}
-    with connect_store(settings, read_only=True) as conn:
-        assert store.get_state(conn, "last_backup") == last_backup
-
-
 def test_rehashed_release_still_rejects_duplicate_public_link_key(settings):
     with connect_store(settings) as conn:
         store.apply(conn, response([event([2])]))
@@ -238,44 +209,4 @@ def test_replacement_failure_rolls_back_links_membership_progress_and_generation
         assert links(conn) == [("polymarket", "1", "3", 1)]
         assert store.get_state(conn, "cursor") == "new"
         assert store.generation(conn) == 2
-        assert store.validate_store(conn)["valid"]
-
-
-def test_import_membership_commit_retry_and_completed_resume_keep_one_pair(tmp_path):
-    release, _, fixture_conn = release_fixture(tmp_path, usable=True)
-    fixture_conn.close()
-    raw = tmp_path / "raw"
-    checksum = add_event_page(release, raw, [{"id": "1", "markets": [{"id": "2"}, {"id": "2"}]}])
-    settings = CurrentSettings(tmp_path / "current")
-    options = {"manifest_sha256": checksum, "raw_root": raw}
-    with connect_store(settings) as conn:
-        assert (
-            current_import.import_release(settings, conn, release, **options)["phase"] == "evidence"
-        )
-    with connect_store(settings) as conn:
-
-        class FailCommit:
-            def execute(self, query, params=None):
-                if query.strip().upper() == "COMMIT":
-                    assert links(conn) == [("polymarket", "1", "2", 1)]
-                    raise RuntimeError("membership commit failed")
-                return conn.execute(query) if params is None else conn.execute(query, params)
-
-            def __getattr__(self, name):
-                return getattr(conn, name)
-
-        with pytest.raises(CurrentError, match="seed evidence failed: membership commit failed"):
-            current_import.import_release(settings, FailCommit(), release, **options)
-        assert links(conn) == []
-        assert conn.execute("SELECT count(*) FROM _membership").fetchone() == (0,)
-        assert store.get_state(conn, "seed_pending")["stage"] == "evidence"
-    with connect_store(settings) as conn:
-        assert (
-            current_import.import_release(settings, conn, release, **options)["phase"] == "verify"
-        )
-        assert links(conn) == [("polymarket", "1", "2", 1)]
-    with connect_store(settings) as conn:
-        assert current_import.import_release(settings, conn, release, **options)["complete"]
-        assert current_import.import_release(settings, conn, release, **options)["resumed"]
-        assert links(conn) == [("polymarket", "1", "2", 1)]
         assert store.validate_store(conn)["valid"]

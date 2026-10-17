@@ -176,7 +176,6 @@ def test_process_failure_keeps_report(tmp_path, monkeypatch):
         executable=tmp_path / "mock-executable",
         account_root=[seed],
         invocations=1,
-        backup_every=0,
         cadence_seconds=0,
         max_total_seconds=4000,
         characterize=True,
@@ -220,7 +219,6 @@ def test_disjoint_paths_and_cadence():
         capacity.run(
             Namespace(
                 invocations=1,
-                backup_every=0,
                 cadence_seconds=0,
                 max_total_seconds=4000,
                 characterize=False,
@@ -319,7 +317,6 @@ def test_tiny_characterization_with_real_commands(tmp_path, monkeypatch):
         executable=executable,
         account_root=[seed],
         invocations=1,
-        backup_every=0,
         cadence_seconds=0,
         max_total_seconds=4000,
         characterize=True,
@@ -350,7 +347,6 @@ def test_initial_query_requires_capacity_admission(tmp_path, monkeypatch):
         executable=tmp_path / "mock-executable",
         account_root=[seed],
         invocations=1,
-        backup_every=0,
         cadence_seconds=0,
         max_total_seconds=4000,
         characterize=True,
@@ -359,21 +355,11 @@ def test_initial_query_requires_capacity_admission(tmp_path, monkeypatch):
     assert json.loads((output / "report.json").read_text())["error"] == "ValueError: no capacity"
 
 
-def test_backup_refused_before_any_child(monkeypatch):
-    monkeypatch.setattr(
-        capacity.installed, "run_command", lambda *_a, **_kw: pytest.fail("child invoked")
-    )
-    with pytest.raises(ValueError, match="explicitly accounted external"):
-        capacity.run(
-            Namespace(
-                invocations=1,
-                backup_every=1,
-                cadence_seconds=0,
-                max_total_seconds=4000,
-                characterize=True,
-            )
-        )
-    assert capacity.parser().get_default("backup_every") == 0
+def test_backup_option_is_removed(tmp_path):
+    base = ["--seed-root", str(tmp_path), "--root", str(tmp_path), "--output", str(tmp_path)]
+    base += ["--executable", str(tmp_path), "--account-root", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        capacity.parser().parse_args([*base, "--backup-every", "1"])
 
 
 def test_log_budget_counts_failed_logs(tmp_path):
@@ -383,29 +369,22 @@ def test_log_budget_counts_failed_logs(tmp_path):
     )
 
 
-def test_combined_capacity_accepts_exact_peak_and_rejects_one_extra_byte(tmp_path, monkeypatch):
+def test_candidate_is_admitted_per_root_without_aggregate_envelope(tmp_path, monkeypatch):
     root, output, legacy = tmp_path / "root", tmp_path / "output", tmp_path / "legacy"
     output.mkdir()
     (output / "source.jsonl").write_bytes(b"1234567")
     (output / "child.log").write_bytes(b"abc")
     limits = capacity.CurrentLimits()
-    ceiling = 256 * 1024**3
-    sizes = {
-        root: limits.max_retained_bytes,
-        output: 10,
-        legacy: ceiling
-        - limits.max_retained_bytes
-        - capacity.MAX_AUDIT_BYTES
-        - capacity.ANCILLARY_BYTES,
-    }
+    sizes = {root: limits.max_retained_bytes, output: 10, legacy: 4 * limits.max_retained_bytes}
     monkeypatch.setattr(
         capacity.accounting, "aggregate_usage", lambda path: {"logical_owned_bytes": sizes[path]}
     )
     monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _: SimpleNamespace(free=2**50))
     measured = capacity.capacity([root, output, legacy], root, output)
-    assert measured["total_bytes"] + measured["reserved_bytes"] == ceiling
-    sizes[legacy] += 1
-    with pytest.raises(ValueError, match="combined retained capacity exhausted"):
+    # Legacy and total bytes are reported, but no combined limit gates admission.
+    assert measured["total_bytes"] > limits.max_retained_bytes
+    sizes[root] += 1
+    with pytest.raises(ValueError, match="retained capacity exhausted"):
         capacity.capacity([root, output, legacy], root, output)
 
 

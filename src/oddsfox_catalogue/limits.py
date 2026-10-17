@@ -5,7 +5,6 @@ import stat
 from contextlib import closing
 from pathlib import Path
 
-from oddsfox_catalogue.config import Settings
 from oddsfox_catalogue.gamma.http import RequestBudgetExceeded
 
 
@@ -93,37 +92,3 @@ def _directory_bytes_dirfd(directory: Path) -> int:
             continue
         raise RequestBudgetExceeded("storage directory changed or was skipped during accounting")
     return total
-
-
-def _union_bytes(paths: tuple[Path, ...]) -> int:
-    for path in paths:
-        for ancestor in (path, *path.parents):
-            if ancestor.is_symlink():
-                raise RequestBudgetExceeded("storage path contains a symlink")
-    roots = {Path(os.path.abspath(path)) for path in paths}
-    roots = {p for p in roots if not any(p != q and p.is_relative_to(q) for q in roots)}
-    return sum(directory_bytes(root) for root in roots)
-
-
-def retained_bytes(settings: Settings) -> int:
-    return _union_bytes(
-        (
-            settings.root,
-            settings.data_dir,
-            settings.state_dir,
-            settings.dlt_pipelines_dir,
-            settings.warehouse_path,
-            settings.warehouse_path.with_name(settings.warehouse_path.name + ".wal"),
-        )
-    )
-
-
-def temporary_bytes(settings: Settings) -> int:
-    return _union_bytes((settings.temporary_dir, settings.dlt_pipelines_dir))
-
-
-def enforce_storage_limits(settings: Settings, *, additional_bytes: int = 0) -> None:
-    if retained_bytes(settings) + additional_bytes > settings.capture.max_retained_bytes:
-        raise RequestBudgetExceeded("retained storage allowance exhausted")
-    if temporary_bytes(settings) > settings.capture.max_temp_bytes:
-        raise RequestBudgetExceeded("temporary storage allowance exhausted")

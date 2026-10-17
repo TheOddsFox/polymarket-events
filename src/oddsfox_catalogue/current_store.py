@@ -135,8 +135,6 @@ def _identity_key(mapping):
 
 
 def apply(conn, response: ResponseRows, progress=None):
-    if conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone():
-        raise CurrentError("seed import incomplete; resume import-release with its frozen source")
     stamp = (
         datetime.fromisoformat(response.received_at.replace("Z", "+00:00")),
         response.response_id,
@@ -450,18 +448,13 @@ def validate_public(conn, sources):
             raise CurrentError("release relational integrity violation")
 
 
-def validate_store(conn, *, allow_seeding=False):
-    return _validate_store(conn, allow_seeding=allow_seeding)[0]
+def validate_store(conn):
+    return _validate_store(conn)[0]
 
 
-def _validate_store(conn, *, allow_seeding=False):
+def _validate_store(conn):
     """Return validation and freshly compared source evidence, never accept a proof."""
     _validate_schema(conn)
-    if (
-        not allow_seeding
-        and conn.execute("SELECT 1 FROM sync_state WHERE key='seed_pending'").fetchone()
-    ):
-        raise CurrentError("seed import incomplete; resume import-release with its frozen source")
     validate_public(conn, {table: table for table in SCHEMAS})
     for query in [
         "SELECT 1 FROM _identity_claims GROUP BY venue,market_id,asset_kind,asset_id "

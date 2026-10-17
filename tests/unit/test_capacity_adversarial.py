@@ -284,7 +284,6 @@ def test_real_output_overflow_retains_failed_bounded_log_and_report(tmp_path, mo
         executable=executable,
         account_root=[seed],
         invocations=1,
-        backup_every=0,
         cadence_seconds=0,
         max_total_seconds=4000,
         characterize=True,
