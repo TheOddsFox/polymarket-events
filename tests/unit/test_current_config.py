@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from oddsfox_catalogue.current_config import (
+    CurrentLimits,
     CurrentSettings,
     admit,
     connect_store,
@@ -101,6 +102,9 @@ def test_approved_defaults_and_sample_config_match(tmp_path):
         "active_recheck_s": 20 * 3600,
         "cold_recheck_s": 58 * 86400,
         "publication_reserve_s": 60.0,
+        "full_pass_publish_interval_s": 21600.0,
+        "duckdb_memory_bytes": 2 * 1024**3,
+        "duckdb_threads": 2,
     }
     sample = load_current_settings(
         tmp_path / "root",
@@ -108,7 +112,11 @@ def test_approved_defaults_and_sample_config_match(tmp_path):
             "CATALOGUE_CONFIG": str(Path(__file__).resolve().parents[2] / "config/catalogue.toml")
         },
     )
-    assert sample == settings
+    assert sample.gamma == settings.gamma
+    assert sample.limits.duckdb_memory_bytes == 6 * 1024**3
+    assert replace(sample.limits, duckdb_memory_bytes=settings.limits.duckdb_memory_bytes) == (
+        settings.limits
+    )
 
 
 @pytest.mark.parametrize("duration,retained_gib", [(1200, 160), (300, 512)])
@@ -150,6 +158,31 @@ def test_resource_limits_reject_values_outside_approved_policy(tmp_path, name, v
 def test_resource_limit_expansion_preserves_positive_finite_validation(tmp_path, name, value):
     with pytest.raises((CurrentError, ValueError)):
         load_current_settings(tmp_path / "root", env={f"CATALOGUE_CATALOGUE_{name.upper()}": value})
+
+
+def test_new_keys_default_on_an_old_config_and_reject_their_ceilings(tmp_path):
+    root = tmp_path / "old"
+    root.mkdir()
+    (root / "config.toml").write_text("[catalogue]\npublication_reserve_s = 60\n")
+    limits = load_current_settings(root, env={}).limits
+    assert limits.full_pass_publish_interval_s == 21600
+    assert limits.duckdb_memory_bytes == 2 * 1024**3
+    assert limits.duckdb_threads == 2
+    with pytest.raises(CurrentError, match="duckdb_memory_bytes"):
+        load_current_settings(
+            root, env={"CATALOGUE_CATALOGUE_DUCKDB_MEMORY_BYTES": str(17 * 1024**3)}
+        )
+    with pytest.raises(CurrentError, match="duckdb_threads"):
+        load_current_settings(root, env={"CATALOGUE_CATALOGUE_DUCKDB_THREADS": "9"})
+
+
+def test_meter_overrun_blocks(tmp_path):
+    root = validate_root(tmp_path / "root", initialize=True)
+    settings = CurrentSettings(root, limits=replace(CurrentLimits(), max_retained_bytes=10**9))
+    settings.meter.snapshot(root)
+    settings.meter.add(10**9)
+    with pytest.raises(CurrentError, match="retained"):
+        admit(settings, additional_bytes=1)
 
 
 def test_admission_checks_reserve_and_retained(tmp_path):

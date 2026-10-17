@@ -2,6 +2,8 @@
 
 import copy
 import json
+import queue
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -389,16 +391,140 @@ def _write_response(settings, raw_dir, response, request):
             "status": response.status,
         },
     )
+    settings.meter.add(len(response.body))
 
 
-def fetch_apply(settings, conn, client, kind, ids, *, progress=None, native=False, absence=False):
+class ResponsePrefetcher:
+    """Fetch the next known pass request while the current response is applied.
+
+    The worker shares the parent's rate limit and stats. Depth is two bodies.
+    A body is used only when its request matches the frozen one; anything else
+    is discarded and still counts, because the worker already performed the GET.
+    """
+
+    def __init__(self, client, *, deadline):
+        self.worker = client.spawn()
+        self.deadline = deadline
+        self.discarded = 0
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._pending = []
+        self._inflight = None
+        self._done = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="catalogue-prefetch", daemon=True)
+        self._thread.start()
+
+    def submit(self, request):
+        if self._stop.is_set() or time.monotonic() >= self.deadline:
+            return
+        with self._lock:
+            if len(self._pending) >= 2 or self._inflight == request or request in self._pending:
+                return
+            self._pending.append(request)
+        self._wake.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            with self._lock:
+                request = self._pending.pop(0) if self._pending else None
+                if request is not None:
+                    self._inflight = request
+            if request is None:
+                self._wake.wait(0.05)
+                self._wake.clear()
+                continue
+            if self._stop.is_set() or time.monotonic() >= self.deadline:
+                self._abandon()
+                return
+            try:
+                payload = self.worker.get(request["endpoint"], request["params"])
+            except BaseException as exc:
+                payload = exc
+            with self._lock:
+                self._inflight = None
+            self._done.put((request, payload))
+        self._abandon()
+
+    def _abandon(self):
+        with self._lock:
+            self._pending.clear()
+            self._inflight = None
+
+    def take(self, request):
+        held = []
+        try:
+            while True:
+                try:
+                    got, payload = self._done.get_nowait()
+                except queue.Empty:
+                    with self._lock:
+                        waiting = request in self._pending or self._inflight == request
+                    if waiting and self._thread.is_alive() and not self._stop.is_set():
+                        self._wake.wait(0.01)
+                        continue
+                    return None
+                if got == request:
+                    if isinstance(payload, BaseException):
+                        raise payload
+                    return payload
+                held.append((got, payload))
+        finally:
+            for item in held:
+                self._done.put(item)
+
+    def close(self):
+        self._stop.set()
+        self._wake.set()
+        self._abandon()
+        self.worker._deadline = min(getattr(self.worker, "_deadline", 0), self.worker._clock())
+        self._thread.join(timeout=5)
+        self.worker.close()
+        while True:
+            try:
+                self._done.get_nowait()
+            except queue.Empty:
+                break
+            self.discarded += 1
+
+
+def first_bulk_request(settings, conn, lane, ids):
+    """The first certified list request for these ids, matching ``fetch_unit``."""
+    _certificate_value, passes = _certificate(settings, conn, lane)
+    wanted = [int(entity_id(value)) for value in ids]
+    return {"endpoint": f"/{lane}", "params": _window_params(wanted, lane, passes[0])}
+
+
+def fetch_apply(
+    settings, conn, client, kind, ids, *, progress=None, native=False, absence=False, attempts=None
+):
     """Persist and apply a bounded repair unit; callers own its scheduling checkpoint."""
     return fetch_unit(
-        settings, conn, client, kind, ids, progress=progress, native=native, absence=absence
+        settings,
+        conn,
+        client,
+        kind,
+        ids,
+        progress=progress,
+        native=native,
+        absence=absence,
+        attempts=attempts,
     )[0]
 
 
-def fetch_unit(settings, conn, client, kind, ids, *, progress=None, native=False, absence=False):
+def fetch_unit(
+    settings,
+    conn,
+    client,
+    kind,
+    ids,
+    *,
+    progress=None,
+    native=False,
+    absence=False,
+    attempts=None,
+    prefetcher=None,
+):
     """Like ``fetch_apply``, also returning the bulk IDs no listing contained.
 
     An omission is not absence. A forced pass settles each omitted known entity with a
@@ -448,13 +574,17 @@ def fetch_unit(settings, conn, client, kind, ids, *, progress=None, native=False
     listed = set()
     while work["remaining"]:
         request = work["remaining"][0]
+        if prefetcher is not None and len(work["remaining"]) > 1:
+            prefetcher.submit(work["remaining"][1])
         endpoint, params = request["endpoint"], request["params"]
         batch = [int(endpoint.rsplit("/", 1)[1])] if native else params["id"]
         raw_dir = settings.raw_dir / work["raw_id"]
         manifest = _pending_manifest(raw_dir, settings.root)
         if manifest is None:
             try:
-                response = client.get(endpoint, params)
+                response = prefetcher.take(request) if prefetcher is not None else None
+                if response is None:
+                    response = client.get(endpoint, params)
                 requests_made += 1
             except ResponseTooLarge:
                 if len(batch) == 1:
@@ -511,7 +641,9 @@ def fetch_unit(settings, conn, client, kind, ids, *, progress=None, native=False
         if not next_work["remaining"]:
             checkpoint.update(progress or {})
         admit(settings, additional_bytes=max(65536, 4 * len(body)))
-        current_store.apply(conn, rows, checkpoint)
+        current_store.apply(
+            conn, rows, checkpoint, attempts=attempts if not next_work["remaining"] else None
+        )
         responses += 1
         record_count += len(records)
         work = next_work

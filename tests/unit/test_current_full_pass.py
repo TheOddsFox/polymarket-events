@@ -1,5 +1,6 @@
 """Forced full pass: gates bypassed until every known entity has a newer receipt."""
 
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -281,7 +282,7 @@ def test_native_404_records_absence_only_for_known_entities(setup):
     assert conn.execute("SELECT count(*) FROM events WHERE event_id='3'").fetchone()[0] == 0
 
 
-def test_window_gaps_cost_no_native_lookup(setup):
+def test_window_gaps_cost_no_native_lookup_outside_a_pass(setup):
     settings, conn = setup
     seed(conn, [event(2)], age=3600)
     seen = []
@@ -295,3 +296,161 @@ def test_window_gaps_cost_no_native_lookup(setup):
     )
     reconcile._confirm_omitted(settings, conn, client, "events", ["2", "3"])
     assert seen == ["/events/2"]
+
+
+def test_pass_walks_events_in_order_and_resumes_from_the_cursor(setup):
+    settings, conn = setup
+    seed(conn, [event(i) for i in range(1, 151)], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+    calls = []
+
+    def stop_after_one(request):
+        ids = [int(value) for value in request.url.params.get_list("id")]
+        calls.append(ids)
+        if ids[0] > 100:
+            raise CaptureStopped()
+        return httpx.Response(200, json=[event(value) for value in ids])
+
+    run(settings, conn, stop_after_one)
+    assert current_store.get_state(conn, "full_pass")["cursor_after"] == 100
+    assert list(range(1, 101)) in calls
+    resumed_at = len(calls)
+
+    def resume(request):
+        calls.append([int(value) for value in request.url.params.get_list("id")])
+        return httpx.Response(200, json=[event(value) for value in calls[-1]])
+
+    run(settings, conn, resume)
+    assert calls[resumed_at:] == [list(range(101, 151))]
+    assert reconcile.full_pass_status(conn, now=NOW)["completed_at"] is not None
+
+
+def test_pass_renews_nested_markets_and_sweeps_orphans(setup):
+    settings, conn = setup
+    parent = event(1)
+    parent["markets"] = [market(10)]
+    old = (NOW - timedelta(seconds=3600)).isoformat()
+    current_store.apply(
+        conn, project_response([parent], "events", received_at=old, response_id="e")
+    )
+    current_store.apply(
+        conn, project_response([market(11)], "markets", received_at=old, response_id="m")
+    )
+    reconcile.start_full_pass(conn, now=NOW)
+    seen = []
+
+    def handler(request):
+        ids = request.url.params.get_list("id")
+        seen.append((request.url.path, ids))
+        if request.url.path == "/events":
+            return httpx.Response(200, json=[parent])
+        if request.url.path == "/markets":
+            return httpx.Response(200, json=[market(11)])
+        pytest.fail(request.url.path)
+
+    run(settings, conn, handler)
+    assert ("/markets", ["10"]) not in seen
+    assert ("/markets", ["11"]) in seen
+    assert reconcile.full_pass_status(conn, now=NOW)["remaining"] == 0
+
+
+def test_pass_skips_id_range_windows(setup):
+    settings, conn = setup
+    seed(conn, [event(2)], age=3600)
+    current_store.set_state(
+        conn,
+        "discovery",
+        {"lanes": {"events": {"frontier": 500}, "markets": {"frontier": 500}}},
+    )
+    reconcile.start_full_pass(conn, now=NOW)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params.get_list("id"))
+        return httpx.Response(200, json=[event(2)])
+
+    run(settings, conn, handler)
+    assert seen == [["2"]]
+
+
+def test_urgent_active_event_takes_the_next_pass_slot(setup):
+    settings, conn = setup
+    seed(conn, [event(i, closed=True) for i in range(1, 4)], age=3600)
+    seed(conn, [event(9)], age=23 * 3600)
+    reconcile.start_full_pass(conn, now=NOW)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params.get_list("id"))
+        return httpx.Response(
+            200, json=[event(int(value), closed=value != "9") for value in seen[-1]]
+        )
+
+    run(settings, conn, handler)
+    assert seen[0] == ["9"]
+
+
+def test_event_request_count_is_one_per_hundred(setup):
+    settings, conn = setup
+    seed(conn, [event(i) for i in range(1, 251)], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        ids = request.url.params.get_list("id")
+        return httpx.Response(200, json=[event(int(value)) for value in ids])
+
+    run(settings, conn, handler)
+    assert calls == ["/events", "/events", "/events"]
+
+
+def test_prefetch_mismatch_is_discarded_and_recounted(setup):
+    settings, conn = setup
+    seed(conn, [event(1)], age=3600)
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.params.get_list("id"))
+        return httpx.Response(200, json=[event(1)])
+
+    client = GammaClient(
+        settings.gamma, transport=httpx.MockTransport(handler), sleep=lambda _: None
+    )
+    prefetcher = current_sync.ResponsePrefetcher(client, deadline=time.monotonic() + 30)
+    prefetcher.submit({"endpoint": "/events", "params": {"limit": 1, "id": [99]}})
+    deadline = time.monotonic() + 2
+    while client.stats.requests < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    current_sync.fetch_unit(settings, conn, client, "events", [1], prefetcher=prefetcher)
+    prefetcher.close()
+    assert prefetcher.discarded >= 1
+    assert client.stats.requests >= 2
+    assert ["1"] in calls
+
+
+def test_stop_and_deadline_drain_the_prefetch_worker(setup):
+    settings, conn = setup
+    entered = threading.Event()
+
+    def handler(request):
+        entered.set()
+        prefetcher._stop.wait(2)
+        return httpx.Response(200, json=[])
+
+    client = GammaClient(
+        settings.gamma, transport=httpx.MockTransport(handler), sleep=lambda _: None
+    )
+    prefetcher = current_sync.ResponsePrefetcher(client, deadline=time.monotonic() + 30)
+    prefetcher.submit(current_sync.first_bulk_request(settings, conn, "events", [1]))
+    assert entered.wait(1)
+    prefetcher.close()
+    assert not prefetcher._thread.is_alive()
+
+    late = current_sync.ResponsePrefetcher(client, deadline=time.monotonic() - 1)
+    before = client.stats.requests
+    late.submit(current_sync.first_bulk_request(settings, conn, "events", [1]))
+    time.sleep(0.05)
+    late.close()
+    assert client.stats.requests == before
+    assert not late._thread.is_alive()

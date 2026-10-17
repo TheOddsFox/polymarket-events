@@ -175,7 +175,9 @@ def _current(args):
         settings, operation, options, duration=settings.limits.max_duration_s
     )
     print(json.dumps(result, default=str, indent=2))
-    return 0 if success else 3
+    if not success or result.get("published") is False:
+        return 3
+    return 0
 
 
 def main(argv=None):
