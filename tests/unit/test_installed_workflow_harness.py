@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from contextlib import suppress
 from pathlib import Path
 
@@ -115,6 +116,135 @@ def test_command_failure_reads_only_bounded_tail(tmp_path):
             tmp_path / "failure.log",
         )
     assert "diagnostic:" not in str(error.value)
+
+
+class FakeProcess:
+    pid = 123
+
+    def __init__(self, polls=(), initial_wait_error=None):
+        self.polls = deque(polls)
+        self.initial_wait_error = initial_wait_error
+        self.waits = []
+
+    def poll(self):
+        return self.polls.popleft() if self.polls else 0
+
+    def wait(self, timeout):
+        self.waits.append(timeout)
+        if len(self.waits) == 1 and self.initial_wait_error:
+            raise self.initial_wait_error
+        return 0
+
+
+def patch_process(monkeypatch, process, killpg):
+    monkeypatch.setattr(harness.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(harness.os, "killpg", killpg)
+
+
+def test_cleanup_signals_group_after_leader_already_exited(tmp_path, monkeypatch):
+    process = FakeProcess(polls=[0, 0])
+    signals = []
+    patch_process(monkeypatch, process, lambda pid, signum: signals.append(signum))
+
+    harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.waits == [600, 5, 5]
+
+
+def test_cleanup_ignores_missing_process_group(tmp_path, monkeypatch):
+    process = FakeProcess()
+
+    def missing_group(pid, signum):
+        raise ProcessLookupError
+
+    patch_process(monkeypatch, process, missing_group)
+
+    harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+
+
+def test_term_permission_race_retries_after_leader_exit(tmp_path, monkeypatch):
+    process = FakeProcess(polls=[None, 0, 0])
+    signals = []
+
+    def killpg(pid, signum):
+        signals.append(signum)
+        if signum == signal.SIGTERM and signals.count(signum) == 1:
+            raise PermissionError("race")
+
+    patch_process(monkeypatch, process, killpg)
+    harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+    assert signals == [signal.SIGTERM, signal.SIGTERM, signal.SIGKILL]
+
+
+def test_kill_permission_race_retries_after_leader_exit(tmp_path, monkeypatch):
+    process = FakeProcess(polls=[0, None, 0])
+    signals = []
+
+    def killpg(pid, signum):
+        signals.append(signum)
+        if signum == signal.SIGKILL and signals.count(signum) == 1:
+            raise PermissionError("race")
+
+    patch_process(monkeypatch, process, killpg)
+    harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+    assert signals == [signal.SIGTERM, signal.SIGKILL, signal.SIGKILL]
+
+
+@pytest.mark.parametrize("polls", [[None, None, 0], [0, 0]])
+def test_genuine_permission_failure_is_preserved_and_final_wait_runs(tmp_path, monkeypatch, polls):
+    process = FakeProcess(polls=polls)
+    signals = []
+
+    def killpg(pid, signum):
+        signals.append(signum)
+        if signum == signal.SIGTERM:
+            raise PermissionError("genuine")
+
+    patch_process(monkeypatch, process, killpg)
+    with pytest.raises(PermissionError, match="genuine"):
+        harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.waits == [600, 5]
+
+
+def test_repeated_permission_failure_after_exit_retry_is_visible(tmp_path, monkeypatch):
+    process = FakeProcess(polls=[None, 0, 0])
+    signals = []
+
+    def killpg(pid, signum):
+        signals.append(signum)
+        if signum == signal.SIGTERM:
+            raise PermissionError("repeated")
+
+    patch_process(monkeypatch, process, killpg)
+    with pytest.raises(PermissionError, match="repeated"):
+        harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+    assert signals == [signal.SIGTERM, signal.SIGTERM, signal.SIGKILL]
+    assert process.waits == [600, 5]
+
+
+def test_final_wait_runs_when_kill_signal_fails(tmp_path, monkeypatch):
+    process = FakeProcess()
+
+    def killpg(pid, signum):
+        if signum == signal.SIGKILL:
+            raise PermissionError("kill failed")
+
+    patch_process(monkeypatch, process, killpg)
+    with pytest.raises(PermissionError, match="kill failed"):
+        harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
+    assert process.waits == [600, 5, 5]
+
+
+def test_successful_cleanup_preserves_original_command_error(tmp_path, monkeypatch):
+    original = subprocess.TimeoutExpired(["unused"], 1)
+    process = FakeProcess(initial_wait_error=original)
+    patch_process(monkeypatch, process, lambda pid, signum: None)
+
+    with pytest.raises(subprocess.TimeoutExpired) as error:
+        harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log", timeout=1)
+    assert error.value is original
 
 
 def test_timeout_stops_term_ignoring_descendant_after_parent_exits(tmp_path):

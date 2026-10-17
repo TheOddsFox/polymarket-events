@@ -7,7 +7,7 @@ description: Universal Pad engineering orchestration — specify Work and Plans,
 
 Use this skill for non-trivial local agentic engineering. Keep Pad's official `pad` skill for CLI/MCP mechanics. This skill overrides routing that would create Ideas or Tasks.
 
-Git owns code. `scripts/verify` owns verification. Pad owns intent, scope, status, dependencies, decisions, evidence, and handoffs. This repository has no GitHub Actions workflow.
+Git owns code. The repository documented verification process owns verification. Pad owns intent, scope, status, dependencies, decisions, evidence, and handoffs.
 
 ## Collections
 

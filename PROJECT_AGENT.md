@@ -2,7 +2,7 @@
 
 Public local, single-host catalogue of unique Polymarket events, markets, event-owned memberships and exact native outcome identifiers. Odds, financial metrics and observation history belong outside this runtime.
 
-Use AGENTS.md and the local pad-engineering skill. Git owns code. Local verify scripts own verification. Pad owns scope and evidence. Keep Work/Plans and all operator data outside Git. There is no GitHub Actions workflow.
+Use AGENTS.md and the local pad-engineering skill. Git owns code. Local verify scripts own verification. Pad owns scope and evidence. Keep Work/Plans and all operator data outside Git. GitHub Actions were intentionally removed; do not restore hosted workflows unless explicitly requested.
 
 ## Runtime
 

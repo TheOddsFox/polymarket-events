@@ -96,6 +96,26 @@ def test_pass_bypasses_cold_and_active_gates_only_while_active(setup):
     assert {row[0] for row in active} == {"1", "2"}
 
 
+@pytest.mark.parametrize("cold", [False, True])
+def test_due_and_full_pass_order_ids_as_huge_integers(setup, cold):
+    _settings, conn = setup
+    ids = [
+        "9223372036854775807",
+        "9223372036854775808",
+        "18446744073709551615",
+        "18446744073709551616",
+        "99999999999999999999",
+    ]
+    seed(conn, [event(key) for key in reversed(ids)], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+    started = reconcile._pass_started(conn)
+
+    assert [
+        row[0] for row in reconcile._due(conn, "events", cold, NOW, 20 * 3600, pass_started=started)
+    ] == ids
+    assert reconcile._stale_event_ids(conn, started, None) == ids
+
+
 def test_pass_completes_only_after_every_known_event_has_a_newer_receipt(setup):
     settings, conn = setup
     seed(conn, [event(1), event(2, closed=True)], age=3600)
@@ -323,6 +343,38 @@ def test_pass_walks_events_in_order_and_resumes_from_the_cursor(setup):
     run(settings, conn, resume)
     assert calls[resumed_at:] == [list(range(101, 151))]
     assert reconcile.full_pass_status(conn, now=NOW)["completed_at"] is not None
+
+
+def test_legacy_cursor_recovers_incomplete_lower_id_without_retrying_in_invocation(setup):
+    settings, conn = setup
+    key = "9223372036854775808"
+    incomplete = event(key)
+    incomplete.pop("markets")
+    seed(conn, [incomplete], age=3600)
+    reconcile.start_full_pass(conn, now=NOW)
+    state = current_store.get_state(conn, "full_pass")
+    state["cursor_after"] = 99999999999999999999
+    current_store.set_state(conn, "full_pass", state)
+
+    attempts = []
+
+    def interrupted(request):
+        attempts.append(request.url.params.get_list("id"))
+        raise CaptureStopped()
+
+    run(settings, conn, interrupted)
+    assert attempts == [[key]]
+    assert current_store.get_state(conn, "full_pass")["cursor_after"] == 99999999999999999999
+
+    resumed = []
+
+    def finish(request):
+        resumed.append(request.url.params.get_list("id"))
+        return httpx.Response(200, json=[event(key)])
+
+    run(settings, conn, finish)
+    assert resumed == [[key]]
+    assert reconcile.full_pass_status(conn, now=NOW)["remaining"] == 0
 
 
 def test_pass_renews_nested_markets_and_sweeps_orphans(setup):

@@ -56,7 +56,7 @@ def _due(conn, lane, cold, now, interval, *, pass_started=None):
         WHERE (? OR (e.closed IS TRUE)=?) AND
         (e.receipt IS NULL OR e.receipt<=? OR e.unresolved) AND
         (a.last_attempt IS NULL OR a.last_attempt<=?)
-        ORDER BY a.last_attempt NULLS FIRST,e.receipt NULLS FIRST,try_cast(e.id AS BIGINT)
+        ORDER BY a.last_attempt NULLS FIRST,e.receipt NULLS FIRST,try_cast(e.id AS HUGEINT)
         LIMIT 100""",
         [lane, bypass, cold, threshold, now - timedelta(hours=1)],
     ).fetchall()
@@ -208,8 +208,8 @@ def _stale_event_ids(conn, started, after):
                 SELECT p.event_id, NULL, true FROM _parent_repairs p
                 WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id=p.event_id)
             ) WHERE (receipt IS NULL OR receipt<=? OR unresolved)
-            AND (? IS NULL OR try_cast(id AS BIGINT) > ?)
-            ORDER BY try_cast(id AS BIGINT)""",
+            AND (? IS NULL OR try_cast(id AS HUGEINT) > ?)
+            ORDER BY try_cast(id AS HUGEINT)""",
             [started, after, after],
         ).fetchall()
     ]
@@ -245,6 +245,9 @@ def _reconcile_pass(settings, conn, client, stop, counters):
         return {**counters, "source_complete": False}
     stored = current_store.get_state(conn, "full_pass") or {}
     pending = _stale_event_ids(conn, started, stored.get("cursor_after"))
+    if not pending and stored.get("cursor_after") is not None:
+        # Older checkpoints may have advanced past unresolved or oversized IDs.
+        pending = _stale_event_ids(conn, started, None)
     prefetcher = ResponsePrefetcher(client, deadline=stop)
     try:
         while time.monotonic() < stop:

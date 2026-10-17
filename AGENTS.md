@@ -2,7 +2,7 @@
 
 This repository uses the Universal Pad specification for non-trivial agentic work.
 
-**Git** is the source of truth for code. **`scripts/verify`** is the source of truth for verification. **Pad** is the source of truth for intent, scope, status, dependencies, decisions, evidence, and handoffs. This repository has no GitHub Actions workflow.
+**Git** is the source of truth for code. **Local `scripts/verify-fast` and `scripts/verify`** are the source of truth for verification. **Pad** is the source of truth for intent, scope, status, dependencies, decisions, evidence, and handoffs.
 
 Read [`PROJECT_AGENT.md`](PROJECT_AGENT.md) before implementation. It holds repository-specific invariants, stack notes, and the native verification commands wrapped by `scripts/verify-fast` and `scripts/verify`.
 

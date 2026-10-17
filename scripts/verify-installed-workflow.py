@@ -136,15 +136,28 @@ def run_command(
                 code = process.wait(timeout=timeout)
         finally:
             with SIGNALS.hold() as stopped:
+
+                def signal_group(signum):
+                    running = process.poll() is None
+                    try:
+                        os.killpg(process.pid, signum)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        if not running or process.poll() is None:
+                            raise
+                        with suppress(ProcessLookupError):
+                            os.killpg(process.pid, signum)
+
                 try:
-                    with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGTERM)
+                    signal_group(signal.SIGTERM)
                     with suppress(subprocess.TimeoutExpired):
                         process.wait(timeout=5)
                 finally:
-                    with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=5)
+                    try:
+                        signal_group(signal.SIGKILL)
+                    finally:
+                        process.wait(timeout=5)
             if stopped.signum is not None:
                 raise Terminated(stopped.signum)
     if code:
