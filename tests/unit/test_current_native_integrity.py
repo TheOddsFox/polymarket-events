@@ -293,6 +293,69 @@ def test_uint256_max_plus_one_is_retained_as_unusable_without_assets(catalogue, 
     assert publisher.publish(settings, conn)["valid"]
 
 
+@pytest.mark.parametrize(
+    "version,field,json_encoded",
+    [
+        ("v1", "clobTokenIds", False),
+        ("v1", "positionIds", True),
+        ("v2", "positionIds", True),
+        ("v2", "clobTokenIds", False),
+    ],
+)
+def test_oversized_native_id_quarantines_only_its_market(catalogue, version, field, json_encoded):
+    settings, conn = catalogue
+    invalid = market(version)
+    invalid[field][1] = "9" * 5000
+    if json_encoded:
+        invalid[field] = json.dumps(invalid[field])
+    valid = {
+        **market(version),
+        "id": "3",
+        "conditionId": "0x" + "b" * 64,
+        "clobTokenIds": ["31", "32"],
+        "positionIds": ["41", "42"],
+    }
+    rows = project_response(
+        [invalid, valid],
+        "markets",
+        received_at="2026-10-14T00:00:00Z",
+        response_id="oversized-native-id",
+        native_market_ids=["2", "3"],
+    )
+    assert [(row["market_id"], row["usable"]) for row in rows.markets] == [
+        ("2", False),
+        ("3", True),
+    ]
+    assert field in rows.markets[0]["identity_error"]
+    expected = ["31", "32"] if version == "v1" else ["41", "42"]
+    assert [(row["market_id"], row["asset_id"]) for row in rows.outcomes] == [
+        ("3", asset_id) for asset_id in expected
+    ]
+    store.apply(conn, rows)
+    assert conn.execute("SELECT market_id,usable FROM markets ORDER BY market_id").fetchall() == [
+        ("2", False),
+        ("3", True),
+    ]
+    assert conn.execute("SELECT DISTINCT market_id FROM outcomes").fetchall() == [("3",)]
+    assert store.validate_store(conn)["valid"]
+    release = publisher.publish(settings, conn)
+    assert publisher.verify_release(release["path"], settings=settings)["valid"]
+
+
+def test_long_leading_zero_native_id_is_quarantined_as_noncanonical():
+    raw = market("v1")
+    raw["clobTokenIds"][0] = "0" * 5000 + "1"
+    rows = project_response(
+        raw,
+        "markets",
+        received_at="2026-10-14T00:00:00Z",
+        response_id="long-leading-zero-native-id",
+    )
+    assert rows.markets[0]["usable"] is False
+    assert rows.markets[0]["identity_error"] == "clobTokenIds contains a noncanonical native ID"
+    assert rows.outcomes == []
+
+
 @pytest.mark.parametrize("scenario", ["v1-counterpart", "v2-counterpart", "different-asset-kinds"])
 def test_native_uniqueness_respects_optional_counterparts_and_selected_namespaces(
     catalogue, scenario

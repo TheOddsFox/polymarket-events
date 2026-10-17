@@ -186,6 +186,48 @@ def test_refresh_without_a_catalogue_writes_empty_identity_history(tmp_path):
     assert json.loads((tmp_path / "bundle" / "identity_history.json").read_text()) == []
 
 
+@pytest.mark.parametrize(
+    "market_id,field,json_encoded",
+    [("11", "clobTokenIds", True), ("12", "positionIds", False)],
+)
+def test_refresh_quarantines_oversized_native_id_and_keeps_other_market(
+    tmp_path, market_id, field, json_encoded
+):
+    fixture = CurrentGammaServer()
+    catalogue = seeded_catalogue(tmp_path, fixture)
+    before = digest(catalogue.store_path)
+    markets = fixture.markets
+    invalid_ids = ["9" * 5000, "22"]
+    markets[market_id][field] = json.dumps(invalid_ids) if json_encoded else invalid_ids
+    fixture.replace(events={}, markets=markets)
+    output = tmp_path / "bundle"
+    with GammaClient(catalogue.gamma, transport=httpx.MockTransport(fixture.handle)) as client:
+        manifest = metadata.refresh_metadata(
+            catalogue.gamma,
+            catalogue,
+            tmp_path / "producer",
+            ["11", "12"],
+            output,
+            client=client,
+        )
+    assert manifest["contract"] == metadata.CONTRACT
+    assert manifest["http_attempts"] == 2
+    coverage = json.loads((output / "coverage.json").read_text())
+    assert [(row["market_id"], row["status"]) for row in coverage] == [
+        ("11", "found"),
+        ("12", "found"),
+    ]
+    projected = {row["market_id"]: row for row in json.loads((output / "markets.json").read_text())}
+    valid_id = "12" if market_id == "11" else "11"
+    assert projected[market_id]["usable"] is False
+    assert field in projected[market_id]["identity_error"]
+    assert projected[valid_id]["usable"] is True
+    outcomes = json.loads((output / "outcomes.json").read_text())
+    assert len(outcomes) == 2
+    assert {row["market_id"] for row in outcomes} == {valid_id}
+    assert digest(catalogue.store_path) == before
+
+
 def test_metadata_requires_an_explicit_producer_root(tmp_path, capsys):
     code = cli.main(
         [

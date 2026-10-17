@@ -128,9 +128,9 @@ def _asset_ids(value: Any, name: str, count: int) -> list[str] | None:
         if isinstance(item, bool) or not isinstance(item, str | int):
             raise NormalizationError(f"{name} contains an invalid native ID")
         text = str(item)
-        if not text.isascii() or not text.isdigit() or str(int(text)) != text:
+        if not text.isascii() or not text.isdigit() or (text != "0" and text.startswith("0")):
             raise NormalizationError(f"{name} contains a noncanonical native ID")
-        if not 0 < int(text) < 2**256:
+        if len(text) > 78 or not 0 < int(text) < 2**256:
             raise NormalizationError(f"{name} contains an out-of-range native ID")
         result.append(text)
     if len(set(result)) != len(result):

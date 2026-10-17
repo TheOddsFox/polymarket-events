@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Oversized native asset IDs are quarantined as invalid identities without aborting a response.
 - Prefetch handoff keeps completed responses available without a duplicate GET or
   unnecessary request-budget exhaustion.
 - Full-pass completion keeps the measured publication reserve even when cadence
