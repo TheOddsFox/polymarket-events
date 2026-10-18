@@ -117,6 +117,11 @@ page halves the limit and restarts that pass without reusing its old opaque curs
 A single oversized record or persistent request failure remains visible and resumable.
 Durable pages freeze endpoint, parameters, certificate and raw receipt together with
 application progress; raw references retain the existing `raw_id` spelling.
+Periodic keyset reconciliation uses the same bounded native identity repair as
+numeric windows, including nested event markets and durable-page replay. The existing
+100-repair limit, retry cooldown and acquisition deadline still apply. Confirmation
+follows page application; interruption between those operations can leave an identity
+unavailable until it is revisited.
 
 Failed reprobes preserve the working certificate and store diagnostics separately.
 If a successful base proof contradicts the old lifecycle passes while an optional

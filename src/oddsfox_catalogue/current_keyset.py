@@ -342,12 +342,18 @@ def resume_pending(settings, conn, client):
             else None
         ),
     )
-    return {
+    result = {
         "responses": 1,
         "records": len(rows),
         "last_id": last_id,
         "complete": all(item["done"] for item in next_state["lanes"][lane]["passes"].values()),
     }
+    if pending.get("reconcile") is not None and rows:
+        result["identity_repairs"] = {
+            "lane": lane,
+            "ids": [entity_id(row.get("id")) for row in rows],
+        }
+    return result
 
 
 def cold_page(settings, conn, client, lane, *, reconcile_state, now, cycle_started=None):

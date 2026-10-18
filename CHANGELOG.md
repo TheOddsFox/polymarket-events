@@ -29,6 +29,9 @@
 
 ### Fixed
 
+- Periodic keyset reconciliation performs the existing bounded native identity
+  repairs after fresh pages and durable replay, including nested event markets.
+
 - Failed optional capability reprobes preserve working certificates; contradictory
   lifecycle proofs fence acquisition until a successful reprobe. Certificate,
   diagnostic, fence and keyset-state changes commit atomically.

@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
-"""Run the local development gate on POSIX or native Windows."""
-
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-root = Path(__file__).resolve().parents[1]
-env = {**os.environ, "UV_LINK_MODE": "copy"}
-commands = [
-    ["git", "diff", "--check"],
-    ["uv", "run", "--locked", "ruff", "check", "."],
-    ["uv", "run", "--locked", "ruff", "format", "--check", "."],
-    ["uv", "run", "--locked", "pytest", "-q", *sys.argv[1:]],
-]
-for command in commands:
-    command_env = env
-    if "pytest" in command:
-        command_env = {
-            **env,
-            "CATALOGUE_GAMMA_BASE_URL": "http://127.0.0.1:9",
-            "CATALOGUE_GAMMA_ALLOW_LOOPBACK": "1",
-        }
-    subprocess.run(command, cwd=root, env=command_env, check=True)
+ROOT = Path(__file__).resolve().parent.parent
+COMMANDS = [(['git', 'diff', '--check'], {'UV_LINK_MODE': 'copy'}), (['uv', 'run', '--locked', 'ruff', 'check', '.'], {'UV_LINK_MODE': 'copy'}), (['uv', 'run', '--locked', 'ruff', 'format', '--check', '.'], {'UV_LINK_MODE': 'copy'}), (['uv', 'run', '--locked', 'pytest', '-q'], {'UV_LINK_MODE': 'copy', 'CATALOGUE_GAMMA_BASE_URL': 'http://127.0.0.1:9', 'CATALOGUE_GAMMA_ALLOW_LOOPBACK': '1'})]
+def accepts_pytest_args(argv):
+    return argv[0] == "pytest" or any(argv[index:index + 2] == ["-m", "pytest"] for index in range(len(argv) - 1)) or (argv[:2] == ["uv", "run"] and "pytest" in argv[2:])
+for configured, additions in COMMANDS:
+    argv = list(configured)
+    if accepts_pytest_args(argv):
+        argv.extend(sys.argv[1:])
+    env = os.environ.copy()
+    env.update(additions)
+    subprocess.run(argv, check=True, cwd=ROOT, env=env)

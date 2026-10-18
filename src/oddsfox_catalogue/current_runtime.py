@@ -197,6 +197,7 @@ def _execute(settings, operation, options, deadline):
             max_duration_s=settings.limits.max_duration_s,
             deadline=acquisition_deadline,
         ) as client:
+            resumed_repair_counter = {"responses": 0}
             try:
                 if operation == "probe":
                     try:
@@ -230,7 +231,18 @@ def _execute(settings, operation, options, deadline):
                     result = _persist_probe_result(conn, result, options, probe_options)
                 else:
                     try:
-                        resume_pending(settings, conn, client)
+                        resumed = resume_pending(settings, conn, client)
+                        from .current_reconcile import _now, repair_resumed_identities
+
+                        repair_resumed_identities(
+                            settings,
+                            conn,
+                            client,
+                            resumed,
+                            now=_now(),
+                            stop=acquisition_deadline,
+                            response_counter=resumed_repair_counter,
+                        )
                         if operation == "refresh":
                             result = discover(settings, conn, client, deadline=deadline)
                             from .current_reconcile import repair_pending
@@ -255,6 +267,10 @@ def _execute(settings, operation, options, deadline):
                             "source_complete": False,
                             "budget_exhausted": True,
                         }
+                    if resumed_repair_counter["responses"]:
+                        result["responses"] = (
+                            result.get("responses", 0) + resumed_repair_counter["responses"]
+                        )
                     acquired = time.monotonic()
                     completed = (get_state(conn, "full_pass") or {}).get("completed_at")
                     just_completed = options.get("full_pass") and completed not in (

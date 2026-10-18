@@ -68,6 +68,48 @@ def _attempt(conn, lane, ids, now):
     current_store.record_attempts(conn, lane, ids, now)
 
 
+def repair_identities(settings, conn, client, lane, ids, now, stop, *, response_counter=None):
+    """Confirm changed or invalid native identities related to one applied batch."""
+    if not ids or time.monotonic() >= stop:
+        return 0
+    _initialize(conn)
+    repairs = conn.execute(
+        """SELECT DISTINCT m.market_id FROM markets m
+        LEFT JOIN _reconcile_attempts a ON a.kind='native' AND a.id=m.market_id
+        WHERE NOT m.usable
+        AND (a.last_attempt IS NULL OR a.last_attempt<=?) AND (
+            (?='markets' AND m.market_id IN (SELECT unnest(?))) OR
+            (?='events' AND EXISTS (SELECT 1 FROM event_markets e
+                WHERE e.market_id=m.market_id AND e.event_id IN (SELECT unnest(?)))))
+        ORDER BY m.market_id LIMIT 100""",
+        [
+            now - timedelta(hours=1),
+            lane,
+            [str(key) for key in ids],
+            lane,
+            [str(key) for key in ids],
+        ],
+    ).fetchall()
+    responses = 0
+    for (key,) in repairs:
+        if time.monotonic() >= stop:
+            break
+        count = fetch_apply(
+            settings,
+            conn,
+            client,
+            "markets",
+            [key],
+            native=True,
+            attempts=("native", [key], now),
+        )["responses"]
+        if response_counter is None:
+            responses += count
+        else:
+            response_counter["responses"] += count
+    return responses
+
+
 def _cold(conn, settings, now, state, *, pass_started=None):
     discovery = current_store.get_state(conn, "discovery", {}).get("lanes", {})
     for offset in range(4):
@@ -351,38 +393,12 @@ def _reconcile_pass(settings, conn, client, stop, counters):
                 state = dict(current_store.get_state(conn, "full_pass") or {})
                 state["cursor_after"] = int(advance)
                 current_store.set_state(conn, "full_pass", state)
-            repairs = conn.execute(
-                """SELECT DISTINCT m.market_id FROM markets m
-                LEFT JOIN _reconcile_attempts a ON a.kind='native' AND a.id=m.market_id
-                WHERE NOT m.usable
-                AND (a.last_attempt IS NULL OR a.last_attempt<=?) AND (
-                    (?='markets' AND m.market_id IN (SELECT unnest(?))) OR
-                    (?='events' AND EXISTS (SELECT 1 FROM event_markets e
-                        WHERE e.market_id=m.market_id AND e.event_id IN (SELECT unnest(?)))))
-                ORDER BY m.market_id LIMIT 100""",
-                [
-                    now - timedelta(hours=1),
-                    lane,
-                    [str(key) for key in ids],
-                    lane,
-                    [str(key) for key in ids],
-                ],
-            ).fetchall()
-            for (key,) in repairs:
-                if time.monotonic() >= stop:
-                    break
-                try:
-                    counters["responses"] += fetch_apply(
-                        settings,
-                        conn,
-                        client,
-                        "markets",
-                        [key],
-                        native=True,
-                        attempts=("native", [key], now),
-                    )["responses"]
-                except (CaptureStopped, RequestBudgetExceeded):
-                    return {**counters, "source_complete": False}
+            try:
+                repair_identities(
+                    settings, conn, client, lane, ids, now, stop, response_counter=counters
+                )
+            except (CaptureStopped, RequestBudgetExceeded):
+                return {**counters, "source_complete": False}
     finally:
         prefetcher.close()
     return {**counters, "source_complete": False}
@@ -404,7 +420,11 @@ def _reconcile_units(settings, conn, client, *, deadline):
         return {**counters, "source_complete": False}
     # Frozen foreign checkpoints must finish before this scheduler advances its own state.
     try:
-        counters["responses"] += resume_pending(settings, conn, client)["responses"]
+        resumed = resume_pending(settings, conn, client)
+        counters["responses"] += resumed["responses"]
+        repair_resumed_identities(
+            settings, conn, client, resumed, now=_now(), stop=stop, response_counter=counters
+        )
     except (CaptureStopped, RequestBudgetExceeded):
         return {**counters, "source_complete": False}
     _initialize(conn)
@@ -468,6 +488,12 @@ def _reconcile_units(settings, conn, client, *, deadline):
                 break
             counters["responses"] += result.get("responses", 0)
             counters["cold_batches"] += 1
+            try:
+                repair_resumed_identities(
+                    settings, conn, client, result, now=now, stop=stop, response_counter=counters
+                )
+            except (CaptureStopped, RequestBudgetExceeded):
+                return {**counters, "source_complete": False}
             if result.get("complete"):
                 state["windows"][lane] = {"next": 1, "cycle": window["started_at"]}
                 current_store.set_state(conn, "reconcile", state)
@@ -494,39 +520,30 @@ def _reconcile_units(settings, conn, client, *, deadline):
             except (CaptureStopped, RequestBudgetExceeded):
                 break
         # Only changed/invalid identities need native confirmation; one ID per budget check.
-        repairs = conn.execute(
-            """SELECT DISTINCT m.market_id FROM markets m
-            LEFT JOIN _reconcile_attempts a ON a.kind='native' AND a.id=m.market_id
-            WHERE NOT m.usable
-            AND (a.last_attempt IS NULL OR a.last_attempt<=?) AND (
-                (?='markets' AND m.market_id IN (SELECT unnest(?))) OR
-                (?='events' AND EXISTS (SELECT 1 FROM event_markets e
-                    WHERE e.market_id=m.market_id AND e.event_id IN (SELECT unnest(?)))))
-            ORDER BY m.market_id LIMIT 100""",
-            [
-                now - timedelta(hours=1),
-                lane,
-                [str(key) for key in ids],
-                lane,
-                [str(key) for key in ids],
-            ],
-        ).fetchall()
-        for (key,) in repairs:
-            if time.monotonic() >= stop:
-                break
-            try:
-                counters["responses"] += fetch_apply(
-                    settings,
-                    conn,
-                    client,
-                    "markets",
-                    [key],
-                    native=True,
-                    attempts=("native", [key], now),
-                )["responses"]
-            except (CaptureStopped, RequestBudgetExceeded):
-                return {**counters, "source_complete": False}
+        try:
+            repair_identities(
+                settings, conn, client, lane, ids, now, stop, response_counter=counters
+            )
+        except (CaptureStopped, RequestBudgetExceeded):
+            return {**counters, "source_complete": False}
     return {**counters, "source_complete": False}
+
+
+def repair_resumed_identities(settings, conn, client, resumed, *, now, stop, response_counter=None):
+    """Repair native identities reported by an applied keyset cold page."""
+    repair = resumed.get("identity_repairs")
+    if repair is None:
+        return 0
+    return repair_identities(
+        settings,
+        conn,
+        client,
+        repair["lane"],
+        repair["ids"],
+        now,
+        stop,
+        response_counter=response_counter,
+    )
 
 
 def repair_pending(settings, conn, client, *, deadline):
