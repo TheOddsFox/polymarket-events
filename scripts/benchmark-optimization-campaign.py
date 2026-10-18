@@ -3,6 +3,8 @@
 
 Version 1 manifests retain the binding-first workflow. Version 2 compares the
 outcome-grouping and queue candidates independently against one common baseline.
+Version 3 evaluates claim, queue and certified-acquisition candidates against a
+common baseline with workload-specific evidence.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import signal
 import stat
 import subprocess
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 HARNESS_PATH = Path(__file__).with_name("benchmark-full-pass.py")
 SPEC = importlib.util.spec_from_file_location("optimization_full_pass", HARNESS_PATH)
@@ -24,6 +26,7 @@ bench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bench)
 
 CAMPAIGN_BUDGET_S = 1800.0
+V3_CAMPAIGN_BUDGET_S = 10800.0
 VARIANTS = {
     "outcome_grouping": "current_store.py",
     "queue": "current_reconcile.py",
@@ -31,6 +34,30 @@ VARIANTS = {
 }
 MANIFEST_KEYS = {"baseline", "binding", *VARIANTS}
 V2_CANDIDATES = {"outcome_grouping", "queue"}
+V3_CANDIDATES = ("claims", "queue", "closed_any", "keyset")
+V3_OWNERSHIP = {
+    "claims": {
+        "current_store.py",
+        "current_config.py",
+        "current_runtime.py",
+        "cli.py",
+        "current_claim_indexes.py",
+    },
+    "queue": {"current_reconcile.py"},
+    "closed_any": {
+        "current_sync.py",
+        "current_runtime.py",
+        "cli.py",
+    },
+    "keyset": {
+        "current_sync.py",
+        "current_runtime.py",
+        "cli.py",
+        "current_reconcile.py",
+        "current_keyset.py",
+    },
+}
+V3_PRIORITY = V3_CANDIDATES
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -58,8 +85,37 @@ def _load_manifest(path: Path) -> dict:
         if not {"baseline", "binding"}.issubset(data) or not set(data).issubset(MANIFEST_KEYS):
             raise ValueError("legacy manifest requires baseline and binding package entries")
         return {**data, "_version": 1}
-    if type(data.get("version")) is not int or data["version"] != 2:
-        raise ValueError("manifest version must be integer 2")
+    if type(data.get("version")) is not int or data["version"] not in {2, 3}:
+        raise ValueError("manifest version must be integer 2 or 3")
+    if data["version"] == 3:
+        if set(data) - {"version", "baseline", "candidates", "combinations", "claims_mode"}:
+            raise ValueError("version 3 manifest contains unknown fields")
+        claims_mode = data.get("claims_mode", "indexed")
+        if type(claims_mode) is not str or claims_mode not in {"lookup_only", "indexed"}:
+            raise ValueError("version 3 claims_mode must be 'lookup_only' or 'indexed'")
+        candidates = data.get("candidates")
+        if not isinstance(candidates, dict) or set(candidates) != set(V3_CANDIDATES):
+            raise ValueError("version 3 manifest requires claims, queue, closed_any and keyset")
+        combinations = data.get("combinations", {})
+        if not isinstance(combinations, dict):
+            raise ValueError("version 3 combinations must be an object")
+        normalized = {
+            "_version": 3,
+            "_claims_mode": claims_mode,
+            "baseline": data.get("baseline"),
+        }
+        normalized.update(candidates)
+        for feature_key, entry in combinations.items():
+            features = feature_key.split("+") if isinstance(feature_key, str) else []
+            if (
+                len(features) < 2
+                or features != sorted(set(features))
+                or not set(features).issubset(V3_CANDIDATES)
+                or feature_key != "+".join(features)
+            ):
+                raise ValueError("combination keys must be sorted feature names joined by '+'")
+            normalized[f"_combination:{feature_key}"] = entry
+        return normalized
     if set(data) != {"version", "baseline", "candidates"}:
         raise ValueError("version 2 manifest requires only version, baseline and candidates")
     candidates = data["candidates"]
@@ -87,13 +143,18 @@ def _entry_path(entry: object, manifest_path: Path) -> tuple[Path, dict[str, str
     for name, value in expected.items():
         if (
             not isinstance(name, str)
-            or Path(name).is_absolute()
-            or ".." in Path(name).parts
-            or Path(name).suffix != ".py"
+            or "\\" in name
+            or name.startswith("/")
+            or any(part in {"", ".", ".."} for part in name.split("/"))
+            or ":" in name
+            or PurePosixPath(name).is_absolute()
+            or PurePosixPath(name).suffix != ".py"
             or not isinstance(value, str)
             or not HEX_SHA256.fullmatch(value)
         ):
             raise ValueError("manifest source hash inventory is malformed")
+    if len({name.casefold() for name in expected}) != len(expected):
+        raise ValueError("manifest source hash inventory has case-colliding paths")
     return package, expected
 
 
@@ -102,15 +163,23 @@ def _validate_package_tree(package: Path, budget=None) -> list[Path]:
     if not package.is_dir():
         raise ValueError("runtime package must be a regular directory")
     paths = []
+    portable_names: set[str] = set()
     for path in sorted(package.rglob("*")):
         if budget:
             budget.admit(0.001)
+        if bench.is_link_or_reparse(path):
+            raise ValueError("runtime package contains a link or reparse point")
         mode = path.lstat().st_mode
         if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
             raise ValueError("runtime package contains a symlink or special file")
         if stat.S_ISREG(mode):
             if path.suffix != ".py":
                 raise ValueError("runtime package contains non-source files")
+            portable_name = path.relative_to(package).as_posix()
+            folded_name = portable_name.casefold()
+            if folded_name in portable_names:
+                raise ValueError("runtime package contains case-colliding source paths")
+            portable_names.add(folded_name)
             paths.append(path)
     return paths
 
@@ -128,7 +197,7 @@ def _hash_package(package: Path, budget=None) -> dict[str, str]:
                 if not block:
                     break
                 digest.update(block)
-        result[str(path.relative_to(package))] = digest.hexdigest()
+        result[path.relative_to(package).as_posix()] = digest.hexdigest()
     return result
 
 
@@ -145,7 +214,7 @@ def _preflight_paths(manifest, manifest_path: Path, output: Path) -> dict:
     paths = {
         name: _entry_path(entry, manifest_path)
         for name, entry in manifest.items()
-        if name != "_version"
+        if name not in {"_version", "_claims_mode"}
     }
     package_paths = [package for package, _expected in paths.values()]
     for package in package_paths:
@@ -235,6 +304,94 @@ def _freeze_packages(resolved: dict, output: Path, budget) -> dict:
     return {"packages": frozen, "provenance": originals}
 
 
+def _validate_v3_ownership(baseline_hashes, candidate_hashes, allowed, label):
+    removed = set(baseline_hashes) - set(candidate_hashes)
+    added = set(candidate_hashes) - set(baseline_hashes)
+    changed = {
+        name
+        for name in set(baseline_hashes) & set(candidate_hashes)
+        if baseline_hashes[name] != candidate_hashes[name]
+    }
+    if removed:
+        raise ValueError(f"{label} removes source files from the baseline")
+    changed.update(added)
+    if changed - allowed:
+        raise ValueError(f"{label} changes files outside its ownership allowlist")
+    return bool(changed)
+
+
+def _changed_v3_files(baseline_hashes, candidate_hashes):
+    return {
+        name
+        for name in set(baseline_hashes) | set(candidate_hashes)
+        if baseline_hashes.get(name) != candidate_hashes.get(name)
+    }
+
+
+def _v3_allowed_ownership(feature, claims_mode):
+    if feature == "claims" and claims_mode == "lookup_only":
+        return {"current_store.py"}
+    return V3_OWNERSHIP[feature]
+
+
+def _freeze_v3_packages(resolved, output, budget, claims_mode="indexed"):
+    frozen, provenance = {}, {}
+    for name, (source, expected_hashes) in resolved.items():
+        budget.admit(1)
+        target_name = name.removeprefix("_combination:")
+        target = output / "inputs" / target_name / "oddsfox_catalogue"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tree_bounded(source, target, budget)
+        actual = _hash_package(target, budget)
+        if actual != expected_hashes:
+            raise ValueError(f"package changed while it was being frozen: {name}")
+        frozen[name] = target
+        provenance[name] = {"path": str(source), "source_hashes": actual}
+
+    baseline_hashes = _hash_package(frozen["baseline"], budget)
+    candidate_changes = {}
+    for name in V3_CANDIDATES:
+        if name not in frozen:
+            continue
+        candidate_hashes = _hash_package(frozen[name], budget)
+        candidate_changes[name] = _changed_v3_files(baseline_hashes, candidate_hashes)
+        provenance[name]["eligible"] = _validate_v3_ownership(
+            baseline_hashes,
+            candidate_hashes,
+            _v3_allowed_ownership(name, claims_mode),
+            name,
+        )
+        if not provenance[name]["eligible"]:
+            provenance[name]["deferred_reason"] = "candidate is identical to baseline"
+    for name in frozen:
+        if not name.startswith("_combination:"):
+            continue
+        feature_key = name.partition(":")[2]
+        features = feature_key.split("+")
+        allowed = set().union(
+            *(_v3_allowed_ownership(feature, claims_mode) for feature in features)
+        )
+        provenance[name]["features"] = features
+        combination_hashes = _hash_package(frozen[name], budget)
+        combination_changes = _changed_v3_files(baseline_hashes, combination_hashes)
+        missing_features = [
+            feature
+            for feature in features
+            if not (candidate_changes.get(feature, set()) & combination_changes)
+        ]
+        if missing_features:
+            raise ValueError(
+                f"{name} contains no changed files for declared features: "
+                + ", ".join(missing_features)
+            )
+        provenance[name]["eligible"] = _validate_v3_ownership(
+            baseline_hashes, combination_hashes, allowed, name
+        )
+        if not provenance[name]["eligible"]:
+            provenance[name]["deferred_reason"] = "combination is identical to baseline"
+    return {"packages": frozen, "provenance": provenance}
+
+
 def _copy_package(source: Path, target: Path, budget) -> str:
     _copy_tree_bounded(source, target, budget)
     return bench.canonical_hash(_hash_package(target, budget))
@@ -267,11 +424,15 @@ def _campaign_provenance(budget) -> dict:
         Path(bench.__file__).resolve(),
         Path(bench.REPO) / "tests" / "fakes" / "world.py",
         Path(bench.REPO) / "tests" / "fakes" / "capacity_source.py",
+        Path(bench.REPO) / "src" / "oddsfox_catalogue" / "platform_support.py",
+        Path(bench.REPO) / "src" / "oddsfox_catalogue" / "_windows.py",
+        Path(bench.REPO) / "src" / "oddsfox_catalogue" / "_process_gate.py",
+        Path(bench.REPO) / "scripts" / "verify-installed-workflow.py",
     ]
     return {
         "git_revision": revision,
         "source_hashes": {
-            str(path.relative_to(bench.REPO)): _digest_bounded(path, budget) for path in paths
+            path.relative_to(bench.REPO).as_posix(): _digest_bounded(path, budget) for path in paths
         },
     }
 
@@ -520,8 +681,11 @@ def _run_v2(seed, output, budget, warmed, report, packages, provenance, seed_has
     budget.holdback_s = 15.0
 
 
-def _stage_sample(seed, output, package, budget, label, warmup=False):
-    return bench.run_sample(seed, output, package, budget, "perf", label, warmup=warmup)
+def _stage_sample(seed, output, package, budget, label, warmup=False, workload=None):
+    kwargs = {"warmup": warmup}
+    if workload is not None:
+        kwargs["workload"] = workload
+    return bench.run_sample(seed, output, package, budget, "perf", label, **kwargs)
 
 
 def _save_stage_sample(report, output, stage, row, category, pair=None):
@@ -536,24 +700,62 @@ def _save_stage_sample(report, output, stage, row, category, pair=None):
     return row
 
 
-def _warm(runtime_name, package, seed, output, budget, warmed, report):
+def _warm(runtime_name, package, seed, output, budget, warmed, report, workload=None):
     source_hash = bench.canonical_hash(_hash_package(package, budget))
-    if source_hash in warmed:
-        return
+    key = (source_hash, workload)
+    warmup_key = runtime_name if workload is None else f"{runtime_name}:{workload}"
+    if key in warmed:
+        if warmup_key not in report.get("warmups", {}):
+            existing = next(
+                (
+                    row
+                    for row in report.get("warmups", {}).values()
+                    if row.get("source_hash") == source_hash
+                    and row.get("workload", row["sample"].get("workload")) == workload
+                ),
+                None,
+            )
+            if existing is not None:
+                report["warmups"][warmup_key] = existing
+                return
+        else:
+            return
+        # A caller may reuse the warmed set with a fresh report. Without the
+        # sample in this report, rerun rather than create an incomplete alias.
+        warmed.discard(key)
     warm_dir = output / "warmups" / source_hash[:16]
+    if workload is not None:
+        warm_dir /= workload
     warm_dir.mkdir(parents=True)
-    sample = _stage_sample(seed, warm_dir, package, budget, f"warm-{source_hash[:10]}")
-    warmed.add(source_hash)
-    report.setdefault("warmups", {})[runtime_name] = {
+    sample = _stage_sample(
+        seed, warm_dir, package, budget, f"warm-{source_hash[:10]}", workload=workload
+    )
+    warmed.add(key)
+    report.setdefault("warmups", {})[warmup_key] = {
         "source_hash": source_hash,
+        "workload": workload,
         "sample": sample,
     }
     bench._save(output / "report.json", report)
 
 
-def _compare_stage(stage, left_name, left, right_name, right, seed, output, budget, warmed, report):
-    _warm(left_name, left, seed, output, budget, warmed, report)
-    _warm(right_name, right, seed, output, budget, warmed, report)
+def _compare_stage(
+    stage,
+    left_name,
+    left,
+    right_name,
+    right,
+    seed,
+    output,
+    budget,
+    warmed,
+    report,
+    *,
+    workload=None,
+    comparison=None,
+):
+    _warm(left_name, left, seed, output, budget, warmed, report, workload)
+    _warm(right_name, right, seed, output, budget, warmed, report, workload)
     rows = {left_name: [], right_name: []}
     order = (
         (left_name, left),
@@ -564,20 +766,396 @@ def _compare_stage(stage, left_name, left, right_name, right, seed, output, budg
         (right_name, right),
     )
     for index, (name, package) in enumerate(order, 1):
-        sample = _stage_sample(seed, output, package, budget, f"{stage}-{index:02d}-{name}")
+        sample = _stage_sample(
+            seed, output, package, budget, f"{stage}-{index:02d}-{name}", workload=workload
+        )
         pair = (index + 1) // 2
         sample = _save_stage_sample(report, output, stage, sample, name, pair)
         rows[name].append(sample)
-    scored = bench.comparison(rows[left_name], rows[right_name], "perf")
+    scored = (
+        comparison(rows[left_name], rows[right_name])
+        if comparison
+        else bench.comparison(rows[left_name], rows[right_name], "perf")
+    )
     stage_report = report["stages"][stage]
     stage_report.update(
         status=scored["status"],
         comparison=scored,
         left=left_name,
         right=right_name,
+        workload=workload,
     )
     bench._save(output / "report.json", report)
     return scored
+
+
+def _v3_workloads(candidate):
+    if candidate in {"claims", "queue"}:
+        return (None,)
+    if candidate == "closed_any":
+        return ("closed_any",)
+    return ("discovery_sparse", "discovery_dense", "discovery_tail")
+
+
+def _best_v3_candidate(report):
+    qualified = report.get("qualified_candidates", {})
+    return next((name for name in V3_PRIORITY if name in qualified), None)
+
+
+def _api_compare(baseline, candidate, workload):
+    try:
+        return bench.api_comparison(baseline, candidate, workload)
+    except ValueError as exc:
+        return {"status": "invalid", "reason": str(exc)}
+
+
+def _verify_api_seeds(api_seeds, output, budget):
+    for workload, metadata in api_seeds.items():
+        root = output / "api-seeds" / workload
+        for component in ("provider", "workspace"):
+            expected = metadata.get(f"{component}_seed_sha256")
+            actual = _digest_bounded(root / component / "catalogue.duckdb", budget)
+            if actual != expected:
+                raise CampaignIntegrityError(
+                    f"API workload {component} seed changed during campaign: {workload}"
+                )
+        if _digest_bounded(root / "api-seed.json", budget) != metadata.get("_manifest_sha256"):
+            raise CampaignIntegrityError(
+                f"API workload manifest changed during campaign: {workload}"
+            )
+
+
+def _run_v3(
+    seed,
+    output,
+    budget,
+    warmed,
+    report,
+    packages,
+    provenance,
+    seed_hash,
+    harness,
+    claims_mode="indexed",
+):
+    report["retained"] = []
+    report["qualified_candidates"] = {}
+    report.setdefault("api_seed_errors", {})
+    budget.holdback_s = 15.0
+    api_seeds = {}
+    api_harness_available = hasattr(bench, "API_WORKLOADS") and hasattr(bench, "prepare_api_seed")
+
+    def ensure_api_seed(workload):
+        if not api_harness_available:
+            return False
+        if workload in api_seeds:
+            return True
+        root = output / "api-seeds" / workload
+        try:
+            metadata = bench.prepare_api_seed(root, workload, budget, packages["baseline"])
+        except (TimeoutError, subprocess.TimeoutExpired, CampaignIntegrityError):
+            raise
+        except Exception as exc:
+            report["api_seed_errors"][workload] = type(exc).__name__
+            bench._save(output / "report.json", report)
+            return False
+        if metadata.get("status") != "prepared":
+            raise ValueError(
+                metadata.get("message", f"API workload preparation failed: {workload}")
+            )
+        expected_runtime_hashes = _hash_package(packages["baseline"], budget)
+        if metadata.get("runtime_source_hashes") != expected_runtime_hashes:
+            raise CampaignIntegrityError(f"API workload runtime provenance mismatch: {workload}")
+        for component in ("provider", "workspace"):
+            expected = metadata.get(f"{component}_seed_sha256")
+            actual = _digest_bounded(root / component / "catalogue.duckdb", budget)
+            if expected != actual:
+                raise CampaignIntegrityError(
+                    f"API workload {component} seed hash mismatch: {workload}"
+                )
+        metadata["_manifest_sha256"] = _digest_bounded(root / "api-seed.json", budget)
+        api_seeds[workload] = metadata
+        report["api_workloads"] = api_seeds
+        bench._save(output / "report.json", report)
+        return True
+
+    first_comparison_duration = None
+    for candidate in V3_PRIORITY:
+        if candidate not in packages or not provenance[candidate].get("eligible"):
+            continue
+        if candidate == "claims" and claims_mode == "indexed":
+            if hasattr(bench, "claim_resource_diagnostics"):
+                diagnostics_dir = output / "claim-resource-diagnostics"
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    diagnostics = bench.claim_resource_diagnostics(
+                        packages[candidate], diagnostics_dir, budget
+                    )
+                except TimeoutError:
+                    raise
+                except Exception as exc:
+                    diagnostics = {
+                        "status": "failed",
+                        "resource_gate": False,
+                        "reason": f"claim resource diagnostics failed: {type(exc).__name__}",
+                    }
+                report["claim_resource_diagnostics"] = diagnostics
+                if diagnostics.get("resource_gate") is not True:
+                    report["deferred"][candidate] = diagnostics.get(
+                        "reason", "insufficient_evidence: claim index resource gate failed"
+                    )
+                else:
+                    report["deferred"][candidate] = (
+                        "insufficient_evidence: indexed steady-state full-pass samples and "
+                        "per-sample supervised index installation are unavailable"
+                    )
+            else:
+                report["claim_resource_diagnostics"] = {
+                    "status": "unavailable",
+                    "resource_gate": False,
+                    "reason": "claim-scale index installation diagnostics are unavailable",
+                }
+                report["deferred"][candidate] = (
+                    "insufficient_evidence: claim-scale index installation diagnostics are unavailable"
+                )
+            bench._save(output / "report.json", report)
+            continue
+        if candidate == "claims":
+            report.setdefault("candidate_descriptions", {})[candidate] = (
+                "Selective lookup without indexes"
+            )
+        if first_comparison_duration is not None:
+            budget.holdback_s = 15.0 + 1.25 * first_comparison_duration
+        workloads = _v3_workloads(candidate)
+        missing_workload = next(
+            (
+                workload
+                for workload in workloads
+                if workload is not None and not ensure_api_seed(workload)
+            ),
+            None,
+        )
+        if missing_workload is not None:
+            error = report["api_seed_errors"].get(missing_workload)
+            report["deferred"][candidate] = (
+                f"insufficient_evidence: workload seed preparation failed ({error})"
+                if error
+                else "insufficient_evidence: workload harness unavailable"
+            )
+            continue
+
+        estimates = []
+        for workload in workloads:
+            seed_for = seed if workload is None else output / "api-seeds" / workload
+            _warm(
+                "baseline", packages["baseline"], seed_for, output, budget, warmed, report, workload
+            )
+            _warm(
+                candidate, packages[candidate], seed_for, output, budget, warmed, report, workload
+            )
+            left_key = "baseline" if workload is None else f"baseline:{workload}"
+            right_key = candidate if workload is None else f"{candidate}:{workload}"
+            left_wall = report["warmups"][left_key]["sample"]["wall_s"]
+            right_wall = report["warmups"][right_key]["sample"]["wall_s"]
+            estimates.append(1.25 * 3 * (left_wall + right_wall))
+        estimate = sum(estimates)
+        report.setdefault("admission", {})[candidate] = {
+            "projected_scored_seconds": estimate,
+            "headroom_fraction": 0.25,
+            "integrity_reserve_seconds": 15.0,
+            "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
+        }
+        if estimate > budget.remaining:
+            report["deferred"][candidate] = (
+                "insufficient_evidence: complete paired workload set does not fit shared budget"
+            )
+            bench._save(output / "report.json", report)
+            continue
+
+        comparison_started = time.monotonic()
+        results = []
+        for workload in workloads:
+            seed_for = seed if workload is None else output / "api-seeds" / workload
+            compare = (
+                None
+                if workload is None
+                else lambda baseline, candidate_rows, w=workload: _api_compare(
+                    baseline, candidate_rows, w
+                )
+            )
+            result = _compare_stage(
+                f"{candidate}_vs_baseline_{workload or 'full_pass'}",
+                "baseline",
+                packages["baseline"],
+                candidate,
+                packages[candidate],
+                seed_for,
+                output,
+                budget,
+                warmed,
+                report,
+                workload=workload,
+                comparison=compare,
+            )
+            results.append(result)
+            if result.get("status") != "qualified":
+                break
+        _assert_campaign_provenance(harness, budget)
+        _verify_api_seeds(api_seeds, output, budget)
+        comparison_duration = time.monotonic() - comparison_started
+        report.setdefault("comparison_durations", {})[candidate] = comparison_duration
+        if len(results) == len(workloads) and all(
+            row.get("status") == "qualified" for row in results
+        ):
+            report["qualified_candidates"][candidate] = {
+                "comparisons": results,
+                "workloads": list(workloads),
+            }
+            if first_comparison_duration is None:
+                first_comparison_duration = comparison_duration
+        else:
+            failed = next((row for row in results if row.get("status") != "qualified"), {})
+            report["deferred"][candidate] = failed.get("reason", failed.get("status", "incomplete"))
+        bench._save(output / "report.json", report)
+
+    qualified = list(report["qualified_candidates"])
+    if not qualified:
+        report["status"] = "insufficient_evidence" if report["deferred"] else "deferred"
+        return
+    _verify_api_seeds(api_seeds, output, budget)
+    if len(qualified) == 1:
+        chosen = qualified[0]
+        report["retained"] = [chosen]
+        report["status"] = "qualified"
+        report["final_combination"] = {
+            "status": "reused_independent_evidence",
+            "features": [chosen],
+        }
+        budget.holdback_s = 15.0
+        return
+
+    feature_key = "+".join(sorted(qualified))
+    combination_key = f"_combination:{feature_key}"
+    combination = packages.get(combination_key)
+    if combination is None or not provenance[combination_key].get("eligible"):
+        chosen = _best_v3_candidate(report)
+        report["retained"] = [chosen]
+        report["status"] = "qualified_individual_combination_deferred"
+        report["deferred"]["combination"] = "exact qualified feature-set package is unavailable"
+        report["final_combination"] = {"status": "deferred", "features": qualified}
+        budget.holdback_s = 15.0
+        return
+
+    budget.holdback_s = 15.0
+    workloads = []
+    for candidate in qualified:
+        for workload in _v3_workloads(candidate):
+            if workload not in workloads:
+                workloads.append(workload)
+    for workload in workloads:
+        if workload is not None and not ensure_api_seed(workload):
+            chosen = _best_v3_candidate(report)
+            report["retained"] = [chosen] if chosen else []
+            report["status"] = (
+                "qualified_individual_combination_deferred" if chosen else "insufficient_evidence"
+            )
+            report["deferred"]["combination"] = "required workload harness is unavailable"
+            return
+    combination_hashes = _hash_package(combination, budget)
+    report["final_combination_source_hashes"] = combination_hashes
+    estimate = 0.0
+    for workload in workloads:
+        seed_for = seed if workload is None else output / "api-seeds" / workload
+        _warm("baseline", packages["baseline"], seed_for, output, budget, warmed, report, workload)
+        _warm("final_combination", combination, seed_for, output, budget, warmed, report, workload)
+        left_key = "baseline" if workload is None else f"baseline:{workload}"
+        right_key = "final_combination" if workload is None else f"final_combination:{workload}"
+        estimate += (
+            1.25
+            * 3
+            * (
+                report["warmups"][left_key]["sample"]["wall_s"]
+                + report["warmups"][right_key]["sample"]["wall_s"]
+            )
+        )
+    report["final_combination_projected_seconds"] = estimate
+    if estimate > budget.remaining:
+        chosen = _best_v3_candidate(report)
+        report["retained"] = [chosen]
+        report["status"] = "qualified_individual_combination_deferred"
+        report["deferred"]["combination"] = (
+            "insufficient_evidence: final comparison reserve unavailable"
+        )
+        return
+    results = []
+    for workload in workloads:
+        seed_for = seed if workload is None else output / "api-seeds" / workload
+        compare = (
+            None
+            if workload is None
+            else lambda baseline, candidate_rows, w=workload: _api_compare(
+                baseline, candidate_rows, w
+            )
+        )
+        result = _compare_stage(
+            f"final_combination_vs_baseline_{workload or 'full_pass'}",
+            "baseline",
+            packages["baseline"],
+            "final_combination",
+            combination,
+            seed_for,
+            output,
+            budget,
+            warmed,
+            report,
+            workload=workload,
+            comparison=compare,
+        )
+        results.append(result)
+        if result.get("status") != "qualified":
+            break
+    if len(results) == len(workloads) and all(row.get("status") == "qualified" for row in results):
+        _verify_api_seeds(api_seeds, output, budget)
+        if _hash_package(combination, budget) != combination_hashes:
+            raise CampaignIntegrityError("combination package changed during its measured stage")
+        report["retained"] = [*qualified, "combined"]
+        report["status"] = "qualified"
+        report["final_combination"] = {
+            "status": "qualified",
+            "features": qualified,
+            "comparisons": results,
+        }
+    else:
+        _verify_api_seeds(api_seeds, output, budget)
+        if _hash_package(combination, budget) != combination_hashes:
+            raise CampaignIntegrityError("combination package changed during its measured stage")
+        chosen = _best_v3_candidate(report)
+        failed = next((row for row in results if row.get("status") != "qualified"), {})
+        report["retained"] = [chosen]
+        report["status"] = "qualified_individual_combination_deferred"
+        report["deferred"]["combination"] = failed.get(
+            "reason", failed.get("status", "incomplete comparison")
+        )
+        report["final_combination"] = {
+            "status": failed.get("status", "deferred"),
+            "features": qualified,
+            "comparisons": results,
+        }
+
+
+def _retain_v3_candidate(report, packages, provenance, seed, seed_hash, harness, budget):
+    report["retained"] = []
+    budget.holdback_s = 0.0
+    for candidate in V3_PRIORITY:
+        if candidate not in report.get("qualified_candidates", {}):
+            continue
+        try:
+            _integrity_check(packages, provenance, seed, seed_hash, budget)
+            _verify_api_seeds(report.get("api_workloads", {}), seed.parent, budget)
+            _assert_campaign_provenance(harness, budget)
+        except Exception:
+            return
+        report["retained"] = [candidate]
+        return
 
 
 def _integrity_check(packages, provenance, seed, seed_hash, budget):
@@ -636,24 +1214,32 @@ def parser():
 
 
 def run(args, *, budget=None) -> int:
-    budget = budget or bench.Budget(limit_s=CAMPAIGN_BUDGET_S)
-    if budget.limit_s != CAMPAIGN_BUDGET_S:
-        raise ValueError("campaign requires the shared 1,800-second budget")
+    supplied_budget = budget is not None
+    budget = budget or bench.Budget(limit_s=V3_CAMPAIGN_BUDGET_S)
     output = bench.safe_path(args.output)
     manifest_path = bench.safe_path(args.manifest)
     if output.exists():
         raise ValueError("output must be a fresh directory")
     budget.admit(1)
     manifest = _load_manifest(manifest_path)
+    claims_mode = manifest.get("_claims_mode", "indexed")
+    expected_budget = V3_CAMPAIGN_BUDGET_S if manifest["_version"] == 3 else CAMPAIGN_BUDGET_S
+    if supplied_budget and budget.limit_s != expected_budget:
+        raise ValueError(
+            f"version {manifest['_version']} campaign requires a {expected_budget:,.0f}-second budget"
+        )
+    if not supplied_budget:
+        budget.limit_s = expected_budget
     paths = _preflight_paths(manifest, manifest_path, output)
     report = {
         "kind": "synthetic-optimization-campaign",
         "measurement_version": bench.MEASUREMENT_VERSION,
+        "platform": bench.sys.platform,
         "manifest_version": manifest["_version"],
         "status": "failed",
         "profile": "perf",
         "started_at": bench.datetime.now(bench.UTC).isoformat(),
-        "budget_seconds": CAMPAIGN_BUDGET_S,
+        "budget_seconds": expected_budget,
         "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
         "warmup_mode": "one unprofiled fresh-worker run per distinct runtime",
         "samples": [],
@@ -661,6 +1247,8 @@ def run(args, *, budget=None) -> int:
         "deferred": {},
         "retained": [],
     }
+    if manifest["_version"] == 3:
+        report["claims_mode"] = claims_mode
     output.mkdir(parents=True)
     bench._save(output / "report.json", report)
     packages = {}
@@ -674,10 +1262,16 @@ def run(args, *, budget=None) -> int:
         report["harness_provenance"] = harness
         bench._save(output / "report.json", report)
         resolved = _preflight(paths, budget)
-        frozen = _freeze_packages(resolved, output, budget)
+        frozen = (
+            _freeze_v3_packages(resolved, output, budget, claims_mode)
+            if manifest["_version"] == 3
+            else _freeze_packages(resolved, output, budget)
+        )
         packages, provenance = frozen["packages"], frozen["provenance"]
+        if manifest["_version"] == 3:
+            provenance["_claims_mode"] = {"value": claims_mode, "source": "manifest"}
         report["inputs"] = provenance
-        for name in VARIANTS:
+        for name in V3_CANDIDATES if manifest["_version"] == 3 else VARIANTS:
             if name in provenance and not provenance[name].get("eligible"):
                 report["deferred"][name] = provenance[name]["deferred_reason"]
         bench._save(output / "report.json", report)
@@ -702,6 +1296,33 @@ def run(args, *, budget=None) -> int:
         bench._save(output / "report.json", report)
 
         warmed = set()
+        if manifest["_version"] == 3:
+            _run_v3(
+                seed,
+                output,
+                budget,
+                warmed,
+                report,
+                packages,
+                provenance,
+                seed_hash,
+                harness,
+                claims_mode,
+            )
+            budget.holdback_s = 0.0
+            _integrity_check(packages, provenance, seed, seed_hash, budget)
+            _assert_campaign_provenance(harness, budget)
+            return (
+                0
+                if report["status"]
+                in {
+                    "qualified",
+                    "qualified_individual_combination_deferred",
+                    "insufficient_evidence",
+                    "deferred",
+                }
+                else 1
+            )
         if manifest["_version"] == 2:
             _run_v2(
                 seed,
@@ -844,7 +1465,11 @@ def run(args, *, budget=None) -> int:
     except (TimeoutError, subprocess.TimeoutExpired) as exc:
         report["status"] = "insufficient_evidence"
         report["error"] = str(exc)
-        if report.get("manifest_version") == 2:
+        if report.get("manifest_version") == 3:
+            _retain_v3_candidate(report, packages, provenance, seed, seed_hash, harness, budget)
+            if report["retained"]:
+                report["status"] = "qualified_individual_combination_deferred"
+        elif report.get("manifest_version") == 2:
             _retain_best_v2_candidate(
                 report, packages, provenance, seed, seed_hash, harness, budget
             )
@@ -860,7 +1485,9 @@ def run(args, *, budget=None) -> int:
         report["interrupted_exit_code"] = (
             128 + exc.signum if isinstance(exc, bench.Terminated) else 130
         )
-        if report.get("manifest_version") == 2:
+        if report.get("manifest_version") == 3:
+            _retain_v3_candidate(report, packages, provenance, seed, seed_hash, harness, budget)
+        elif report.get("manifest_version") == 2:
             _retain_best_v2_candidate(
                 report, packages, provenance, seed, seed_hash, harness, budget
             )
@@ -875,7 +1502,9 @@ def run(args, *, budget=None) -> int:
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
-        if report.get("manifest_version") == 2:
+        if report.get("manifest_version") == 3:
+            _retain_v3_candidate(report, packages, provenance, seed, seed_hash, harness, budget)
+        elif report.get("manifest_version") == 2:
             _retain_best_v2_candidate(
                 report, packages, provenance, seed, seed_hash, harness, budget
             )
@@ -904,7 +1533,7 @@ def run(args, *, budget=None) -> int:
 def main() -> int:
     previous = {
         signum: signal.signal(signum, lambda signum, _frame: bench.SIGNALS.receive(signum))
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        for signum in bench.operator_signals(include_interrupt=True)
     }
     try:
         return run(parser().parse_args())

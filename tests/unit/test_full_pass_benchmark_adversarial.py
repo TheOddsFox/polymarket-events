@@ -3,11 +3,12 @@
 import json
 import math
 import os
-import signal
 import sys
 
 import pytest
 from test_full_pass_benchmark import benchmark, row
+
+from oddsfox_catalogue.platform_support import operator_signals
 
 
 def baseline_fixture(tmp_path):
@@ -53,6 +54,8 @@ def test_nested_output_rejected_without_mutating_baseline(tmp_path):
 @pytest.mark.parametrize("artifact", ["seed", "runtime"])
 @pytest.mark.parametrize("unsafe", ["symlink", "fifo"])
 def test_unsafe_baseline_descendants_never_reach_workers(tmp_path, monkeypatch, artifact, unsafe):
+    if unsafe == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("POSIX FIFO contract; native reparse rejection has separate coverage")
     baseline = baseline_fixture(tmp_path)
     tree = baseline / "seed" if artifact == "seed" else baseline / "runtime" / "oddsfox_catalogue"
     outside = tmp_path / "outside.py"
@@ -63,7 +66,8 @@ def test_unsafe_baseline_descendants_never_reach_workers(tmp_path, monkeypatch, 
     else:
         os.mkfifo(path)
     monkeypatch.setattr(benchmark, "run_sample", lambda *a, **k: pytest.fail("unsafe worker"))
-    with pytest.raises(ValueError, match="symlink or special"):
+    message = "link or reparse" if unsafe == "symlink" else "symlink or special"
+    with pytest.raises(ValueError, match=message):
         benchmark.validate_baseline(baseline, "smoke", benchmark.REPO / "src" / "oddsfox_catalogue")
     assert outside.read_text() == "preserve me"
 
@@ -246,9 +250,9 @@ def test_compare_budget_includes_preparation_before_baseline_validation(tmp_path
     assert report["elapsed_seconds"] == 107.0
 
 
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("signum", operator_signals(include_interrupt=True))
 def test_main_restores_handlers_and_retains_interrupted_report(tmp_path, monkeypatch, signum):
-    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    signals = operator_signals(include_interrupt=True)
     original = {number: object() for number in signals}
     installed = dict(original)
     changes = []

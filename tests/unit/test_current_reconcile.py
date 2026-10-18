@@ -154,7 +154,7 @@ def test_frozen_pending_repair_resumes_before_selection(setup):
                 "passes": [None],
             },
             "remaining": [{"endpoint": "/events/7", "params": {}}],
-            "raw_id": "frozen",
+            "raw_id": "0123456789abcdef0123456789abcdef",
         },
     )
     calls = []

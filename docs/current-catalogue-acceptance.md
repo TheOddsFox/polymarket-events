@@ -38,3 +38,19 @@ Observed retained storage was 7.57 GiB (8,125,747,037 bytes) and peak RSS was 4.
 A known event whose source member list stays incomplete produces no membership receipt, so
 its pass stays open until the source returns a complete list. A known entity that upstream
 no longer serves is settled by a native 404 during a forced pass and then counts toward it.
+
+## Synthetic optimization evidence
+
+The version-3 campaign described in the [guide](current-catalogue.md#version-3-acquisition-campaign)
+uses offline fixtures and separate full-pass, market-ID and discovery oracles. Its
+performance qualification does not satisfy the deployment bar above. Neither synthetic
+application timings nor index installation measurements establish a current full-catalogue
+runtime or a benefit from changing the storage cable.
+
+
+The 2026-10-18 local campaign was stopped by user direction with one scored queue
+pair and no qualified optimization. Code and correctness fixes continue, while full
+runs and performance comparisons move to the native Windows workstation. Native
+Windows filesystem/process/ACL proofs and deployment acceptance remain unrecorded.
+The Windows run needs a fresh common portable baseline; earlier POSIX measurements
+are not a substitute. No full-catalogue or cable-benefit estimate follows from this PR.

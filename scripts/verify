@@ -1,10 +1,28 @@
-#!/bin/sh
-set -eu
-cd "$(dirname "$0")/.."
-git diff --check
-git diff --cached --check
-env UV_LINK_MODE=copy uv lock --check
-env UV_LINK_MODE=copy uv sync --locked
-env UV_LINK_MODE=copy uv run --locked ruff check .
-env UV_LINK_MODE=copy uv run --locked ruff format --check .
-env UV_LINK_MODE=copy CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9 CATALOGUE_GAMMA_ALLOW_LOOPBACK=1 uv run --locked pytest -q
+#!/usr/bin/env python3
+"""Run the completion gate on POSIX or native Windows."""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+env = {**os.environ, "UV_LINK_MODE": "copy"}
+commands = [
+    ["git", "diff", "--check"],
+    ["git", "diff", "--cached", "--check"],
+    ["uv", "lock", "--check"],
+    ["uv", "sync", "--locked"],
+    ["uv", "run", "--locked", "ruff", "check", "."],
+    ["uv", "run", "--locked", "ruff", "format", "--check", "."],
+    ["uv", "run", "--locked", "pytest", "-q", *sys.argv[1:]],
+]
+for command in commands:
+    command_env = env
+    if "pytest" in command:
+        command_env = {
+            **env,
+            "CATALOGUE_GAMMA_BASE_URL": "http://127.0.0.1:9",
+            "CATALOGUE_GAMMA_ALLOW_LOOPBACK": "1",
+        }
+    subprocess.run(command, cwd=root, env=command_env, check=True)

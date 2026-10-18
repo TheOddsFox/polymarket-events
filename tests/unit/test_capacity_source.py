@@ -1,6 +1,7 @@
 import hashlib
 import json
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import duckdb
@@ -10,6 +11,37 @@ from fakes.capacity_source import MAX_AUDIT_BYTES, CapacitySource
 from fakes.world import make_event, make_market
 from oddsfox_catalogue.current_rows import project_response
 from oddsfox_catalogue.current_store import apply, initialize
+
+
+def test_keyset_accepts_bounded_filtered_control_ids_and_rejects_invalid_filters():
+    source = CapacitySource.__new__(CapacitySource)
+    params = [
+        ("limit", "2"),
+        ("order", "id"),
+        ("ascending", "true"),
+        ("id", "2"),
+        ("id", "4"),
+        ("after_cursor", "Mg"),
+    ]
+    request = "/events/keyset?" + urlencode(params)
+    kind, ids, closed, native, keyset, cursor_args = source._request(request)
+    assert (kind, ids, closed, native, keyset) == ("events", ["2", "4"], None, False, True)
+    assert cursor_args == ("Mg", 2, ["2", "4"])
+
+    invalid_filters = [
+        [*params, ("id", "4")],
+        [("limit", "1"), *params[1:]],
+        [
+            ("limit", "101"),
+            ("order", "id"),
+            ("ascending", "true"),
+            *[("id", str(value)) for value in range(1, 102)],
+        ],
+        [("limit", "1"), ("order", "id"), ("ascending", "true"), ("id", "01")],
+    ]
+    for invalid in invalid_filters:
+        with pytest.raises(ValueError):
+            source._request("/events/keyset?" + urlencode(invalid))
 
 
 @pytest.fixture
@@ -67,6 +99,48 @@ def test_frozen_full_shapes_and_controls(seed, tmp_path):
         assert get(source, "/markets/14")[1]["outcomes"] == []
         assert get(source, "/events/99")[0] == 404
         assert get(source, "/events?id=99&limit=1")[1] == []
+        status, mixed = get(
+            source, "/markets?id=10&id=11&id=99&limit=3&closed=any&include_tag=true"
+        )
+        assert status == 200
+        assert [market["id"] for market in mixed] == ["10", "11"]
+        assert get(source, "/markets?limit=1&closed=any")[0] == 400
+        status, page = get(source, "/events/keyset?limit=2&order=id&ascending=true")
+        assert status == 200
+        assert [item["id"] for item in page["events"]] == ["1", "2"]
+        assert page["next_cursor"]
+        status, filtered = get(
+            source,
+            "/events/keyset?limit=2&order=id&ascending=true&id=2&id=4",
+        )
+        assert status == 200
+        assert [item["id"] for item in filtered["events"]] == ["2", "4"]
+        assert filtered["next_cursor"]
+        filtered_cursor = filtered["next_cursor"]
+        status, filtered_tail = get(
+            source,
+            "/events/keyset?limit=2&order=id&ascending=true&id=2&id=4"
+            f"&after_cursor={filtered_cursor}",
+        )
+        assert status == 200
+        assert filtered_tail["events"] == []
+        assert "next_cursor" not in filtered_tail
+        cursor = page["next_cursor"]
+        status, next_page = get(
+            source, f"/events/keyset?limit=2&order=id&ascending=true&after_cursor={cursor}"
+        )
+        assert status == 200
+        assert [item["id"] for item in next_page["events"]] == ["3", "4"]
+        status, market_page = get(
+            source,
+            "/markets/keyset?limit=2&order=id&ascending=true&closed=true&include_tag=true",
+        )
+        assert status == 200
+        assert all(item["closed"] is True for item in market_page["markets"])
+        assert (
+            get(source, "/markets/keyset?limit=2&order=id&ascending=true&after_cursor=invalid")[0]
+            == 400
+        )
         for path in (
             "/other",
             "/events/01",

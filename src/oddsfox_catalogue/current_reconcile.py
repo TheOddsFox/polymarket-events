@@ -1,6 +1,7 @@
 """Bounded due work, with successful receipts kept separate from retry fairness."""
 
 import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 
 from . import current_store
@@ -95,6 +96,23 @@ def _cold(conn, settings, now, state, *, pass_started=None):
                 < min(settings.limits.cold_recheck_s, COLD_FRESHNESS_S // 2)
             ):
                 continue
+            certificate = current_store.get_state(conn, "bulk_policy", {})
+            keyset = (
+                certificate.get("version") == 3
+                and certificate.get("origin") == settings.gamma.base_url
+                and certificate.get("capabilities", {}).get("keyset_discovery", {}).get("supported")
+                is True
+            )
+            if keyset:
+                started_at = window.get("started_at", now.timestamp())
+                next_window = {
+                    "next": 1,
+                    "cycle": None,
+                    "started_at": started_at,
+                    "high": None,
+                    "keyset": True,
+                }
+                return lane, [], slot, next_window
             high = window.get("high")
             if high is None:
                 high = discovery.get(lane, {}).get("frontier", 0)
@@ -238,6 +256,27 @@ def _pass_checkpoint(conn, cursor):
     return {"full_pass": state, "reconcile": reconcile_state}
 
 
+def _take_pending(queue, skipped, limit):
+    """Consume the next bounded set of stale IDs, ignoring settled urgent work."""
+    ids = []
+    while queue and len(ids) < limit:
+        key = queue.popleft()
+        if key not in skipped:
+            ids.append(key)
+    return ids
+
+
+def _peek_pending(queue, skipped, limit):
+    """Preview eligible queue IDs for prefetch without changing the queue."""
+    ids = []
+    for key in queue:
+        if key not in skipped:
+            ids.append(key)
+            if len(ids) == limit:
+                break
+    return ids
+
+
 def _reconcile_pass(settings, conn, client, stop, counters):
     """Walk stale events in id order, then the markets those events did not renew."""
     started = _pass_started(conn)
@@ -248,19 +287,20 @@ def _reconcile_pass(settings, conn, client, stop, counters):
     if not pending and stored.get("cursor_after") is not None:
         # Older checkpoints may have advanced past unresolved or oversized IDs.
         pending = _stale_event_ids(conn, started, None)
+    pending = deque(pending)
+    skipped = set()
     prefetcher = ResponsePrefetcher(client, deadline=stop)
     try:
         while time.monotonic() < stop:
             now = _now()
+            while pending and pending[0] in skipped:
+                pending.popleft()
             urgent = _urgent_active_ids(conn, settings, now)
             if urgent:
                 lane, ids, advance = "events", urgent, None
                 counter = "active_batches"
-                urgent_ids = set(ids)
-                pending = [item for item in pending if item not in urgent_ids]
             elif pending:
-                ids = pending[:100]
-                pending = pending[100:]
+                ids = _take_pending(pending, skipped, 100)
                 lane, advance, counter = "events", ids[-1], "cold_batches"
             else:
                 rows = _due(
@@ -275,8 +315,9 @@ def _reconcile_pass(settings, conn, client, stop, counters):
                     break
                 lane, ids, advance = "markets", [row[0] for row in rows], None
                 counter = "cold_batches"
-            if pending and lane == "events" and advance is not None:
-                prefetcher.submit(first_bulk_request(settings, conn, "events", pending[:100]))
+            preview = _peek_pending(pending, skipped, 100)
+            if preview and lane == "events" and advance is not None:
+                prefetcher.submit(first_bulk_request(settings, conn, "events", preview))
             if time.monotonic() >= stop:
                 break
             admit(settings, additional_bytes=65536)
@@ -304,6 +345,8 @@ def _reconcile_pass(settings, conn, client, stop, counters):
                     counters["responses"] += _confirm_omitted(settings, conn, client, lane, omitted)
                 except (CaptureStopped, RequestBudgetExceeded):
                     break
+            if lane == "events" and counter == "active_batches":
+                skipped.update(ids)
             if advance is not None:
                 state = dict(current_store.get_state(conn, "full_pass") or {})
                 state["cursor_after"] = int(advance)
@@ -409,6 +452,26 @@ def _reconcile_units(settings, conn, client, *, deadline):
         if time.monotonic() >= stop:
             break
         admit(settings, additional_bytes=65536)
+        if not ids and window is not None and window.get("keyset"):
+            from .current_keyset import cold_page
+
+            try:
+                result = cold_page(
+                    settings,
+                    conn,
+                    client,
+                    lane,
+                    reconcile_state=state,
+                    now=now,
+                )
+            except (CaptureStopped, RequestBudgetExceeded):
+                break
+            counters["responses"] += result.get("responses", 0)
+            counters["cold_batches"] += 1
+            if result.get("complete"):
+                state["windows"][lane] = {"next": 1, "cycle": window["started_at"]}
+                current_store.set_state(conn, "reconcile", state)
+            continue
         try:
             result, omitted = fetch_unit(
                 settings,

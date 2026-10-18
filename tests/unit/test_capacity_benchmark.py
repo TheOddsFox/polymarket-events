@@ -102,6 +102,8 @@ def test_audit_larger_than_accounted_output_rejected(tmp_path, monkeypatch):
     ],
 )
 def test_output_rejects_nonregular_evidence(tmp_path, name, kind):
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("POSIX FIFO contract; native reparse rejection has separate coverage")
     path = tmp_path / name
     if kind == "symlink":
         path.symlink_to(tmp_path / "missing")

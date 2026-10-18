@@ -66,6 +66,10 @@ def test_init_stamps_a_fresh_root_and_worker_can_acquire_its_lock(tmp_path, monk
 
 
 @pytest.mark.parametrize("worker_end", ["finish", "kill"])
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX orphan-lock contract; Windows Job kills the orphan on parent death",
+)
 def test_parent_sigkill_does_not_unlock_a_live_worker(settings, monkeypatch, capsys, worker_end):
     context = multiprocessing.get_context("spawn")
     receive, send = context.Pipe(duplex=False)

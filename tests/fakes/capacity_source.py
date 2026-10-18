@@ -1,5 +1,6 @@
 """Frozen, bounded loopback Gamma source for capacity characterization."""
 
+import base64
 import hashlib
 import json
 import os
@@ -22,9 +23,15 @@ _ID = re.compile(r"[1-9][0-9]{0,19}\Z")
 
 class CapacitySource:
     def __init__(
-        self, seed_root: Path, audit_path: Path, *, delay_s=0.3, max_audit_bytes=MAX_AUDIT_BYTES
+        self,
+        seed_root: Path,
+        audit_path: Path,
+        *,
+        delay_s=0.3,
+        max_audit_bytes=MAX_AUDIT_BYTES,
+        source_root: Path | None = None,
     ):
-        self.seed_root = safe_path(Path(seed_root)).resolve(strict=True)
+        self.seed_root = safe_path(Path(source_root or seed_root)).resolve(strict=True)
         self.db_path = self.seed_root / "catalogue.duckdb"
         audit_path = safe_path(Path(audit_path))
         if audit_path.is_relative_to(self.seed_root):
@@ -43,6 +50,7 @@ class CapacitySource:
             config={"memory_limit": "2GB", "threads": "2", "max_temp_directory_size": "0B"},
         )
         self.lock = threading.RLock()
+        self.audit_path = audit_path
         self.delay_s = delay_s
         self.max_audit_bytes = max_audit_bytes
         self.stats = {
@@ -176,7 +184,7 @@ class CapacitySource:
             f"AND {kind[:-1]}_id IN (SELECT unnest(?))",
             ids,
         )
-        rows = [r for r in rows if closed is None or bool(r["closed"]) == closed]
+        rows = [r for r in rows if closed in (None, "any") or bool(r["closed"]) == closed]
         if kind == "events":
             event_ids = [r["event_id"] for r in rows]
             links = self._query(
@@ -265,19 +273,71 @@ class CapacitySource:
             raise ValueError
         kind = parts[1]
         query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=110)
+        keyset = len(parts) == 3 and parts[2] == "keyset"
+        if len(parts) == 3 and not keyset:
+            if query or not _ID.fullmatch(parts[2]):
+                raise ValueError
+            return kind, [parts[2]], None, True, False, None
+        if keyset:
+            if set(query) - {
+                "id",
+                "limit",
+                "order",
+                "ascending",
+                "after_cursor",
+                "closed",
+                "include_tag",
+            }:
+                raise ValueError
+            if any(len(values) != 1 for key, values in query.items() if key != "id"):
+                raise ValueError
+            if query.get("order") != ["id"] or query.get("ascending") != ["true"]:
+                raise ValueError
+            limit_values = query.get("limit", ["20"])
+            if len(limit_values) != 1 or not limit_values[0].isdigit():
+                raise ValueError
+            limit = int(limit_values[0])
+            if not 1 <= limit <= 100:
+                raise ValueError
+            ids = query.get("id", [])
+            if (
+                len(ids) > 100
+                or (ids and limit != len(ids))
+                or len(set(ids)) != len(ids)
+                or any(not _ID.fullmatch(value) for value in ids)
+            ):
+                raise ValueError
+            closed = query.get("closed", [None])[0]
+            if closed not in (None, "true", "false"):
+                raise ValueError
+            if kind == "markets" and closed is None:
+                closed = "false"
+            closed = None if closed is None else closed == "true"
+            if "include_tag" in query and (kind != "markets" or query["include_tag"] != ["true"]):
+                raise ValueError
+            cursor = query.get("after_cursor", [None])[0]
+            if cursor == "":
+                raise ValueError
+            return kind, ids, closed, False, True, (cursor, limit, ids)
         if len(parts) == 3:
             if query or not _ID.fullmatch(parts[2]):
                 raise ValueError
-            return kind, [parts[2]], None, True
+            return kind, [parts[2]], None, True, False, None
         if set(query) - {"id", "limit", "closed", "order", "ascending", "include_tag"}:
             raise ValueError
         for key, values in query.items():
             if key != "id" and len(values) != 1:
                 raise ValueError
         closed = query.get("closed", [None])[0]
-        if closed not in (None, "true", "false"):
+        if closed not in (None, "true", "false", "any"):
             raise ValueError
-        closed = (False if kind == "markets" else None) if closed is None else closed == "true"
+        if closed == "any" and (kind != "markets" or "id" not in query):
+            raise ValueError
+        closed = (
+            (False if kind == "markets" else None)
+            if closed is None
+            else ("any" if closed == "any" else closed == "true")
+        )
         if "include_tag" in query and (kind != "markets" or query["include_tag"] != ["true"]):
             raise ValueError
         ids = query.get("id")
@@ -298,7 +358,44 @@ class CapacitySource:
             raise ValueError
         if any(not _ID.fullmatch(i) for i in ids):
             raise ValueError
-        return kind, ids, closed, False
+        return kind, ids, closed, False, False, None
+
+    @staticmethod
+    def _decode_cursor(cursor):
+        try:
+            value = base64.urlsafe_b64decode(cursor.encode() + b"=" * (-len(cursor) % 4)).decode()
+        except Exception as exc:
+            raise ValueError from exc
+        if not _ID.fullmatch(value):
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _encode_cursor(value):
+        return base64.urlsafe_b64encode(str(value).encode()).decode().rstrip("=")
+
+    def _keyset_records(self, kind, closed, cursor, limit, requested_ids=()):
+        after = int(self._decode_cursor(cursor)) if cursor else 0
+        clause = " AND closed=?" if closed is not None else ""
+        params = [after]
+        if closed is not None:
+            params.append(closed)
+        selected = ""
+        if requested_ids:
+            selected = f" AND {kind[:-1]}_id IN ({','.join('?' for _ in requested_ids)})"
+            params.extend(requested_ids)
+        ids = [
+            str(row[0])
+            for row in self.conn.execute(
+                f"SELECT {kind[:-1]}_id FROM {kind} WHERE venue='polymarket' "
+                f"AND try_cast({kind[:-1]}_id AS HUGEINT)>?{clause}{selected} "
+                f"ORDER BY try_cast({kind[:-1]}_id AS HUGEINT) LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+        ]
+        page_ids = ids
+        records = self.records(kind, page_ids, closed)
+        return records, self._encode_cursor(page_ids[-1]) if len(page_ids) == limit else None
 
     def _serve(self, handler):
         self.stats["requests"] += 1
@@ -306,28 +403,38 @@ class CapacitySource:
         self.stats["http_attempts"] = number
         route = urlsplit(handler.path).path.split("/")
         route_key = (
-            "/" + route[1]
+            "/" + route[1] + ("/keyset" if len(route) == 3 and route[2] == "keyset" else "")
             if len(route) in (2, 3) and route[1] in ("events", "markets")
             else "invalid"
         )
-        if len(route) == 3 and route_key != "invalid":
+        if len(route) == 3 and route_key != "invalid" and route[2] != "keyset":
             route_key += "/id"
         self.stats["paths"][route_key] = self.stats["paths"].get(route_key, 0) + 1
         kind, ids, records, native = None, [], [], False
+        closed, keyset = None, False
         status = 200
         try:
             if self.failure:
                 raise RuntimeError("source failed")
             self._check_identity()
-            kind, ids, closed, native = self._request(handler.path)
+            kind, ids, closed, native, keyset, cursor_args = self._request(handler.path)
             time.sleep(self.delay_s)
             if self.faults and number % 1000 == 0:
                 status, payload = 503, {"error": "injected failure"}
                 self.stats["faults"] += 1
             else:
-                records = self.records(kind, ids, closed)
+                if keyset:
+                    cursor, limit, requested_ids = cursor_args
+                    records, next_cursor = self._keyset_records(
+                        kind, closed, cursor, limit, requested_ids
+                    )
+                    payload = {kind: records}
+                    if next_cursor is not None:
+                        payload["next_cursor"] = next_cursor
+                else:
+                    records = self.records(kind, ids, closed)
+                    payload = records[0] if native and records else records
                 status = 404 if native and not records else 200
-                payload = records[0] if native and records else records
             self._check_identity()
             body = json.dumps(payload, separators=(",", ":")).encode()
             if len(body) > MAX_RESPONSE_BYTES:
@@ -343,6 +450,8 @@ class CapacitySource:
             "request": number,
             "monotonic_s": time.monotonic(),
             "kind": kind,
+            "closed": closed,
+            "keyset": keyset,
             "status": status,
             "ids": ids,
             "emitted_ids": [r["id"] for r in records] if status == 200 else [],

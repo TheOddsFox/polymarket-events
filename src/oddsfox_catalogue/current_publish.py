@@ -27,6 +27,12 @@ from .current_store import _validate_store, generation, summary
 from .current_store import validate_public as _integrity
 from .fingerprints import semantic_fingerprint
 from .limits import directory_bytes
+from .platform_support import (
+    remove_tree,
+    replace_directory,
+    replace_file,
+    sync_directory,
+)
 
 _RAW_ID = re.compile(r"[0-9a-f]{32}\Z")
 
@@ -138,11 +144,11 @@ def _prune_unreferenced_raw(settings, referenced, cutoff=None, progress=None):
             if cutoff is not None and time.monotonic() >= cutoff:
                 deferred = True
                 break
-            shutil.rmtree(path)
+            _remove_tree(path)
             progress["deleted_count"] += 1
             progress["deleted_bytes"] += size
     except BaseException as primary:
-        _fsync_completed(settings.raw_dir, before, progress["deleted_count"], primary)
+        _fsync_completed(settings.raw_dir, before, progress["deleted_count"], primary, force=True)
         raise
     else:
         _fsync_completed(settings.raw_dir, before, progress["deleted_count"])
@@ -175,11 +181,18 @@ def _maintenance_cutoff(deadline):
     return None if deadline is None else deadline - 15
 
 
-def _fsync_completed(directory, before, after, primary=None):
-    if after <= before:
+def _remove_tree(path):
+    if os.name == "nt":
+        remove_tree(path)
+    else:
+        shutil.rmtree(path)
+
+
+def _fsync_completed(directory, before, after, primary=None, *, force=False):
+    if after <= before and not force:
         return
     try:
-        _fsync_dir(directory)
+        sync_directory(directory)
     except BaseException:
         if primary is not None and not isinstance(primary, Exception):
             return
@@ -230,11 +243,11 @@ def _cleanup_cooperative(settings, keep, cutoff, progress):
                     if cutoff is not None and time.monotonic() >= cutoff:
                         deferred = True
                         break
-                    shutil.rmtree(child)
+                    _remove_tree(child)
                     progress["deleted_count"] += 1
                     progress["deleted_bytes"] += size
         except BaseException as primary:
-            _fsync_completed(directory, before, progress["deleted_count"], primary)
+            _fsync_completed(directory, before, progress["deleted_count"], primary, force=True)
             raise
         else:
             _fsync_completed(directory, before, progress["deleted_count"])
@@ -440,18 +453,22 @@ def _cleanup(settings, keep):
     ):
         if not directory.exists():
             continue
-        for child in directory.iterdir():
-            name = child.name.removeprefix(prefix)
-            if (
-                not child.name.startswith(prefix)
-                or not re.fullmatch(r"[0-9a-f]{32}", name)
-                or name in keep
-            ):
-                continue
-            safe_path(child)
-            directory_bytes(child)
-            if child.is_dir():
-                shutil.rmtree(child)
+        try:
+            for child in directory.iterdir():
+                name = child.name.removeprefix(prefix)
+                if (
+                    not child.name.startswith(prefix)
+                    or not re.fullmatch(r"[0-9a-f]{32}", name)
+                    or name in keep
+                ):
+                    continue
+                safe_path(child)
+                directory_bytes(child)
+                if child.is_dir():
+                    _remove_tree(child)
+        except BaseException as primary:
+            _fsync_completed(directory, 0, 0, primary, force=True)
+            raise
         _fsync_dir(directory)
 
 
@@ -640,7 +657,7 @@ def publish(settings, conn, *, deadline=None):
         admit(settings)
         _fsync_dir(stage)
         final = releases / release_id
-        os.replace(stage, final)
+        replace_directory(stage, final)
         _fsync_dir(releases)
         _fsync_dir(published)
         _check_deadline(deadline)
@@ -654,7 +671,7 @@ def publish(settings, conn, *, deadline=None):
         pending_pointer = safe_path(published / "current.next.json")
         atomic_write_bytes(pending_pointer, json.dumps(pointer, sort_keys=True).encode())
         _check_deadline(deadline)
-        os.replace(pending_pointer, current)
+        replace_file(pending_pointer, current)
         _fsync_dir(published)
         pre_commit_s = time.monotonic() - publication_started
         try:

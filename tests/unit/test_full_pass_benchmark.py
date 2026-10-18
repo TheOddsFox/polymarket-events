@@ -279,12 +279,12 @@ def test_baseline_tree_rejects_symlinks_and_special_files(tmp_path):
     benchmark.validate_tree(tree, python_only=True)
     link = tree / "link.py"
     link.symlink_to(tree / "ok.py")
-    with pytest.raises(ValueError, match="symlink or special"):
+    with pytest.raises(ValueError, match="symlink or special|link or reparse"):
         benchmark.validate_tree(tree, python_only=True)
     link.unlink()
     if hasattr(os, "mkfifo"):
         os.mkfifo(tree / "pipe")
-        with pytest.raises(ValueError, match="symlink or special"):
+        with pytest.raises(ValueError, match="symlink or special|link or reparse"):
             benchmark.validate_tree(tree)
 
 

@@ -39,6 +39,57 @@ def test_campaign_budget_is_shared_and_keeps_holdback_and_shutdown_reserve():
         campaign.bench.Budget(inherited=1785, limit_s=1800).admit(1)
 
 
+def test_warmup_aliases_identical_runtime_workload_without_rewarming(tmp_path, monkeypatch):
+    runtime = package(tmp_path / "runtime", **{"current_store.py": "VALUE = 1\n"})
+    calls = []
+
+    def stage_sample(_seed, _output, _package, _budget, _label, workload=None):
+        calls.append(workload)
+        return {"wall_s": 1.0, "workload": workload}
+
+    monkeypatch.setattr(campaign, "_stage_sample", stage_sample)
+    report = {}
+    warmed = set()
+    budget = campaign.bench.Budget()
+
+    campaign._warm(
+        "baseline",
+        runtime,
+        tmp_path / "seed-a",
+        tmp_path / "evidence",
+        budget,
+        warmed,
+        report,
+        "closed_any",
+    )
+    campaign._warm(
+        "closed_any",
+        runtime,
+        tmp_path / "seed-a",
+        tmp_path / "evidence",
+        budget,
+        warmed,
+        report,
+        "closed_any",
+    )
+    campaign._warm(
+        "baseline",
+        runtime,
+        tmp_path / "seed-b",
+        tmp_path / "evidence",
+        budget,
+        warmed,
+        report,
+        "discovery_dense",
+    )
+
+    assert calls == ["closed_any", "discovery_dense"]
+    assert report["warmups"]["baseline:closed_any"] == report["warmups"]["closed_any:closed_any"]
+    assert report["warmups"]["baseline:discovery_dense"]["sample"]["workload"] == (
+        "discovery_dense"
+    )
+
+
 def test_manifest_accepts_only_data_entries_and_complete_hash_inventory(tmp_path):
     source = package(tmp_path / "runtime", **{"current_store.py": "VALUE = 1\n"})
     path = tmp_path / "manifest.json"
@@ -74,6 +125,356 @@ def test_manifest_rejects_duplicate_json_keys(tmp_path):
     path.write_text('{"baseline":{},"baseline":{},"binding":{}}')
     with pytest.raises(ValueError, match="duplicate key"):
         campaign._load_manifest(path)
+
+
+def _v3_manifest_entry(path):
+    return {"path": str(path), "source_hashes": inventory(path)}
+
+
+def test_v3_manifest_requires_all_candidates_and_sorted_exact_combination_keys(tmp_path):
+    baseline = package(
+        tmp_path / "baseline",
+        **{
+            "current_store.py": "BASE = 1\n",
+            "current_reconcile.py": "BASE = 1\n",
+            "current_sync.py": "BASE = 1\n",
+            "current_runtime.py": "BASE = 1\n",
+        },
+    )
+    candidate = package(
+        tmp_path / "candidate",
+        **{
+            "current_store.py": "BASE = 1\n",
+            "current_reconcile.py": "BASE = 1\n",
+            "current_sync.py": "BASE = 1\n",
+            "current_runtime.py": "BASE = 1\n",
+        },
+    )
+    entries = {name: _v3_manifest_entry(candidate) for name in campaign.V3_CANDIDATES}
+    path = tmp_path / "manifest-v3.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "baseline": _v3_manifest_entry(baseline),
+                "candidates": entries,
+                "combinations": {"claims+queue": _v3_manifest_entry(candidate)},
+            }
+        )
+    )
+    manifest = campaign._load_manifest(path)
+    assert manifest["_version"] == 3
+    assert manifest["_combination:claims+queue"] == _v3_manifest_entry(candidate)
+
+    for key in ("queue+claims", "claims+claims", "claims+projection"):
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "baseline": _v3_manifest_entry(baseline),
+                    "candidates": entries,
+                    "combinations": {key: _v3_manifest_entry(candidate)},
+                }
+            )
+        )
+        with pytest.raises(ValueError, match="combination keys"):
+            campaign._load_manifest(path)
+
+
+def test_v3_manifest_rejects_unknown_fields_and_missing_candidates(tmp_path):
+    source = package(tmp_path / "runtime", **{"current_store.py": "VALUE = 1\n"})
+    entry = _v3_manifest_entry(source)
+    candidates = {name: entry for name in campaign.V3_CANDIDATES}
+    path = tmp_path / "manifest-v3.json"
+    for data, message in (
+        (
+            {"version": 3, "baseline": entry, "candidates": candidates, "command": "run"},
+            "unknown fields",
+        ),
+        (
+            {"version": 3, "baseline": entry, "candidates": {"claims": entry}},
+            "requires claims",
+        ),
+    ):
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match=message):
+            campaign._load_manifest(path)
+
+
+def test_v3_ownership_allows_only_owned_added_files_and_never_removals():
+    baseline = {"__init__.py": "a", "current_store.py": "b"}
+    candidate = {**baseline, "current_claim_indexes.py": "new"}
+    assert campaign._validate_v3_ownership(
+        baseline, candidate, campaign.V3_OWNERSHIP["claims"], "claims"
+    )
+    with pytest.raises(ValueError, match="outside its ownership"):
+        campaign._validate_v3_ownership(
+            baseline,
+            {**candidate, "unrelated.py": "bad"},
+            campaign.V3_OWNERSHIP["claims"],
+            "claims",
+        )
+    with pytest.raises(ValueError, match="removes"):
+        campaign._validate_v3_ownership(
+            baseline, {"__init__.py": "a"}, campaign.V3_OWNERSHIP["claims"], "claims"
+        )
+
+
+def test_v3_combination_ownership_is_union_of_feature_surfaces():
+    baseline = {"current_sync.py": "a", "current_store.py": "b"}
+    combination = {"current_sync.py": "c", "current_store.py": "d"}
+    allowed = campaign.V3_OWNERSHIP["claims"] | campaign.V3_OWNERSHIP["closed_any"]
+    assert campaign._validate_v3_ownership(baseline, combination, allowed, "combo")
+    with pytest.raises(ValueError, match="outside its ownership"):
+        campaign._validate_v3_ownership(
+            baseline, {**combination, "current_reconcile.py": "bad"}, allowed, "combo"
+        )
+
+
+def test_v3_freezing_validates_owned_additions_and_exact_combination(tmp_path):
+    base_files = {
+        "current_store.py": "store = 1\n",
+        "current_reconcile.py": "queue = 1\n",
+        "current_sync.py": "sync = 1\n",
+        "current_runtime.py": "runtime = 1\n",
+        "cli.py": "cli = 1\n",
+    }
+    baseline = package(tmp_path / "baseline", **base_files)
+    candidates = {}
+    for name, filename in (
+        ("claims", "current_store.py"),
+        ("queue", "current_reconcile.py"),
+        ("closed_any", "current_sync.py"),
+        ("keyset", "current_sync.py"),
+    ):
+        files = {**base_files, filename: f"{name} = 2\n"}
+        if name in {"claims", "keyset"}:
+            files["current_claim_indexes.py" if name == "claims" else "current_keyset.py"] = (
+                "owned = True\n"
+            )
+        candidates[name] = package(tmp_path / name, **files)
+    combo = package(
+        tmp_path / "combo",
+        **{
+            **base_files,
+            "current_store.py": "claims = 2\n",
+            "current_reconcile.py": "queue = 2\n",
+        },
+    )
+    resolved = {
+        "baseline": (baseline, inventory(baseline)),
+        **{name: (path, inventory(path)) for name, path in candidates.items()},
+        "_combination:claims+queue": (combo, inventory(combo)),
+    }
+    frozen = campaign._freeze_v3_packages(
+        resolved, tmp_path / "evidence", campaign.bench.Budget(limit_s=10800)
+    )
+    assert all(frozen["provenance"][name]["eligible"] for name in candidates)
+    assert frozen["provenance"]["_combination:claims+queue"]["eligible"]
+    assert inventory(baseline) == resolved["baseline"][1]
+
+    incomplete_combo = package(
+        tmp_path / "incomplete-combo",
+        **{**base_files, "current_store.py": "claims = 2\n"},
+    )
+    bad_resolved = {
+        **resolved,
+        "_combination:claims+queue": (incomplete_combo, inventory(incomplete_combo)),
+    }
+    with pytest.raises(ValueError, match="no changed files for declared features: queue"):
+        campaign._freeze_v3_packages(
+            bad_resolved, tmp_path / "bad-evidence", campaign.bench.Budget(limit_s=10800)
+        )
+
+
+def test_v3_requires_its_long_shared_budget(tmp_path):
+    source = package(tmp_path / "runtime", **{"current_store.py": "VALUE = 1\n"})
+    entry = _v3_manifest_entry(source)
+    manifest = tmp_path / "manifest-v3.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "baseline": entry,
+                "candidates": {name: entry for name in campaign.V3_CANDIDATES},
+            }
+        )
+    )
+    args = campaign.parser().parse_args(
+        ["--manifest", str(manifest), "--output", str(tmp_path / "evidence")]
+    )
+    with pytest.raises(ValueError, match="10,800-second"):
+        campaign.run(args, budget=campaign.bench.Budget(limit_s=1800))
+
+
+def test_v3_workloads_and_fallback_follow_declared_priority():
+    assert campaign._v3_workloads("claims") == (None,)
+    assert campaign._v3_workloads("queue") == (None,)
+    assert campaign._v3_workloads("closed_any") == ("closed_any",)
+    assert campaign._v3_workloads("keyset") == (
+        "discovery_sparse",
+        "discovery_dense",
+        "discovery_tail",
+    )
+    report = {"qualified_candidates": {"closed_any": {}, "queue": {}}}
+    assert campaign._best_v3_candidate(report) == "queue"
+
+
+def test_v3_api_seed_verification_covers_both_databases_and_metadata(tmp_path):
+    root = tmp_path / "api-seeds" / "closed_any"
+    root.mkdir(parents=True)
+    metadata = {}
+    for component in ("provider", "workspace"):
+        database = root / component / "catalogue.duckdb"
+        database.parent.mkdir()
+        database.write_bytes(component.encode())
+        metadata[f"{component}_seed_sha256"] = campaign._digest_bounded(
+            database, campaign.bench.Budget(limit_s=10800)
+        )
+    manifest = root / "api-seed.json"
+    manifest.write_text('{"workload":"closed_any"}\n')
+    metadata["_manifest_sha256"] = campaign._digest_bounded(
+        manifest, campaign.bench.Budget(limit_s=10800)
+    )
+    campaign._verify_api_seeds(
+        {"closed_any": metadata},
+        tmp_path,
+        campaign.bench.Budget(limit_s=10800),
+    )
+    manifest.write_text('{"workload":"changed"}\n')
+    with pytest.raises(campaign.CampaignIntegrityError, match="manifest changed"):
+        campaign._verify_api_seeds(
+            {"closed_any": metadata},
+            tmp_path,
+            campaign.bench.Budget(limit_s=10800),
+        )
+
+
+def test_v3_claim_resource_failure_does_not_abort_queue_candidate(tmp_path, monkeypatch):
+    baseline = package(tmp_path / "baseline", **{"current_reconcile.py": "BASE = 1\n"})
+    claims = package(
+        tmp_path / "claims",
+        **{
+            "current_reconcile.py": "BASE = 1\n",
+            "current_store.py": "CLAIMS = 1\n",
+        },
+    )
+    queue = package(tmp_path / "queue", **{"current_reconcile.py": "QUEUE = 1\n"})
+    closed_any = package(tmp_path / "closed-any", **{"current_sync.py": "CLOSED_ANY = 1\n"})
+    output = tmp_path / "evidence"
+    output.mkdir()
+    report = {"deferred": {}, "stages": {}}
+    packages = {
+        "baseline": baseline,
+        "claims": claims,
+        "queue": queue,
+        "closed_any": closed_any,
+    }
+    provenance = {name: {"eligible": name != "baseline"} for name in packages}
+    monkeypatch.setattr(
+        campaign.bench,
+        "claim_resource_diagnostics",
+        lambda *_args: {"status": "insufficient_evidence", "resource_gate": False},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        campaign.bench,
+        "prepare_api_seed",
+        lambda *_args: (_ for _ in ()).throw(OSError("fixture preparation unavailable")),
+    )
+    monkeypatch.setattr(campaign, "_assert_campaign_provenance", lambda *_args: None)
+    monkeypatch.setattr(
+        campaign,
+        "_stage_sample",
+        lambda *_args, **_kwargs: {"wall_s": 2.0},
+    )
+    monkeypatch.setattr(
+        campaign.bench,
+        "comparison",
+        lambda *_args: {"status": "qualified", "saved_s": 2.0},
+    )
+
+    campaign._run_v3(
+        tmp_path / "seed",
+        output,
+        campaign.bench.Budget(limit_s=10800),
+        set(),
+        report,
+        packages,
+        provenance,
+        "seed-hash",
+        {},
+    )
+
+    assert report["claim_resource_diagnostics"]["resource_gate"] is False
+    assert "claims" in report["deferred"]
+    assert report["api_seed_errors"] == {"closed_any": "OSError"}
+    assert "closed_any" in report["deferred"]
+    assert report["qualified_candidates"] == {
+        "queue": {"comparisons": [{"status": "qualified", "saved_s": 2.0}], "workloads": [None]}
+    }
+
+
+def test_v3_api_candidate_uses_supervised_fresh_seed_and_workload_gate(tmp_path, monkeypatch):
+    baseline = package(tmp_path / "baseline", **{"current_sync.py": "BASE = 1\n"})
+    closed_any = package(tmp_path / "closed-any", **{"current_sync.py": "CANDIDATE = 1\n"})
+    output = tmp_path / "evidence"
+    output.mkdir()
+    report = {"deferred": {}, "stages": {}}
+    packages = {"baseline": baseline, "closed_any": closed_any}
+    provenance = {
+        "baseline": {"eligible": False},
+        "closed_any": {"eligible": True},
+    }
+    prepared = []
+
+    def prepare_api_seed(root, workload, _budget, runtime_package):
+        assert not root.exists()
+        assert runtime_package == baseline
+        prepared.append(workload)
+        for component in ("provider", "workspace"):
+            database = root / component / "catalogue.duckdb"
+            database.parent.mkdir(parents=True)
+            database.write_bytes(component.encode())
+        metadata_path = root / "api-seed.json"
+        metadata_path.write_text('{"workload":"closed_any"}\n')
+        return {
+            "status": "prepared",
+            "runtime_source_hashes": campaign._hash_package(
+                runtime_package, campaign.bench.Budget()
+            ),
+            "provider_seed_sha256": campaign._digest_bounded(
+                root / "provider" / "catalogue.duckdb", campaign.bench.Budget()
+            ),
+            "workspace_seed_sha256": campaign._digest_bounded(
+                root / "workspace" / "catalogue.duckdb", campaign.bench.Budget()
+            ),
+        }
+
+    monkeypatch.setattr(campaign.bench, "prepare_api_seed", prepare_api_seed)
+    monkeypatch.setattr(campaign, "_assert_campaign_provenance", lambda *_args: None)
+    monkeypatch.setattr(campaign, "_stage_sample", lambda *_args, **_kwargs: {"wall_s": 2.0})
+    monkeypatch.setattr(
+        campaign.bench,
+        "api_comparison",
+        lambda *_args: {"status": "qualified", "saved_s": 1.0},
+    )
+
+    campaign._run_v3(
+        tmp_path / "unused-full-pass-seed",
+        output,
+        campaign.bench.Budget(limit_s=10800),
+        set(),
+        report,
+        packages,
+        provenance,
+        "unused-seed-hash",
+        {},
+    )
+
+    assert prepared == ["closed_any"]
+    assert report["retained"] == ["closed_any"]
+    assert report["qualified_candidates"]["closed_any"]["workloads"] == ["closed_any"]
 
 
 def test_output_nested_in_source_is_rejected_before_any_evidence_is_created(tmp_path):
@@ -564,5 +965,5 @@ def test_source_package_rejects_symlink_and_special_entries(tmp_path, unsafe):
         os.mkfifo(file)
     else:
         pytest.skip("FIFO is unavailable")
-    with pytest.raises(ValueError, match="symlink or special"):
+    with pytest.raises(ValueError, match="symlink or special|link or reparse"):
         campaign.bench.validate_tree(source, python_only=True)

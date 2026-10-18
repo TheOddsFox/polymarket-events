@@ -142,6 +142,8 @@ def test_exact_raw_body_size_boundary_is_valid(tmp_path):
 
 
 def test_raw_fifo_is_rejected_before_opening_it(tmp_path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("POSIX FIFO contract; native reparse rejection has separate coverage")
     path = tmp_path / "fifo"
     os.mkfifo(path)
     with pytest.raises(ValueError):
