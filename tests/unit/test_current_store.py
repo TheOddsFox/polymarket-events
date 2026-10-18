@@ -230,10 +230,9 @@ def test_claim_scans_are_batched_per_response(db):
     apply(counted, response)
     assert len(counted.claim_queries) == 4
     assert counted.claim_queries[0].startswith("SELECT")
-    assert "JOIN (VALUES" in counted.claim_queries[0]
+    assert "asset_id IN (" in counted.claim_queries[0]
     assert counted.claim_queries[1].startswith("SELECT")
-    assert "k(venue, market_id)" in counted.claim_queries[1]
-    assert "JOIN (VALUES" in counted.claim_queries[1]
+    assert "market_id IN (" in counted.claim_queries[1]
     assert counted.claim_queries[2].startswith("DELETE")
     assert counted.claim_queries[3].startswith("INSERT")
 

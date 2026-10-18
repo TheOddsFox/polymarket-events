@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
 import tempfile
 import uuid
 from decimal import Decimal
@@ -15,7 +13,8 @@ from urllib.parse import urlsplit
 
 from oddsfox_catalogue.capture.writer import atomic_write_bytes, write_marker, write_page
 from oddsfox_catalogue.config import GammaSettings
-from oddsfox_catalogue.current_config import CurrentSettings, connect_store
+from oddsfox_catalogue.current_config import CurrentSettings, connect_store, safe_path
+from oddsfox_catalogue.current_contract import CurrentError
 from oddsfox_catalogue.gamma.http import GammaClient, GammaError
 from oddsfox_catalogue.ids import (
     canonical_json,
@@ -36,6 +35,14 @@ from oddsfox_catalogue.normalization import (
     project,
     validate_market_ids,
 )
+from oddsfox_catalogue.platform_support import (
+    is_link_or_reparse,
+    pinned_path,
+    remove_tree,
+    replace_directory,
+    require_durability,
+    sync_directory,
+)
 from oddsfox_catalogue.runlock import run_lock
 
 CONTRACT = "oddsfox.polymarket.metadata.v1"
@@ -46,6 +53,14 @@ MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 ID_RE = re.compile(r"[1-9][0-9]{0,19}\Z")
 CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
 CONFLICT_ERROR = "native identity has conflicting owners"
+
+
+def _existing_ancestor(path: Path) -> Path:
+    while not path.exists():
+        if path.parent == path:
+            raise MetadataError("metadata path has no existing filesystem ancestor")
+        path = path.parent
+    return path
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -260,9 +275,15 @@ def _write_bundle(
         or not 0 < max_output_bytes <= MAX_OUTPUT_BYTES
     ):
         raise MetadataError("metadata output limit must be positive")
-    if output.exists() or output.is_symlink():
+    if is_link_or_reparse(output) or output.exists():
         raise MetadataError("output must be a new immutable directory")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output = safe_path(output)
+    except CurrentError as exc:
+        raise MetadataError("output path is unsafe") from exc
+    anchor = _existing_ancestor(output.parent)
+    with pinned_path(anchor):
+        output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".metadata-", dir=output.parent))
     try:
         files, total = {}, 0
@@ -287,16 +308,15 @@ def _write_bundle(
             raise MetadataError("metadata output exceeds byte limit")
         atomic_write_bytes(stage / "manifest.json", manifest_bytes)
         # No global catalogue pointer is read or changed.
-        os.rename(stage, output)
-        fd = os.open(output.parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        if is_link_or_reparse(output) or output.exists():
+            raise MetadataError("output must be a new immutable directory")
+        replace_directory(stage, output)
+        sync_directory(output.parent)
         return manifest
     finally:
         if stage.exists():
-            shutil.rmtree(stage)
+            remove_tree(stage)
+            sync_directory(output.parent)
 
 
 def _validate_endpoint(gamma: GammaSettings) -> None:
@@ -349,8 +369,16 @@ def refresh_metadata(
 ) -> dict[str, Any]:
     """Fetch only named markets and export this capture's evidence, never stale fallbacks."""
     market_ids = validate_market_ids(market_ids)
-    if output.exists() or output.is_symlink():
+    if is_link_or_reparse(output) or output.exists():
         raise MetadataError("output must be a new immutable directory")
+    try:
+        output = safe_path(output)
+    except CurrentError as exc:
+        raise MetadataError("output path is unsafe") from exc
+    try:
+        producer_root = safe_path(Path(producer_root))
+    except CurrentError as exc:
+        raise MetadataError("producer path is unsafe") from exc
     if not 0 < max_body_bytes <= MAX_BODY_BYTES or not 0 < max_output_bytes <= MAX_OUTPUT_BYTES:
         raise MetadataError("metadata byte limits must be positive and within contract bounds")
     if any(
@@ -359,6 +387,8 @@ def refresh_metadata(
     ):
         raise MetadataError("metadata request/download limits must be nonnegative integers")
     _validate_endpoint(gamma)
+    require_durability(_existing_ancestor(producer_root))
+    require_durability(_existing_ancestor(output.parent))
     owned_client = client is None
     client = client or GammaClient(
         gamma,

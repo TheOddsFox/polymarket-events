@@ -704,12 +704,18 @@ def test_aggregate_usage_counts_link_text_without_opening_targets(tmp_path, monk
 
 
 def test_aggregate_usage_rejects_special_files(tmp_path):
+    if not hasattr(benchmark.os, "mkfifo"):
+        pytest.skip("POSIX FIFO contract; native reparse rejection has separate coverage")
     benchmark.os.mkfifo(tmp_path / "fifo")
     with pytest.raises(ValueError, match="special file"):
         benchmark.aggregate_usage(tmp_path)
 
 
 @pytest.mark.parametrize("entry_type", ["file", "directory"])
+@pytest.mark.skipif(
+    benchmark.os.name == "nt",
+    reason="POSIX mode-bit contract; native ACL denial has separate coverage",
+)
 def test_aggregate_usage_rejects_unreadable_entries(tmp_path, entry_type):
     entry = tmp_path / "unreadable"
     entry.mkdir() if entry_type == "directory" else entry.write_bytes(b"data")

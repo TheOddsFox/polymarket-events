@@ -4,6 +4,18 @@
 
 ### Added
 
+- A version-3 synthetic campaign for selective claims, full-pass queue handling,
+  certified market-ID retrieval and dense/sparse keyset discovery. Independent
+  workload oracles, exact supplied combinations and one shared three-hour budget
+  preserve the earlier manifest workflows and measurement-version-2 guards.
+  Index installation remains deferred without a safe admission model. Full runs and
+  performance qualification move to the Windows workstation; no speedup is claimed.
+- Selective unindexed claim lookups, linear full-pass queue handling, and explicitly
+  certified market-ID/keyset acquisition with version-2 replay compatibility.
+- Native Windows process containment, RSS accounting, reparse-safe storage and
+  fail-closed NTFS volume durability. Real Windows validation remains pending.
+  Existing verification wrappers are runnable with Python on either platform.
+
 - Versioned full-pass phase measurements and independent outcome/queue campaign
   comparisons, preserving legacy manifests and whole-worker performance guards.
   The bounded characterization retained neither candidate: no scored pairs fit.
@@ -16,6 +28,10 @@
   Verified publication comparisons use semantic row fingerprints independently of Parquet layout.
 
 ### Fixed
+
+- Failed optional capability reprobes preserve working certificates; contradictory
+  lifecycle proofs fence acquisition until a successful reprobe. Certificate,
+  diagnostic, fence and keyset-state changes commit atomically.
 
 - Oversized native asset IDs are quarantined as invalid identities without aborting a response.
 - Prefetch handoff keeps completed responses available without a duplicate GET or

@@ -27,6 +27,7 @@ from oddsfox_catalogue.current_config import (  # noqa: E402
     safe_path,
     validate_root,
 )
+from oddsfox_catalogue.platform_support import operator_signals  # noqa: E402
 from oddsfox_catalogue.signals import SIGNALS, Terminated  # noqa: E402
 
 
@@ -329,7 +330,7 @@ def run(args):
 def main():
     previous = {
         signum: signal.signal(signum, lambda signum, _frame: SIGNALS.receive(signum))
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        for signum in operator_signals(include_interrupt=True)
     }
     try:
         return run(parser().parse_args())

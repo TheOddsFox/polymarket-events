@@ -8,11 +8,13 @@ import logging
 import os
 import signal
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
 from .current_contract import CurrentError
+from .platform_support import operator_signals, pinned_path, require_durability
 from .runlock import RunBusy, run_lock
 from .signals import SIGNALS, Terminated
 
@@ -27,7 +29,7 @@ def _install_termination_handlers():
     def handle(signum, _frame):
         SIGNALS.receive(signum)
 
-    previous = {s: signal.signal(s, handle) for s in (signal.SIGHUP, signal.SIGTERM)}
+    previous = {s: signal.signal(s, handle) for s in operator_signals()}
 
     def restore():
         for signum, handler in previous.items():
@@ -52,6 +54,11 @@ def build_parser():
         help="start a forced full pass, or resume an unfinished one",
     )
     probe = sub.add_parser("probe", help="bounded native/bulk provider compatibility checks")
+    probe.add_argument(
+        "--api-optimizations",
+        action="store_true",
+        help="also certify optional bounded API acquisition capabilities",
+    )
     for entity in ("event", "market"):
         for status in ("open", "closed", "absent"):
             probe.add_argument(f"--{status}-{entity}-id", action="append", required=True)
@@ -75,7 +82,7 @@ def build_parser():
 def _metadata(args):
     from .current_config import load_current_settings
     from .ids import sha256_bytes
-    from .metadata import GammaClient, refresh_metadata
+    from .metadata import GammaClient, _existing_ancestor, refresh_metadata
 
     root = args.root
     if root is None and os.environ.get("CATALOGUE_ROOT"):
@@ -99,7 +106,18 @@ def _metadata(args):
             raise CurrentError("metadata.v1 requires isolated producer and output roots")
     client = None
     try:
-        with run_lock(producer.run_lock_path):
+        if os.name == "nt":
+            from .current_runtime import _windows_root_guard
+
+            if not producer.root.exists():
+                ancestor = _existing_ancestor(producer.root)
+                require_durability(ancestor)
+                with pinned_path(ancestor):
+                    producer.root.mkdir(parents=True, exist_ok=True)
+            guard = _windows_root_guard(producer, "metadata")
+        else:
+            guard = nullcontext()
+        with guard, run_lock(producer.run_lock_path):
             client = GammaClient(
                 producer.gamma,
                 max_body_bytes=args.max_response_bytes,
@@ -165,10 +183,13 @@ def _current(args):
         options = {"full_pass": args.full_pass}
     if operation == "probe":
         options = {
-            f"{entity}_ids": {
-                s: getattr(args, f"{s}_{entity}_id") for s in ("open", "closed", "absent")
-            }
-            for entity in ("event", "market")
+            "api_optimizations": args.api_optimizations,
+            **{
+                f"{entity}_ids": {
+                    s: getattr(args, f"{s}_{entity}_id") for s in ("open", "closed", "absent")
+                }
+                for entity in ("event", "market")
+            },
         }
     validate_root(settings.root, initialize=operation == "init")
     success, result = supervise(

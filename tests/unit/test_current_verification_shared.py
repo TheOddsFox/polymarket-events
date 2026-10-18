@@ -446,6 +446,8 @@ def test_candidate_requires_exact_manifest_readback(candidate, monkeypatch, muta
     ],
 )
 def test_candidate_rejects_changed_inventory_and_special_files(candidate, monkeypatch, mutation):
+    if mutation in {"extra-fifo", "parquet-fifo"} and not hasattr(os, "mkfifo"):
+        pytest.skip("POSIX FIFO contract; native reparse rejection has separate coverage")
     settings, conn, _, _, _ = candidate
 
     def tamper(path, data):

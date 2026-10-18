@@ -184,6 +184,36 @@ def _load_keyed(conn, query, keys, width, key_length):
     }
 
 
+def _select_claims_by_assets(conn, keys):
+    """Select by bounded scalar keys, then enforce the exact namespace per chunk."""
+    found = []
+    for chunk in _chunks(keys):
+        expected = set(chunk)
+        asset_ids = list(dict.fromkeys(key[2] for key in chunk))
+        rows = conn.execute(
+            "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims "
+            f"WHERE asset_id IN ({','.join('?' for _ in asset_ids)})",
+            asset_ids,
+        ).fetchall()
+        found.extend(row for row in rows if (row[0], row[3], row[4]) in expected)
+    return found
+
+
+def _select_claims_by_markets(conn, keys):
+    """Select by bounded scalar keys, then enforce venue ownership per chunk."""
+    found = []
+    for chunk in _chunks(keys):
+        expected = set(chunk)
+        market_ids = list(dict.fromkeys(key[1] for key in chunk))
+        rows = conn.execute(
+            "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims "
+            f"WHERE market_id IN ({','.join('?' for _ in market_ids)})",
+            market_ids,
+        ).fetchall()
+        found.extend(row for row in rows if (row[0], row[1]) in expected)
+    return found
+
+
 def _apply_set(conn, response, stamp, progress, attempts):
     event_keys = list({(row["venue"], row["event_id"]) for row in response.events})
     # A repeated id in one response keeps the first row, matching the receipt gate.
@@ -342,18 +372,7 @@ def _apply_set(conn, response, stamp, progress, attempts):
             for outcome in json.loads(mapping) if mapping else []:
                 asset_keys.add((key[0], outcome["asset_kind"], outcome["asset_id"]))
     claims = {}
-    matched = (
-        _select_in(
-            conn,
-            "SELECT c.venue, c.market_id, c.role, c.asset_kind, c.asset_id FROM _identity_claims c "
-            "JOIN (VALUES {values}) k(venue, asset_kind, asset_id) "
-            "ON c.venue=k.venue AND c.asset_kind=k.asset_kind AND c.asset_id=k.asset_id",
-            asset_keys,
-            3,
-        )
-        if asset_keys
-        else []
-    )
+    matched = _select_claims_by_assets(conn, asset_keys) if asset_keys else []
     impacted = set(market_keys)
     for venue, market_id, role, kind, asset in matched:
         claims.setdefault((venue, kind, asset), {}).setdefault(market_id, set()).add(role)
@@ -416,14 +435,7 @@ def _apply_set(conn, response, stamp, progress, attempts):
     )
     stored_claims = {}
     if market_keys:
-        for claim in _select_in(
-            conn,
-            "SELECT c.venue, c.market_id, c.role, c.asset_kind, c.asset_id FROM _identity_claims c "
-            "JOIN (VALUES {values}) k(venue, market_id) "
-            "ON c.venue=k.venue AND c.market_id=k.market_id",
-            market_keys,
-            2,
-        ):
+        for claim in _select_claims_by_markets(conn, market_keys):
             stored_claims.setdefault(claim[:2], []).append(claim)
 
     market_state = {key: list(before_markets[key]) for key in before_markets}

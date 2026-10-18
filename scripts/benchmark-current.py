@@ -16,7 +16,6 @@ import json
 import math
 import os
 import platform
-import resource
 import shutil
 import stat
 import subprocess
@@ -47,6 +46,7 @@ from oddsfox_catalogue.current_store import get_state  # noqa: E402
 from oddsfox_catalogue.current_sync import fetch_apply  # noqa: E402
 from oddsfox_catalogue.gamma.http import CaptureStopped, GammaClient  # noqa: E402
 from oddsfox_catalogue.limits import directory_bytes  # noqa: E402
+from oddsfox_catalogue.platform_support import peak_process_rss_bytes  # noqa: E402
 
 
 def require(condition, message):
@@ -501,31 +501,55 @@ def cli(root, source, executable, *args):
                 )
     command = [executable] if executable else [sys.executable, "-m", "oddsfox_catalogue"]
     started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            [*command, "--root", str(root), *args],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=defaults.limits.max_duration_s + 10,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        completed = subprocess.CompletedProcess(
-            exc.cmd,
-            124,
-            exc.stdout.decode(errors="replace")
-            if isinstance(exc.stdout, bytes)
-            else exc.stdout or "",
-            exc.stderr.decode(errors="replace")
-            if isinstance(exc.stderr, bytes)
-            else exc.stderr or "CLI timeout",
-        )
-    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    full_command = [*command, "--root", str(root), *args]
+    if os.name == "nt":
+        process = subprocess.Popen(full_command, env=env, capture_output=True, text=True)
+        try:
+            stdout, stderr = process.communicate(timeout=defaults.limits.max_duration_s + 10)
+            completed = subprocess.CompletedProcess(
+                full_command, process.returncode, stdout, stderr
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            completed = subprocess.CompletedProcess(
+                full_command, 124, stdout, stderr or "CLI timeout"
+            )
+        peak = peak_process_rss_bytes(process)
+    else:
+        import resource
+
+        try:
+            completed = subprocess.run(
+                full_command,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=defaults.limits.max_duration_s + 10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            completed = subprocess.CompletedProcess(
+                exc.cmd,
+                124,
+                exc.stdout.decode(errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else exc.stdout or "",
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else exc.stderr or "CLI timeout",
+            )
+        peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     result = {
         "process_rss": {
-            "children_cumulative_peak_bytes": peak if sys.platform == "darwin" else peak * 1024,
-            "scope": "all completed CLI children so far; not isolated per invocation",
+            "children_cumulative_peak_bytes": (
+                peak if os.name == "nt" or sys.platform == "darwin" else peak * 1024
+            ),
+            "scope": (
+                "this completed CLI child peak working set"
+                if os.name == "nt"
+                else "all completed CLI children so far; not isolated per invocation"
+            ),
         },
         "command": command + ["--root", str(root), *args],
         "elapsed_wall_s": time.monotonic() - started,
@@ -1049,7 +1073,9 @@ def run(args):
                 row["http"] = source.stats
                 row["retry_responses"] = sum(r["status"] >= 429 for r in source.stats["responses"])
             row["files"] = {
-                str(p.relative_to(root)): p.stat().st_size for p in root.rglob("*") if p.is_file()
+                p.relative_to(root).as_posix(): p.stat().st_size
+                for p in root.rglob("*")
+                if p.is_file()
             }
             row["capacity_after"] = capacity(
                 seed, output, args.max_retained_bytes, account_roots=account_roots

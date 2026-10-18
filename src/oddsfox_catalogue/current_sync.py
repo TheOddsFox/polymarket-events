@@ -3,6 +3,7 @@
 import copy
 import json
 import queue
+import re
 import threading
 import time
 import uuid
@@ -10,13 +11,22 @@ from types import SimpleNamespace
 
 from . import current_store
 from .capture.writer import read_body, read_manifest, write_page
-from .current_config import admit, validate_root
+from .current_config import admit, safe_path, validate_root
 from .current_contract import PROJECTION_VERSION, CurrentError
 from .current_rows import _incomplete, entity_id, project_response
-from .gamma.http import CaptureStopped, MalformedResponse, RequestBudgetExceeded, ResponseTooLarge
+from .gamma.http import (
+    CaptureStopped,
+    CursorExpired,
+    MalformedResponse,
+    RequestBudgetExceeded,
+    ResponseTooLarge,
+    RetriesExhausted,
+)
 from .gamma.paginators import _window_params, unpack
+from .platform_support import is_link_or_reparse
 
 LANES = ("events", "markets")
+_RAW_ID = re.compile(r"[0-9a-f]{32}\Z")
 POLICY = {
     "version": 2,
     "projection_version": PROJECTION_VERSION,
@@ -31,9 +41,19 @@ POLICY = {
 def _pending_manifest(directory, root):
     path = directory / "p000001.manifest.json"
     manifest = read_manifest(path, trusted_root=root)
-    if manifest is None and (path.exists() or path.is_symlink()):
+    if manifest is None and (path.exists() or is_link_or_reparse(path)):
         raise CurrentError("corrupt pending response manifest")
     return manifest
+
+
+def _safe_pending_raw_dir(settings, raw_id):
+    if not isinstance(raw_id, str) or _RAW_ID.fullmatch(raw_id) is None:
+        raise CurrentError("unsafe pending raw identity")
+    raw_root = safe_path(settings.raw_dir)
+    raw_dir = safe_path(raw_root / raw_id)
+    if raw_dir.parent != raw_root:
+        raise CurrentError("pending raw identity escaped the raw directory")
+    return raw_dir
 
 
 def _records(response, lane, wanted=None, *, native=False, closed=None):
@@ -169,10 +189,274 @@ def probe_policy(settings, client, *, event_ids, market_ids):
     return certificate
 
 
-def _certificate(settings, conn, lane):
-    certificate = current_store.get_state(conn, "bulk_policy", {})
+def _pending_work(conn):
+    discovery = current_store.get_state(conn, "discovery", {})
+    return (
+        current_store.get_state(conn, "fetch_pending") is not None
+        or (isinstance(discovery, dict) and discovery.get("pending") is not None)
+        or current_store.get_state(conn, "keyset_pending") is not None
+    )
+
+
+def acquisition_block(conn):
+    """Return the frozen certificate that must remain fenced after a reprobe."""
+    return current_store.get_state(conn, "_acquisition_block")
+
+
+def require_acquisition_allowed(settings, conn):
+    block = acquisition_block(conn)
     if (
-        any(certificate.get(k) != v for k, v in POLICY.items())
+        isinstance(block, dict)
+        and block.get("origin") == settings.gamma.base_url
+        and block.get("certificate") == current_store.get_state(conn, "bulk_policy", {})
+    ):
+        raise CurrentError("acquisition is blocked until a successful policy reprobe")
+
+
+def semantic_lane_proofs(lanes):
+    """Ignore diagnostic metadata while comparing certified lifecycle coverage."""
+    if not isinstance(lanes, dict):
+        return None
+    return {
+        lane: {
+            "supported": proof.get("supported") if isinstance(proof, dict) else None,
+            "passes": proof.get("passes") if isinstance(proof, dict) else None,
+        }
+        for lane in LANES
+        for proof in (lanes.get(lane),)
+    }
+
+
+def _same_projection(left, right, lane):
+    stamp = "2000-01-01T00:00:00+00:00"
+    a = project_response([left], lane, received_at=stamp, response_id="probe")
+    b = project_response([right], lane, received_at=stamp, response_id="probe")
+    return (a.events, a.markets, a.outcomes, a.memberships) == (
+        b.events,
+        b.markets,
+        b.outcomes,
+        b.memberships,
+    )
+
+
+def _probe_market_closed_any(client, ids, native):
+    ids = sorted(int(entity_id(value)) for value in ids)
+    if not 3 <= len(ids) <= 100:
+        raise CurrentError("closed=any probe requires 3..100 market IDs")
+    response = client.get("/markets", _window_params(ids, "markets", "any"))
+    records = _records(response, "markets", ids)
+    listed = {entity_id(row["id"]): row for row in records}
+    expected = set(native)
+    if set(listed) != expected:
+        raise CurrentError("closed=any omissions differ from native controls")
+    for key, record in listed.items():
+        if not _same_projection(record, native[key], "markets"):
+            raise CurrentError("closed=any/native projection mismatch")
+
+
+def _probe_keyset_pass(client, lane, closed, expected_ids):
+    params = {"limit": 10, "order": "id", "ascending": True}
+    if closed is not None:
+        params["closed"] = closed
+    if lane == "markets":
+        params["include_tag"] = True
+    endpoint = f"/{lane}/keyset"
+    previous = 0
+    seen = set()
+    cursor = None
+    for _ in range(2):
+        request_params = dict(params)
+        if cursor is not None:
+            request_params["after_cursor"] = cursor
+        response = client.get(endpoint, request_params)
+        if response.status != 200 or not isinstance(response.json, dict):
+            raise CurrentError("keyset endpoint did not return a page envelope")
+        records, next_cursor = unpack(response.json, lane)
+        if set(response.json) - {lane, "next_cursor"} or len(records) > params["limit"]:
+            raise CurrentError("invalid keyset page envelope")
+        for record in records:
+            key = entity_id(record.get("id"))
+            number = int(key)
+            if number <= previous or key in seen:
+                raise CurrentError("keyset page IDs are not strictly increasing")
+            checked = _records(SimpleNamespace(status=200, json=record), lane, closed=closed)[0]
+            if lane == "markets" and (
+                type(record.get("closed")) is not bool or record["closed"] is not closed
+            ):
+                raise CurrentError("keyset market lifecycle differs from frozen pass")
+            native_response = client.get(f"/{lane}/{key}", {})
+            native = _records(native_response, lane, [number], native=True)[0]
+            if not _same_projection(checked, native, lane):
+                raise CurrentError("keyset/native projection mismatch")
+            if lane == "events" and any(
+                value is None for value in _project([checked], lane, response).memberships.values()
+            ):
+                raise CurrentError("keyset event membership is incomplete")
+            seen.add(key)
+            previous = number
+        if next_cursor is not None and (not next_cursor or next_cursor == cursor):
+            raise CurrentError("keyset cursor did not advance")
+        if next_cursor is None:
+            break
+        cursor = next_cursor
+    expected = sorted({entity_id(value) for value in expected_ids}, key=int)
+    for offset in range(0, len(expected), 100):
+        batch = expected[offset : offset + 100]
+        control_params = {"limit": len(batch), "order": "id", "ascending": True, "id": batch}
+        if closed is not None:
+            control_params["closed"] = closed
+        if lane == "markets":
+            control_params["include_tag"] = True
+        cursor = None
+        last_control_id = 0
+        seen_controls = set()
+        for _ in range(len(batch) + 1):
+            request_params = dict(control_params)
+            if cursor is not None:
+                request_params["after_cursor"] = cursor
+            response = client.get(endpoint, request_params)
+            if response.status != 200 or not isinstance(response.json, dict):
+                raise CurrentError("keyset control query did not return a page envelope")
+            control_rows, next_cursor = unpack(response.json, lane)
+            if set(response.json) - {lane, "next_cursor"} or len(control_rows) > len(batch):
+                raise CurrentError("invalid keyset control page envelope")
+            for record in control_rows:
+                checked = _records(SimpleNamespace(status=200, json=record), lane, closed=closed)[0]
+                key = entity_id(checked["id"])
+                if key not in batch or key in seen_controls or int(key) <= last_control_id:
+                    raise CurrentError("keyset control query returned duplicate or unordered IDs")
+                if lane == "markets" and (
+                    type(record.get("closed")) is not bool or record["closed"] is not closed
+                ):
+                    raise CurrentError(
+                        "keyset market control lifecycle differs from requested pass"
+                    )
+                native_response = client.get(f"/{lane}/{key}", {})
+                native = _records(native_response, lane, [int(key)], native=True)[0]
+                if not _same_projection(checked, native, lane):
+                    raise CurrentError("keyset control/native projection mismatch")
+                seen_controls.add(key)
+                last_control_id = int(key)
+            if next_cursor is None:
+                break
+            if not next_cursor or next_cursor == cursor:
+                raise CurrentError("keyset control cursor did not advance")
+            cursor = next_cursor
+        if seen_controls != set(batch):
+            raise CurrentError("keyset control query omitted a known ID")
+
+
+def _probe_keyset(client, event_ids, market_ids):
+    for lane in LANES:
+        for closed in (None,) if lane == "events" else (False, True):
+            controls = event_ids if lane == "events" else market_ids
+            expected = (
+                [*controls["open"], *controls["closed"]]
+                if lane == "events"
+                else controls["closed" if closed else "open"]
+            )
+            _probe_keyset_pass(client, lane, closed, expected)
+
+
+def probe_api_optimizations(
+    settings,
+    conn,
+    client,
+    *,
+    event_ids,
+    market_ids,
+    market_closed_any=True,
+    keyset_discovery=True,
+):
+    """Probe optional API capabilities without replacing a working certificate on failure."""
+    validate_root(settings.root)
+    if _pending_work(conn):
+        raise CurrentError("cannot replace acquisition certificate while work is pending")
+    base = probe_policy(settings, client, event_ids=event_ids, market_ids=market_ids)
+    if not all(lane.get("supported") for lane in base["lanes"].values()):
+        raise CurrentError("base provider policy failed; existing certificate retained")
+    capabilities = {}
+    if market_closed_any:
+        try:
+            native = {}
+            groups = market_ids
+            for status in ("open", "closed"):
+                for value in groups[status]:
+                    key = entity_id(value)
+                    response = client.get(f"/markets/{key}", {})
+                    row = _records(response, "markets", [int(key)], native=True)[0]
+                    if row.get("closed") is not (status == "closed"):
+                        raise CurrentError("native lifecycle differs from control")
+                    native[key] = row
+            absent = {entity_id(value) for value in groups["absent"]}
+            for value in absent:
+                response = client.get(f"/markets/{value}", {})
+                if response.status != 404:
+                    raise CurrentError("absent native control did not return 404")
+            _probe_market_closed_any(client, [*native, *absent], native)
+            capabilities["market_closed_any"] = {
+                "supported": True,
+                "controls": sorted([*native, *absent], key=int),
+                "lifecycle_coverage": "known-controls-only",
+            }
+        except (
+            CurrentError,
+            ValueError,
+            MalformedResponse,
+            RetriesExhausted,
+            CursorExpired,
+        ) as exc:
+            capabilities["market_closed_any"] = {"supported": False, "error": str(exc)}
+    if keyset_discovery:
+        event_passes = base["lanes"].get("events", {}).get("passes")
+        if event_passes != [None]:
+            # Keyset bootstrap freezes one unfiltered event highwater.  It is
+            # safe only when the base certificate proves that endpoint covers
+            # every lifecycle; split legacy passes cannot establish that.
+            capabilities["keyset_discovery"] = {
+                "supported": False,
+                "error": "keyset event highwater requires certified all-lifecycle event coverage",
+            }
+        else:
+            try:
+                from . import current_keyset
+
+                _probe_keyset(client, event_ids, market_ids)
+                capabilities["keyset_discovery"] = {
+                    "supported": True,
+                    "page_limit": current_keyset.PAGE_LIMIT,
+                    "order": "id-ascending",
+                    "lifecycle_coverage": "events-all-markets-open-and-closed",
+                    "proof": "two-page-native-parity",
+                }
+            except (
+                CurrentError,
+                ValueError,
+                MalformedResponse,
+                RetriesExhausted,
+                CursorExpired,
+            ) as exc:
+                capabilities["keyset_discovery"] = {"supported": False, "error": str(exc)}
+    return {
+        "version": 3,
+        "policy": POLICY,
+        "origin": settings.gamma.base_url,
+        "lanes": base["lanes"],
+        "capabilities": capabilities,
+    }
+
+
+def _certificate(settings, conn, lane):
+    require_acquisition_allowed(settings, conn)
+    certificate = current_store.get_state(conn, "bulk_policy", {})
+    v3 = certificate.get("version") == 3
+    policy = certificate.get("policy") if v3 else certificate
+    if (
+        (
+            v3
+            and (not isinstance(policy, dict) or any(policy.get(k) != v for k, v in POLICY.items()))
+        )
+        or (not v3 and any(certificate.get(k) != v for k, v in POLICY.items()))
         or certificate.get("origin") != settings.gamma.base_url
         or certificate.get("lanes", {}).get(lane, {}).get("supported") is not True
     ):
@@ -183,6 +467,34 @@ def _certificate(settings, conn, lane):
     ):
         raise CurrentError("certificate has unsupported lifecycle passes")
     return certificate, passes
+
+
+def market_closed_any_supported(settings, conn):
+    certificate = current_store.get_state(conn, "bulk_policy", {})
+    return (
+        certificate.get("version") == 3
+        and certificate.get("origin") == settings.gamma.base_url
+        and certificate.get("policy") == POLICY
+        and certificate.get("capabilities", {}).get("market_closed_any", {}).get("supported")
+        is True
+    )
+
+
+def _api_certificate_version(conn):
+    return 3 if current_store.get_state(conn, "bulk_policy", {}).get("version") == 3 else 2
+
+
+def _pending_policy(conn):
+    return (
+        {**POLICY, "acquisition_certificate_version": 3}
+        if _api_certificate_version(conn) == 3
+        else POLICY
+    )
+
+
+def _policy_matches(certificate):
+    policy = certificate.get("policy") if certificate.get("version") == 3 else certificate
+    return isinstance(policy, dict) and all(policy.get(k) == v for k, v in POLICY.items())
 
 
 def validate_discovery_pending(settings, conn, work):
@@ -202,6 +514,7 @@ def validate_discovery_pending(settings, conn, work):
             or len(work["heads"]) + len(work["remaining"]) != len(passes)
         ):
             raise CurrentError("incompatible pending discovery policy")
+        _safe_pending_raw_dir(settings, work.get("raw_id"))
         requests = []
         for closed in passes:
             params = {"limit": 1, "order": "id", "ascending": False}
@@ -217,11 +530,9 @@ def validate_discovery_pending(settings, conn, work):
 def discover(settings, conn, client, *, deadline):
     """Freeze pass heads, then commit each whole numeric window atomically."""
     validate_root(settings.root)
+    require_acquisition_allowed(settings, conn)
     certificate = current_store.get_state(conn, "bulk_policy", {})
-    if (
-        any(certificate.get(k) != v for k, v in POLICY.items())
-        or certificate.get("origin") != settings.gamma.base_url
-    ):
+    if not _policy_matches(certificate) or certificate.get("origin") != settings.gamma.base_url:
         raise CurrentError("a matching bulk policy probe certificate is required")
     for lane in LANES:
         if certificate.get("lanes", {}).get(lane, {}).get("supported") is True:
@@ -247,6 +558,84 @@ def discover(settings, conn, client, *, deadline):
     stop = deadline - reserve
     counters = {"requests": 0, "responses": 0, "records": 0}
     visited = set()
+    keyset_capability = certificate.get("capabilities", {}).get("keyset_discovery", {})
+    bootstrap_state = current_store.get_state(conn, "keyset_bootstrap_complete", False)
+    initial_frontiers = all(
+        item.get("frontier") == 0 and item.get("highwater") is None
+        for item in state["lanes"].values()
+    )
+    if (
+        keyset_capability.get("supported") is True
+        and bootstrap_state is not True
+        and state["pending"] is None
+        and initial_frontiers
+    ):
+        from .current_keyset import cold_page
+
+        # Bootstrap pages share the validated durable page machinery, while the
+        # private marker keeps their lifecycle passes separate from later cold slots.
+        key_state = current_store.get_state(conn, "keyset_discovery")
+        next_lane = 0 if key_state is None else key_state.get("next_lane", 0)
+        while time.monotonic() < stop:
+            key_state = current_store.get_state(conn, "keyset_discovery")
+            if key_state is not None and all(
+                progress["done"]
+                for lane_progress in key_state["lanes"].values()
+                for progress in lane_progress["passes"].values()
+            ):
+                break
+            lanes = list(LANES)
+            lane = lanes[next_lane % len(lanes)]
+            try:
+                result = cold_page(
+                    settings,
+                    conn,
+                    client,
+                    lane,
+                    reconcile_state=None,
+                    now=None,
+                    cycle_started="bootstrap-v1",
+                )
+            except (CaptureStopped, RequestBudgetExceeded):
+                break
+            counters["responses"] += result.get("responses", 0)
+            counters["records"] += result.get("records", 0)
+            key_state = current_store.get_state(conn, "keyset_discovery")
+            next_lane = (LANES.index(lane) + 1) % len(LANES)
+            if result.get("complete"):
+                next_lane = (LANES.index(lane) + 1) % len(LANES)
+            # Stop after a network-free empty highwater completion only if the
+            # other lane still has work; the loop's persisted state is authoritative.
+        key_state = current_store.get_state(conn, "keyset_discovery")
+        if key_state is not None and all(
+            progress["done"]
+            for lane_progress in key_state["lanes"].values()
+            for progress in lane_progress["passes"].values()
+        ):
+            event_highwater = key_state["lanes"]["events"]["passes"]["all"]["highwater"] or 0
+            market_highwater = max(
+                key_state["lanes"]["markets"]["passes"][name]["highwater"] or 0
+                for name in ("open", "closed")
+            )
+            next_state = copy.deepcopy(state)
+            next_state["lanes"]["events"]["frontier"] = event_highwater
+            next_state["lanes"]["markets"]["frontier"] = market_highwater
+            current_store.set_state(conn, "discovery", next_state)
+            current_store.set_state(conn, "keyset_bootstrap_complete", True)
+            state = next_state
+        elif initial_frontiers:
+            # Do not create a numeric highwater unit while the keyset bootstrap
+            # has a durable page pending; resume that exact page first.
+            return {
+                **counters,
+                "frontiers": state["lanes"],
+                "pending": state["pending"],
+                "backlog": sum(
+                    max(0, (value["highwater"] or value["frontier"]) - value["frontier"])
+                    for value in state["lanes"].values()
+                ),
+                "source_complete": False,
+            }
     while time.monotonic() < stop:
         pending = state["pending"]
         if pending is None:
@@ -538,6 +927,7 @@ def fetch_unit(
     it is stored with the pending unit, so a resumed unit keeps the mode it started with.
     """
     validate_root(settings.root)
+    require_acquisition_allowed(settings, conn)
     lane = {"event": "events", "market": "markets"}.get(kind, kind)
     if lane not in LANES:
         raise CurrentError("unknown repair lane")
@@ -545,19 +935,25 @@ def fetch_unit(
     if not wanted or len(wanted) > 100 or len(set(wanted)) != len(wanted):
         raise CurrentError("repair requests require 1..100 distinct IDs")
     certificate, passes = (None, [None]) if native else _certificate(settings, conn, lane)
+    if not native and lane == "markets" and market_closed_any_supported(settings, conn):
+        passes = ["any"]
     existing = current_store.get_state(conn, "fetch_pending")
     identity = {
         "lane": lane,
         "ids": wanted,
         "native": native,
         "progress": progress or {},
-        "policy": POLICY,
+        "policy": _pending_policy(conn),
         "certificate": certificate,
         "passes": passes,
+        "api_certificate_version": _api_certificate_version(conn),
     }
     if existing is not None:
         validate_fetch_pending(settings, conn, existing)
-        if existing["identity"] != identity:
+        expected_identity = dict(identity)
+        if "api_certificate_version" not in existing["identity"]:
+            expected_identity.pop("api_certificate_version")
+        if existing["identity"] != expected_identity:
             raise CurrentError("resume the pending repair before starting another")
     requests = (
         [{"endpoint": f"/{lane}/{key}", "params": {}} for key in wanted]
@@ -606,7 +1002,11 @@ def fetch_unit(
                 records = []
             else:
                 records = _records(
-                    response, lane, batch, native=native, closed=params.get("closed")
+                    response,
+                    lane,
+                    batch,
+                    native=native,
+                    closed=None if params.get("closed") == "any" else params.get("closed"),
                 )
             _project(records, lane, response)
             _write_response(settings, raw_dir, response, request)
@@ -627,7 +1027,7 @@ def fetch_unit(
                 lane,
                 batch,
                 native=native,
-                closed=params.get("closed"),
+                closed=None if params.get("closed") == "any" else params.get("closed"),
             )
         if not native:
             listed.update(entity_id(record["id"]) for record in records)
@@ -663,12 +1063,23 @@ def validate_fetch_pending(settings, conn, work):
     try:
         identity = work["identity"]
         lane, native = identity["lane"], identity["native"]
-        if lane not in LANES or type(native) is not bool or identity["policy"] != POLICY:
+        if lane not in LANES or type(native) is not bool:
             raise CurrentError("incompatible pending repair policy")
+        api_version = identity.get("api_certificate_version", 2)
+        expected_policy = (
+            {**POLICY, "acquisition_certificate_version": 3} if api_version == 3 else POLICY
+        )
+        if identity["policy"] != expected_policy:
+            raise CurrentError("incompatible pending repair policy")
+        if api_version != _api_certificate_version(conn):
+            raise CurrentError("incompatible pending acquisition certificate")
         absence = work.get("absence", False)
         if type(absence) is not bool or (absence and not native):
             raise CurrentError("incompatible pending repair policy")
+        _safe_pending_raw_dir(settings, work.get("raw_id"))
         certificate, passes = (None, [None]) if native else _certificate(settings, conn, lane)
+        if not native and lane == "markets" and market_closed_any_supported(settings, conn):
+            passes = ["any"]
         if identity["certificate"] != certificate or identity["passes"] != passes:
             raise CurrentError("incompatible pending repair certificate")
         ids = identity["ids"]
@@ -689,7 +1100,7 @@ def validate_fetch_pending(settings, conn, work):
                     and len(batch) <= 100
                     and len(batch) == len(set(batch))
                     and set(batch) <= set(ids)
-                    and any(closed is value for value in passes)
+                    and any(type(closed) is type(value) and closed == value for value in passes)
                     and request
                     == {"endpoint": f"/{lane}", "params": _window_params(batch, lane, closed)}
                 )
@@ -701,6 +1112,12 @@ def validate_fetch_pending(settings, conn, work):
 
 def resume_pending(settings, conn, client):
     """Resume a durable repair using only its frozen request and checkpoint."""
+    if current_store.get_state(conn, "keyset_pending") is not None:
+        if current_store.get_state(conn, "fetch_pending") is not None:
+            raise CurrentError("multiple frozen acquisition requests require recovery")
+        from .current_keyset import resume_pending as resume_keyset
+
+        return resume_keyset(settings, conn, client)
     work = current_store.get_state(conn, "fetch_pending")
     if work is None:
         return {"responses": 0}

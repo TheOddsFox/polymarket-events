@@ -3,7 +3,6 @@
 import json
 import multiprocessing
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -26,6 +25,7 @@ from oddsfox_catalogue.current_config import CurrentLimits, CurrentSettings, val
 from oddsfox_catalogue.current_contract import CurrentError
 from oddsfox_catalogue.current_rows import project_response
 from oddsfox_catalogue.gamma.http import GammaClient, RequestBudgetExceeded
+from oddsfox_catalogue.platform_support import operator_signals
 from oddsfox_catalogue.signals import SignalHold, Terminated
 
 
@@ -84,6 +84,8 @@ def test_three_generations_retain_exactly_current_and_previous(catalogue):
 @pytest.mark.parametrize("artifact", ["release", "stage"])
 @pytest.mark.parametrize("unsafe", ["symlink", "fifo"])
 def test_cleanup_rejects_unsafe_descendants_before_deleting(catalogue, artifact, unsafe):
+    if unsafe == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("POSIX FIFO contract; native reparse rejection has separate coverage")
     settings, _ = catalogue
     generated = (
         settings.published_dir / "releases" / ("a" * 32)
@@ -457,7 +459,7 @@ def _stall_worker(*_args):
         time.sleep(60)
 
 
-@pytest.mark.parametrize("failure", [signal.SIGTERM, signal.SIGHUP, "exception"])
+@pytest.mark.parametrize("failure", [*operator_signals(), "exception"])
 def test_supervisor_launch_interrupt_stops_worker_and_closes_pipes(tmp_path, monkeypatch, failure):
     context = multiprocessing.get_context("spawn")
     held = SignalHold()

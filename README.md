@@ -55,5 +55,9 @@ uv run python scripts/verify-distribution.py dist/*.whl dist/*.tar.gz
 uv run python scripts/benchmark-current.py --help
 ```
 
+On native Windows, use `python scripts/verify-fast` and `python scripts/verify`.
+The [guide](docs/current-catalogue.md#native-windows) describes required NTFS/elevated
+volume-flush access and the native validation still pending.
+
 Use the installed-distribution workflow and benchmark instructions in the guide before
 making performance or deployment claims.

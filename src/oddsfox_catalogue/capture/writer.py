@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from oddsfox_catalogue.ids import canonical_json, sha256_bytes
+from oddsfox_catalogue.platform_support import (
+    is_link_or_reparse,
+    open_regular_nofollow,
+    pinned_path,
+    replace_file,
+    sync_directory,
+)
 
 MANIFEST_VERSION = 1
 MAX_BODY_BYTES = 16 * 1024**2
@@ -25,25 +32,28 @@ MAX_MANIFEST_BYTES = 1024**2
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     for ancestor in path.parents:
-        if ancestor.is_symlink():
+        if is_link_or_reparse(ancestor):
             raise ValueError("output path contains a symlink")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    anchor = path.parent
+    while not anchor.exists():
+        anchor = anchor.parent
+    with pinned_path(anchor):
+        path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    with pinned_path(path.parent):
+        fd = open_regular_nofollow(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    if is_link_or_reparse(path):
+        raise ValueError("output path is a reparse point")
+    replace_file(tmp, path)
     _fsync_dir(path.parent)
 
 
 def _fsync_dir(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    sync_directory(directory)
 
 
 def page_stem(seq: int) -> str:
@@ -101,11 +111,11 @@ def read_regular_bytes(path: Path, *, max_bytes: int, trusted_root: Path | None 
         if not path.is_relative_to(root):
             raise ValueError("raw path leaves trusted root")
     for ancestor in (path, *path.parents):
-        if ancestor.is_symlink():
+        if is_link_or_reparse(ancestor):
             raise ValueError("raw path contains a symlink")
     if not stat.S_ISREG(path.stat().st_mode):
         raise ValueError("raw path is not a regular file")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = open_regular_nofollow(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(fd, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):

@@ -92,6 +92,52 @@ identities match. Pending work freezes its exact requests and certificate. A cha
 provider or policy requires a new probe. An unsupported lane blocks use; it is not
 permission to fall back to an unproven query.
 
+### Optional certified acquisition
+
+Add `--api-optimizations` to the same probe command to request a version-3
+certificate. Capability proofs are independent: unsupported capabilities keep the
+certified legacy acquisition path. Ordinary `probe` still creates a version-2
+certificate. Probes refuse replacement while any frozen acquisition work is pending.
+
+Certified market retrieval uses `/markets` with explicit batches of at most 100 IDs
+and `closed=any`. This filter is never used for unfiltered market discovery or
+highwater requests. Native lookup still confirms omissions; a list omission alone
+never establishes absence.
+
+Certified keyset discovery uses ascending numeric `order=id` pages of at most 100,
+with a frozen numeric highwater. Events require certified unfiltered lifecycle
+coverage; markets run separate open and closed passes. Frontiers advance only after
+all required passes cover the boundary or terminate. Known-entity due work, numeric
+incremental tails, full-pass receipts and cycle cadence remain in use. Cursor
+exhaustion records an observed sweep, not complete source coverage. Later sweeps
+remain necessary for lifecycle movement and late records.
+
+An expired cursor restarts only its affected pass, once per invocation. An oversized
+page halves the limit and restarts that pass without reusing its old opaque cursor.
+A single oversized record or persistent request failure remains visible and resumable.
+Durable pages freeze endpoint, parameters, certificate and raw receipt together with
+application progress; raw references retain the existing `raw_id` spelling.
+
+Failed reprobes preserve the working certificate and store diagnostics separately.
+If a successful base proof contradicts the old lifecycle passes while an optional
+proof fails, acquisition is fenced against that exact certificate until a successful
+probe resolves the contradiction. Certificate activation, diagnostics, that fence and
+settled keyset-state cleanup commit atomically. Status, publication and verification
+remain available.
+
+After activating version 3, use the upgraded executable for every probe and acquisition
+command. Older acquisition rejects version 3 before HTTP; older probe code does not
+have the new preservation rules. To return to legacy acquisition, finish pending
+work and run an ordinary successful probe with the upgraded executable. It discards
+only settled keyset metadata, preserving rows and numeric frontiers.
+
+Claim ownership lookups now use bounded scalar predicates with exact per-chunk
+namespace filtering. They work without ART indexes. Index build/drop commands are
+not included: safe build and ongoing-write admission still need workstation evidence.
+The full-pass queue uses a deque and lazy urgent-ID skipping; batch size, prefetch,
+omission confirmation and settled cursor semantics are unchanged. These changes have
+correctness coverage, but their performance remains unqualified.
+
 ## Operations
 
 Run each command by hand. Each invocation is bounded by `max_duration_s` (1200 s),
@@ -253,9 +299,52 @@ Interrupted work resumes from committed progress and pending responses. A failed
 publication keeps the last verified pointer. Verify the pointer before redirecting
 consumers.
 
+## Native Windows
+
+The native port targets 64-bit Python 3.12 on Windows 10/11. Real Windows execution
+and performance validation are pending the workstation run. POSIX and mocked-platform
+tests do not establish native NTFS, Job Object or ACL behavior.
+
+Use a local fixed NTFS drive and an elevated PowerShell session with volume-flush
+access. Network paths, mounted subvolumes, junctions/reparse points, alternate data
+streams and ambiguous trailing-dot/space names are rejected. Keep roots and evidence
+outside OneDrive and other reparse-managed locations. All catalogue operations require
+this durability access, including nominal reads whose existing implementation can
+initialize database or temporary state. Unsupported storage or missing access fails
+before the worker opens its lock or database.
+
+Windows durability uses an explicit volume `FlushFileBuffers`, rather than treating
+POSIX directory fsync as a no-op. This requires administrative privileges and can
+add substantial I/O; measure it on the target machine. See Microsoft's
+[volume-flush contract](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers).
+Workers enter a kill-on-close [Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+before their launch gate opens. Capped pipe output, deadlines and descendant cleanup
+remain supervised. Windows peak RSS is the process peak working set in bytes;
+comparisons across operating systems are rejected.
+
+The existing verification wrappers also run as Python on Windows:
+
+```powershell
+uv sync --locked
+uv build
+$env:UV_OFFLINE = "1"
+$env:UV_LINK_MODE = "copy"
+python scripts/verify-fast
+python scripts/verify
+uv run python scripts/verify-installed-workflow.py --output C:\catalogue-evidence\installed-proof
+uv run python scripts/benchmark-optimization-campaign.py --manifest C:\catalogue-evidence\manifest.json --output C:\catalogue-evidence\campaign
+```
+
+Populate the dependency/build cache before enabling offline mode. Tests and campaign
+workers use synthetic loopback HTTP only. Output directories must be fresh and outside
+the checkout. The installed proof uses restrictive, restorable Windows ACLs and checks
+that writes are denied; Windows read-only mode bits alone are not an equivalent proof.
+The native-only Job, parent-death, rename, reparse and ACL tests must run on Windows.
+
 ## Verification
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion.
+On Windows, invoke them with `python`; arguments are forwarded to pytest.
 Tests use synthetic loopback fixtures and never contact live Gamma. Pytest runs them
 in parallel (`-n auto`); pass `-n0` to run one test in-process. The offline
 environment is `CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9` with
@@ -471,3 +560,142 @@ Urgency caching, more HTTP workers, publication redesign and reduced integrity c
 remain deferred. A future investigation should explain full-pass JSON relation cost and
 sample variation before proposing another transport change. No production runtime or
 USB cable speedup follows from this campaign.
+
+### Version 3 acquisition campaign
+
+Version 3 keeps the earlier manifest workflows and budgets unchanged and adds a
+10,800-second campaign for four independent candidates: `claims`, `queue`,
+`closed_any` and `keyset`. Use the same campaign command and a data-only manifest:
+
+```json
+{
+  "version": 3,
+  "claims_mode": "lookup_only",
+  "baseline": {"path": "/trusted/baseline/oddsfox_catalogue", "source_hashes": {}},
+  "candidates": {
+    "claims": {"path": "/trusted/claims/oddsfox_catalogue", "source_hashes": {}},
+    "queue": {"path": "/trusted/queue/oddsfox_catalogue", "source_hashes": {}},
+    "closed_any": {"path": "/trusted/closed-any/oddsfox_catalogue", "source_hashes": {}},
+    "keyset": {"path": "/trusted/keyset/oddsfox_catalogue", "source_hashes": {}}
+  },
+  "combinations": {
+    "closed_any+queue": {"path": "/trusted/combined/oddsfox_catalogue", "source_hashes": {}}
+  }
+}
+```
+
+Every illustrative empty inventory must be replaced with the complete source
+inventory, using forward-slash relative filenames on every OS. Package paths may be
+relative to the manifest for a relocatable bundle. Backslashes, traversal, drive/ADS
+syntax and case-insensitive inventory collisions are rejected.
+
+`claims_mode` is optional in version 3. Its default, `indexed`, preserves the index
+resource gate. `lookup_only` restricts the claims variant to `current_store.py`, skips
+index diagnostics and applies the unchanged strict full-pass gate to selective lookup
+without indexes. It never qualifies index installation. Earlier manifest versions
+reject this field. Combination names contain sorted, unique feature names joined with `+`.
+The driver never merges code. Only trusted, reviewed local Python packages may be
+supplied; hashes prove integrity, not trust. Candidate and combination changes must
+stay within their permitted production surfaces.
+
+Preparation, copies, warm-ups, comparisons, validation and cleanup share one monotonic
+budget, with 15 seconds reserved for shutdown. Admission protects final-comparison and
+integrity time and requires 25% headroom for scored work. Each workload uses one
+unscored warm-up per runtime and three fresh-worker pairs in AB, BA, AB order.
+Ordinary correctness tests are outside the characterization budget. No selective
+reruns or production-limit increases are permitted.
+
+Claims and queue use the unchanged full-pass oracle and performance gates. Index
+installation, retained/WAL/temporary growth, peak memory and subsequent writes require
+separate evidence; a faster query cannot qualify an unsafe or unusable installer.
+Index rollback does not promise physical disk reclamation. Allocated bytes remain
+charged to retained storage.
+
+API workloads separately exercise mixed-lifecycle market-ID retrieval, dense and
+sparse bootstrap, and an unchanged incremental tail. Their oracle must preserve
+expected contents, memberships, identity/claims, absence decisions, receipt coverage
+and verified publication while validating intentional request/progress differences.
+Later pages may resolve parent nominations without repair requests. Attempt state
+must exactly match the ledger of settled units' supplied attempt writes, including
+their IDs and timestamps; an arbitrary subset is not sufficient.
+The original strict full-pass oracle is not relaxed. API timing requires at least
+10% and one second primary runtime improvement, with at most 5% wall/RSS regression;
+dense and unchanged-tail runtime regressions may not exceed 5%. Attempt counters
+cannot increase. Only keyset workloads permit up to 5% additional downloaded bytes
+for page envelopes; all production byte ceilings remain unchanged.
+
+Fixtures model the documented [bounded market lookup](https://docs.polymarket.com/api-reference/markets/list-markets),
+[event keyset](https://docs.polymarket.com/api-reference/events/list-events-keyset-pagination)
+and [market keyset](https://docs.polymarket.com/api-reference/markets/list-markets-keyset-pagination)
+contracts. Offline certification does not establish live API acceptance or cursor
+lifetime. [DuckDB's index guidance](https://duckdb.org/docs/current/guides/performance/indexing)
+also warns that index buffers can retain substantial memory; compressed database
+size alone is not an installation reservation.
+
+The lookup source contains 2,500 events and 10,100 markets. Its 10,000 targets are
+8,900 closed, 900 open and 100 orphan source markets, plus 100 already-stored orphan
+markets absent from the provider. Native 404s must renew those known entities'
+receipts after an ordinary bounded listing proves their omissions; unknown numeric
+gaps do not create absence receipts. The expected rows
+retain the absent markets. Discovery uses 1,000 events and 4,040 markets, with a
+10-fold ID stride for the sparse profile. The tail fixture starts with completed
+numeric frontiers and must avoid another bootstrap crawl.
+
+The exact supplied final package must pass every retained feature's workloads.
+If it is missing, fails or cannot finish, the highest-priority independently qualified
+single candidate is the only possible fallback, after final integrity validation.
+Incomplete pairs, exhausted budgets and unfinished validation never qualify changes.
+Reports distinguish synthetic workload results from deployment acceptance; they do
+not establish a full-catalogue runtime or USB cable benefit.
+
+
+#### Version 3 evidence, 2026-10-18
+
+The interrupted local POSIX campaign used runtime baseline commit
+`0e03fcf45902ae3adba588f7e839193b8b86c081` and measurement version 2. This commit
+predates the native Windows foundation and is not a usable native Windows baseline.
+Earlier campaign timings are not reused.
+
+Claim diagnostics completed both requested scales under the existing limits:
+
+| Claims | Fixture population | Index build | Post-index write/checkpoint | Measured storage after write |
+| ---: | ---: | ---: | ---: | ---: |
+| 200,000 | 135.849 s | 0.256 s | 0.041 s | 44,576,821 bytes |
+| 1,000,000 | 521.884 s | 1.893 s | 0.018 s | 190,328,885 bytes |
+
+These are diagnostic storage snapshots, not peak WAL/temporary reservations.
+Whole-worker peak RSS was 2,340,995,072 bytes across population, indexing and writes;
+it does not isolate index-build memory. A small insert/delete check does not establish
+sustained replacement or conflict-repair costs. No safe self-contained build and
+ongoing-write admission model was established, so ART indexes and their explicit
+maintenance commands remain deferred. Selective queries are implemented independently
+without indexes; they require fresh `lookup_only` comparison evidence. No index
+break-even invocation count is established.
+
+The private API candidates failed independent correctness review before API scoring:
+a transient optional-capability reprobe failure could replace a working version-3
+certificate after the legacy lane proofs succeeded. Returning an unsupported capability
+on initial activation is valid; losing a working certificate on failed reprobe is not.
+The implementation now preserves certificates, fences contradicted proofs, and commits
+probe state atomically. Compatibility, corruption/recovery and rollback regression
+tests were added. The API paths are included behind explicit certification; native
+execution and performance qualification remain pending.
+
+An earlier preparation attempt hit the SQL memory ceiling while constructing the
+claim fixture in one oversized transaction. The corrected fixture uses bounded
+10,000-row transactions. The failed attempt, completed unscored warm-up and exact
+source snapshot were preserved; no scored sample was reused. Both attempts consume
+the original shared clock.
+
+
+The local campaign was stopped at the user's request after 8,653.523 seconds on its
+original shared clock. It retained no optimization evidence: only one scored queue
+pair completed (350.080 s baseline versus 364.180 s candidate acquisition/application),
+while three pairs are required. Completed samples, failed preparation and all source
+inventories remain private. No scored sample was selectively rerun.
+
+The user moved full runs and performance comparisons to native Windows and authorized
+merging code with that testing to follow. Accordingly, this change makes no speedup
+claim. The Windows comparison must start a fresh campaign from a common portable
+foundation, use matching OS/measurement versions and frozen source inventories, and
+compare the delivered feature set. Historical POSIX timings cannot qualify that run.
