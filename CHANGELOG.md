@@ -10,6 +10,10 @@
   preserve the earlier manifest workflows and measurement-version-2 guards.
   Index installation remains deferred without a safe admission model. Full runs and
   performance qualification move to the Windows workstation; no speedup is claimed.
+- Version-4 synthetic campaign support for independently comparing outcome grouping
+  and reverse claim lookup, an explicitly supplied combined package, and diagnostic-only
+  claim-index measurements. Both complete Mac comparisons failed qualification;
+  neither production optimization is retained.
 - Selective unindexed claim lookups, linear full-pass queue handling, and explicitly
   certified market-ID/keyset acquisition with version-2 replay compatibility.
 - Native Windows process containment, RSS accounting, reparse-safe storage and
@@ -28,6 +32,10 @@
   Verified publication comparisons use semantic row fingerprints independently of Parquet layout.
 
 ### Fixed
+
+- Version-4 campaigns preserve invalid-comparison failures, distinguish complete
+  deferrals from incomplete evidence, and tolerate unavailable Windows filesystem
+  metadata without changing measured performance gates.
 
 - Periodic keyset reconciliation performs the existing bounded native identity
   repairs after fresh pages and durable replay, including nested event markets.

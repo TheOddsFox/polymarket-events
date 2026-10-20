@@ -370,6 +370,10 @@ uv run python scripts/verify-installed-workflow.py --output /tmp/catalogue-insta
 
 The output destination must not exist. The installed-workflow check runs the same
 commands an operator would run, including `reconcile --full-pass`.
+It builds and installs offline: the uv cache must contain both the declared build
+backend and exported hash-locked runtime requirements. If it reports a cache miss,
+preserve that output, prepare a disposable cache separately, and select it with
+`UV_CACHE_DIR` for a fresh proof. The proof never downloads missing dependencies.
 
 Benchmarks are characterization tools and never claim sustained acceptance:
 
@@ -704,3 +708,78 @@ merging code with that testing to follow. Accordingly, this change makes no spee
 claim. The Windows comparison must start a fresh campaign from a common portable
 foundation, use matching OS/measurement versions and frozen source inventories, and
 compare the delivered feature set. Historical POSIX timings cannot qualify that run.
+
+### Version 4 store application campaign
+
+Version 4 compares response-local outcome grouping and reverse claim ownership
+lookups independently against one current baseline. Both changes belong to the
+store module, so the combined runtime must be supplied and reviewed explicitly;
+the driver never combines them by copying their shared file. Versions 1–3 keep
+their existing manifests, defaults and workflows.
+
+Use the same campaign command with this data-only manifest:
+
+```json
+{
+  "version": 4,
+  "baseline": {"path": "inputs/baseline/oddsfox_catalogue", "source_hashes": {}},
+  "candidates": {
+    "outcome_grouping": {"path": "inputs/outcome_grouping/oddsfox_catalogue", "source_hashes": {}},
+    "claim_reverse_lookup": {"path": "inputs/claim_reverse_lookup/oddsfox_catalogue", "source_hashes": {}}
+  },
+  "combined": {"path": "inputs/combined/oddsfox_catalogue", "source_hashes": {}}
+}
+```
+
+Replace every illustrative empty inventory with complete source hashes. Candidate
+and combined packages may differ from the baseline only in `current_store.py`.
+Run semantic tests on each package before freezing; file ownership alone cannot
+establish that both changes survive in the combined implementation.
+
+The campaign uses one 10,800-second budget, beginning before measured package and
+seed preparation. It preserves measurement-version-2 metrics and the existing
+10,000-event/40,400-market interrupted/resumed workload. Each distinct runtime gets
+one unscored warm-up; comparisons use three fresh-worker pairs in AB, BA, AB order.
+Scored runs remain unprofiled. Admission requires 25% headroom and protects final
+combination, integrity and shutdown time. Missing pairs or unfinished final
+source/seed/harness validation cannot retain an optimization.
+
+The unchanged gate requires at least 10% and one second acquisition/application
+savings, at most 5% wall-time and worker-peak regressions, exact semantic and
+publication equivalence, no increased HTTP counters and equal completed cleanup.
+If both candidates qualify, the supplied combination must pass the same comparison.
+Otherwise the stronger qualified individual is retained, preferring grouping on
+an exact savings tie. A single qualifier reuses its independent comparison.
+
+Optional extended claim diagnostics run only after mandatory comparisons, without
+spending integrity or shutdown reserves. The 200,000/1,000,000-claim fixtures compare
+actual selective queries and namespace-aware result multisets before and after
+diagnostic indexes, with query plans, bounded SQL writes and checkpoint timings.
+Filesystem sizes are samples and RSS is a worker lifetime peak. These fixtures do
+not prove full application behavior, production write costs or safe index admission.
+No production index, installer or configuration switch is added.
+
+Keep the manifest, frozen packages, patches, reports, logs and bundle checksum in a
+durable directory outside Git, on the same SSD as the measured synthetic roots.
+Record Mac/OS/Python/DuckDB and filesystem provenance, effective settings and the
+negotiated USB link when available. An unknown link stays unknown; advertised SSD
+throughput is not a measured database rate. Do not use temporary-directory copies
+as the only handoff. Old missing evidence remains missing rather than being
+represented as reconstructed original measurements.
+
+#### Version 4 evidence, 2026-10-20
+
+The Mac SSD campaign completed both independent three-pair comparisons in its
+shared budget. Neither qualified: grouping's median acquire/apply time was
+198.838 s versus 172.427 s, and reverse lookup's was 119.035 s versus 115.203 s.
+Grouping also failed one strict runtime byte-counter comparison. No store change
+is retained; all delivered runtime files match baseline `25315c6`. The explicit
+combined package passed semantic tests but was not timed because neither candidate
+qualified. Final integrity passed, and the 200,000/1,000,000-claim diagnostics
+completed. Their recorded plans still show sequential scans with indexes present.
+
+The [acceptance record](current-catalogue-acceptance.md#version-4-mac-store-application-campaign-2026-10-20)
+contains phase/resource results, source hashes and the durable bundle checksum.
+It also records the reporting-only fixes applied after measurement; original
+reports and measured source are preserved. These synthetic results qualify no
+production optimization and establish no full-catalogue or cable-benefit estimate.

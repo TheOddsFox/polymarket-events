@@ -1178,7 +1178,9 @@ def prepare_api_seed(
     return result
 
 
-def claim_resource_diagnostics(package: Path, output: Path, budget: Budget) -> dict:
+def claim_resource_diagnostics(
+    package: Path, output: Path, budget: Budget, *, extended: bool = False
+) -> dict:
     """Measure synthetic claim-index cost; do not infer a production admission model."""
     package = safe_path(package)
     output = safe_path(output)
@@ -1196,7 +1198,7 @@ def claim_resource_diagnostics(package: Path, output: Path, budget: Budget) -> d
             "perf",
             "--output",
             str(result_root),
-            "--_claim_diagnostics",
+            "--_claim_diagnostics_v4" if extended else "--_claim_diagnostics",
         ],
         result_root.parent,
         budget,
@@ -2304,9 +2306,18 @@ def atomic_write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def claim_fixture_rows(start: int, end: int) -> list[tuple[str, str, str, str, str]]:
+def claim_fixture_rows(
+    start: int, end: int, *, adversarial: bool = False
+) -> list[tuple[str, str, str, str, str]]:
     """Generate one bounded batch of valid synthetic native identity claims."""
     rows = []
+    special = {
+        0: ("polymarket", "10000000000000000001", "candidate", "clob", "7"),
+        1: ("polymarket", "10000000000000000002", "accepted", "clob", "7"),
+        2: ("polymarket", "10000000000000000001", "candidate", "position", "7"),
+        3: ("other-venue", "10000000000000000003", "accepted", "clob", "7"),
+        4: ("polymarket", "10000000000000000001", "candidate", "clob", "7"),
+    }
     for index in range(start, end):
         market_id = f"{10**19 + index // 4:020d}"
         asset_kind = "clob" if index % 4 < 2 else "position"
@@ -2315,11 +2326,209 @@ def claim_fixture_rows(start: int, end: int) -> list[tuple[str, str, str, str, s
             hashlib.sha256(f"claim-fixture:{index // 4}:{asset_kind}".encode()).digest(),
             "big",
         )
-        rows.append(("polymarket", market_id, role, asset_kind, str(asset_number)))
+        row = ("polymarket", market_id, role, asset_kind, str(asset_number))
+        # A tiny deterministic adversarial prefix exercises the exact namespace
+        # filter, duplicate preservation and multiple owners at every scale.
+        rows.append(special.get(index, row) if adversarial else row)
     return rows
 
 
-def populate_claim_fixture(conn, count: int, *, batch_size=10_000, on_batch=None) -> dict:
+def _claim_multiset(rows):
+    from collections import Counter
+
+    return Counter(tuple(row) for row in rows)
+
+
+def _claim_full_scan_oracle(conn, *, asset_keys=(), market_keys=()):
+    """Stream the fixture once and enforce full namespace tuples independently."""
+    asset_keys, market_keys = set(asset_keys), set(market_keys)
+    assets, markets = [], []
+    cursor = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims"
+    )
+    while batch := cursor.fetchmany(50_000):
+        for row in batch:
+            if (row[0], row[3], row[4]) in asset_keys:
+                assets.append(tuple(row))
+            if (row[0], row[1]) in market_keys:
+                markets.append(tuple(row))
+    return assets, markets
+
+
+def _claim_lookup_query_plan(conn, column, ids):
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"EXPLAIN SELECT venue, market_id, role, asset_kind, asset_id "
+        f"FROM _identity_claims WHERE {column} IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return [str(row[-1]) for row in rows]
+
+
+def _claim_lookup_diagnostics(conn, count):
+    from oddsfox_catalogue.current_store import _select_claims_by_assets, _select_claims_by_markets
+
+    fixture = claim_fixture_rows(0, min(count, 512), adversarial=True)
+    asset_keys = list(dict.fromkeys((row[0], row[3], row[4]) for row in fixture))
+    market_keys = list(dict.fromkeys((row[0], row[1]) for row in fixture))
+    expected_assets, expected_markets = _claim_full_scan_oracle(
+        conn, asset_keys=asset_keys, market_keys=market_keys
+    )
+
+    def measure(selector, keys, expected):
+        samples = []
+        result = []
+        for _ in range(3):
+            started = time.monotonic()
+            result = selector(conn, keys)
+            samples.append(time.monotonic() - started)
+            require(
+                _claim_multiset(result) == _claim_multiset(expected),
+                "selective claim lookup disagrees with exact namespace oracle",
+            )
+        return {"samples_s": samples, "median_s": sorted(samples)[1], "rows": len(result)}
+
+    asset_ids = list(dict.fromkeys(key[2] for key in asset_keys))
+    market_ids = list(dict.fromkeys(key[1] for key in market_keys))
+    return {
+        "query_keys": {
+            "asset_namespace_tuples": len(asset_keys),
+            "market_namespace_tuples": len(market_keys),
+        },
+        "expected_rows": {"asset": len(expected_assets), "market": len(expected_markets)},
+        "asset_query_plan": _claim_lookup_query_plan(conn, "asset_id", asset_ids),
+        "market_query_plan": _claim_lookup_query_plan(conn, "market_id", market_ids),
+        "asset_lookup": measure(_select_claims_by_assets, asset_keys, expected_assets),
+        "market_lookup": measure(_select_claims_by_markets, market_keys, expected_markets),
+    }
+
+
+def _claim_storage_metrics(directory: Path, temporary_directory: Path) -> dict:
+    files = [
+        path for path in directory.rglob("*") if path.is_file() and not is_link_or_reparse(path)
+    ]
+    temporary_files = [
+        path
+        for path in temporary_directory.rglob("*")
+        if path.is_file() and not is_link_or_reparse(path)
+    ]
+    database_files = [path for path in files if path.suffix == ".duckdb"]
+    wal_files = [path for path in files if path.suffix == ".wal"]
+    return {
+        "measurement": "sampled filesystem sizes; not peak storage reservation",
+        "database_bytes": sum(path.stat().st_size for path in database_files),
+        "wal_bytes": sum(path.stat().st_size for path in wal_files),
+        "temporary_bytes": sum(path.stat().st_size for path in temporary_files),
+        "catalogue_files_bytes": sum(path.stat().st_size for path in files),
+        "total_bytes": sum(path.stat().st_size for path in files),
+    }
+
+
+def _claim_rss_metrics(peak: int) -> dict:
+    return {
+        "worker_lifetime_peak_rss_bytes": peak,
+        "rss_measurement": "worker lifetime peak; not an isolated query or index-build peak",
+        "peak_rss_bytes": peak,
+    }
+
+
+def _claim_write_diagnostics(conn, count: int, *, adversarial: bool) -> dict:
+    """Exercise bounded replacement, conflict-owner and asset deletion writes, then restore rows."""
+    if type(count) is not int or count <= 0:
+        raise ValueError("claim write diagnostics require a positive fixture size")
+    fixture = claim_fixture_rows(0, 1, adversarial=adversarial)[0]
+    target_market = fixture[1]
+    target_asset = fixture[4]
+    replacement_rows = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims "
+        "WHERE market_id=?",
+        [target_market],
+    ).fetchall()
+    before_count = conn.execute("SELECT count(*) FROM _identity_claims").fetchone()[0]
+    operations = {}
+
+    started = time.monotonic()
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        conn.execute("DELETE FROM _identity_claims WHERE market_id=?", [target_market])
+        conn.executemany("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", replacement_rows)
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            conn.execute("ROLLBACK")
+        raise
+    operations["bounded_replacement_seconds"] = time.monotonic() - started
+    replaced_rows = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims "
+        "WHERE market_id=?",
+        [target_market],
+    ).fetchall()
+    require(
+        _claim_multiset(replaced_rows) == _claim_multiset(replacement_rows),
+        "bounded replacement failed to restore exact market claims",
+    )
+
+    conflict_market = "99999999999999999999"
+    conflict_row = (fixture[0], conflict_market, "candidate", fixture[3], target_asset)
+    started = time.monotonic()
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        conn.execute("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", conflict_row)
+        conn.execute("DELETE FROM _identity_claims WHERE market_id=?", [conflict_market])
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            conn.execute("ROLLBACK")
+        raise
+    operations["conflicting_owner_insert_delete_seconds"] = time.monotonic() - started
+    require(
+        conn.execute(
+            "SELECT count(*) FROM _identity_claims WHERE market_id=?", [conflict_market]
+        ).fetchone()[0]
+        == 0,
+        "conflicting owner cleanup left diagnostic rows behind",
+    )
+
+    asset_rows = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims WHERE asset_id=?",
+        [target_asset],
+    ).fetchall()
+    started = time.monotonic()
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        conn.execute("DELETE FROM _identity_claims WHERE asset_id=?", [target_asset])
+        conn.executemany("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", asset_rows)
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            conn.execute("ROLLBACK")
+        raise
+    operations["asset_deletion_restore_seconds"] = time.monotonic() - started
+    restored_asset_rows = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims WHERE asset_id=?",
+        [target_asset],
+    ).fetchall()
+    require(
+        _claim_multiset(restored_asset_rows) == _claim_multiset(asset_rows),
+        "asset deletion failed to restore exact claims",
+    )
+    after_count = conn.execute("SELECT count(*) FROM _identity_claims").fetchone()[0]
+    require(after_count == before_count == count, "claim write diagnostics changed fixture rows")
+    return operations
+
+
+@contextlib.contextmanager
+def _claim_diagnostic_store(settings, connector, locker, after_close):
+    """Acquire writer lock before opening DuckDB; sample closed files before unlocking."""
+    with locker(settings.run_lock_path):
+        with connector(settings) as conn:
+            yield conn
+        after_close()
+
+
+def populate_claim_fixture(
+    conn, count: int, *, batch_size=10_000, on_batch=None, adversarial=False
+) -> dict:
     """Populate claims in independently committed, bounded transactions."""
     if type(count) is not int or count < 0:
         raise ValueError("claim fixture count must be a nonnegative integer")
@@ -2328,7 +2537,7 @@ def populate_claim_fixture(conn, count: int, *, batch_size=10_000, on_batch=None
     completed = batches = 0
     for start in range(0, count, batch_size):
         end = min(count, start + batch_size)
-        rows = claim_fixture_rows(start, end)
+        rows = claim_fixture_rows(start, end, adversarial=adversarial)
         conn.execute("BEGIN TRANSACTION")
         try:
             conn.executemany("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", rows)
@@ -2384,8 +2593,8 @@ def build_claim_fixture_indexes(conn) -> None:
         raise
 
 
-def run_claim_scale_diagnostics(root: Path) -> dict:
-    """Measure claim population, index build, and small post-index writes offline."""
+def run_claim_scale_diagnostics(root: Path, *, extended: bool = False) -> dict:
+    """Measure synthetic selective lookups, index cost and bounded writes offline."""
     from oddsfox_catalogue.current_config import CurrentSettings, connect_store
     from oddsfox_catalogue.current_store import initialize
     from oddsfox_catalogue.runlock import run_lock
@@ -2396,26 +2605,24 @@ def run_claim_scale_diagnostics(root: Path) -> dict:
     progress = {"status": "in_progress", "scales": []}
     atomic_write_json(progress_path, progress)
 
-    def storage_metrics(directory, temporary_directory):
-        files = [path for path in directory.rglob("*") if path.is_file()]
-        temporary_files = [
-            path
-            for path in temporary_directory.rglob("*")
-            if path.is_file() and not is_link_or_reparse(path)
-        ]
-        return {
-            "total_bytes": sum(path.stat().st_size for path in files),
-            "wal_bytes": sum(path.stat().st_size for path in files if path.suffix == ".wal"),
-            "temporary_bytes": sum(path.stat().st_size for path in temporary_files),
-        }
-
     for count in (200_000, 1_000_000):
         catalogue_root = root / f"claims-{count}"
         catalogue_root.mkdir()
         validate_root(catalogue_root, initialize=True)
         settings = CurrentSettings(catalogue_root)
         started = time.monotonic()
-        with connect_store(settings) as conn, run_lock(settings.run_lock_path):
+        post_close_storage = {}
+
+        def measure_after_close(
+            storage=post_close_storage,
+            root=catalogue_root,
+            temporary_directory=settings.temporary_dir,
+        ):
+            storage.update(_claim_storage_metrics(root, temporary_directory))
+
+        with _claim_diagnostic_store(
+            settings, connect_store, run_lock, measure_after_close
+        ) as conn:
             initialize(conn)
 
             def save_population_progress(batch, scale=count):
@@ -2429,49 +2636,84 @@ def run_claim_scale_diagnostics(root: Path) -> dict:
                 )
                 atomic_write_json(progress_path, progress)
 
-            population = populate_claim_fixture(conn, count, on_batch=save_population_progress)
+            population_started = time.monotonic()
+            population = populate_claim_fixture(
+                conn,
+                count,
+                on_batch=save_population_progress,
+                adversarial=extended,
+            )
+            population_seconds = time.monotonic() - population_started
+            checkpoint_started = time.monotonic()
             conn.execute("CHECKPOINT")
-            populated_storage = storage_metrics(catalogue_root, settings.temporary_dir)
+            population_checkpoint_seconds = time.monotonic() - checkpoint_started
+            populated_storage = _claim_storage_metrics(catalogue_root, settings.temporary_dir)
+            unindexed_queries = _claim_lookup_diagnostics(conn, count) if extended else None
+            pre_index_write_operations = {}
+            pre_index_write_checkpoint_seconds = None
+            pre_index_write_storage = None
+            if extended:
+                pre_index_write_operations = _claim_write_diagnostics(conn, count, adversarial=True)
+                checkpoint_started = time.monotonic()
+                conn.execute("CHECKPOINT")
+                pre_index_write_checkpoint_seconds = time.monotonic() - checkpoint_started
+                pre_index_write_storage = _claim_storage_metrics(
+                    catalogue_root, settings.temporary_dir
+                )
             build_started = time.monotonic()
             build_claim_fixture_indexes(conn)
             index_build_seconds = time.monotonic() - build_started
-            indexed_storage = storage_metrics(catalogue_root, settings.temporary_dir)
+            indexed_storage = _claim_storage_metrics(catalogue_root, settings.temporary_dir)
+            indexed_queries = _claim_lookup_diagnostics(conn, count) if extended else None
             write_started = time.monotonic()
-            write_asset = str(
-                int.from_bytes(hashlib.sha256(f"post-index:{count}".encode()).digest(), "big")
-            )
-            conn.execute(
-                "INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)",
-                ("polymarket", "99999999999999999999", "candidate", "clob", write_asset),
-            )
-            conn.execute(
-                "DELETE FROM _identity_claims WHERE asset_id=?",
-                [write_asset],
-            )
+            if extended:
+                write_operations = _claim_write_diagnostics(conn, count, adversarial=True)
+            else:
+                write_asset = str(
+                    int.from_bytes(hashlib.sha256(f"post-index:{count}".encode()).digest(), "big")
+                )
+                write_operations = {}
+                conn.execute(
+                    "INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)",
+                    ("polymarket", "99999999999999999999", "candidate", "clob", write_asset),
+                )
+                conn.execute("DELETE FROM _identity_claims WHERE asset_id=?", [write_asset])
+            checkpoint_started = time.monotonic()
             conn.execute("CHECKPOINT")
+            write_checkpoint_seconds = time.monotonic() - checkpoint_started
             sustained_write_seconds = time.monotonic() - write_started
-            after_write_storage = storage_metrics(catalogue_root, settings.temporary_dir)
+            after_write_storage = _claim_storage_metrics(catalogue_root, settings.temporary_dir)
             row_count = conn.execute("SELECT count(*) FROM _identity_claims").fetchone()[0]
             require(row_count == count, "claim diagnostic write fixture changed row count")
         scales.append(
             {
                 "claims": count,
                 "population": population,
-                "population_seconds": build_started - started,
+                "population_seconds": population_seconds if extended else build_started - started,
+                "population_checkpoint_seconds": population_checkpoint_seconds,
                 "populated_storage": populated_storage,
                 "index_build_seconds": index_build_seconds,
                 "indexed_storage": indexed_storage,
                 "post_index_write_seconds": sustained_write_seconds,
+                "post_index_write_checkpoint_seconds": write_checkpoint_seconds,
+                "pre_index_write_operations": pre_index_write_operations,
+                "pre_index_write_checkpoint_seconds": pre_index_write_checkpoint_seconds,
+                "pre_index_write_storage": pre_index_write_storage,
+                "post_index_write_operations": write_operations,
                 "post_write_storage": after_write_storage,
+                "post_close_storage": post_close_storage,
             }
         )
+        if extended:
+            scales[-1]["unindexed_selective_queries"] = unindexed_queries
+            scales[-1]["indexed_selective_queries"] = indexed_queries
         progress.update({"status": "in_progress", "current_scale": None, "scales": scales})
         atomic_write_json(progress_path, progress)
     peak = process_peak_rss_bytes()
     result = {
         "status": "measured",
         "scales": scales,
-        "peak_rss_bytes": peak,
+        **_claim_rss_metrics(peak),
         "installer_supported": False,
         "resource_gate": False,
         "reason": "no self-contained production build and sustained-write admission model",
@@ -3038,6 +3280,7 @@ def parser():
     p.add_argument("--_prepare", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--_prepare_api_seed", choices=API_WORKLOADS, help=argparse.SUPPRESS)
     p.add_argument("--_claim_diagnostics", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--_claim_diagnostics_v4", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--_validate", nargs=2, metavar=("BASELINE", "CANDIDATE_PACKAGE"), help=argparse.SUPPRESS
     )
@@ -3109,9 +3352,11 @@ def run(args) -> int:
         except Exception as exc:
             print(json.dumps({"status": "blocked", "message": f"{type(exc).__name__}: {exc}"}))
             return 3
-    if args._claim_diagnostics:
+    if args._claim_diagnostics or args._claim_diagnostics_v4:
         try:
-            result = run_claim_scale_diagnostics(Path(args.output))
+            result = run_claim_scale_diagnostics(
+                Path(args.output), extended=args._claim_diagnostics_v4
+            )
             actual_package = Path(__import__("oddsfox_catalogue").__file__).resolve().parent
             expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
             require(
