@@ -4,6 +4,11 @@
 
 ### Added
 
+- Version-5 synthetic comparisons for receipt metadata factoring, consolidated state
+  reads and typed lookup keys. Direct warm-up attribution separates SQL execution
+  from result materialization; scored workers preserve the existing performance,
+  correctness, HTTP and maintenance gates. Production retention requires complete
+  comparison and final-integrity evidence.
 - A version-3 synthetic campaign for selective claims, full-pass queue handling,
   certified market-ID retrieval and dense/sparse keyset discovery. Independent
   workload oracles, exact supplied combinations and one shared three-hour budget

@@ -32,6 +32,7 @@ SPEC.loader.exec_module(bench)
 CAMPAIGN_BUDGET_S = 1800.0
 V3_CAMPAIGN_BUDGET_S = 10800.0
 V4_CAMPAIGN_BUDGET_S = 10800.0
+V5_CAMPAIGN_BUDGET_S = 10800.0
 VARIANTS = {
     "outcome_grouping": "current_store.py",
     "queue": "current_reconcile.py",
@@ -65,6 +66,8 @@ V3_OWNERSHIP = {
 V3_PRIORITY = V3_CANDIDATES
 V4_CANDIDATES = ("outcome_grouping", "claim_reverse_lookup")
 V4_OWNERSHIP = {name: "current_store.py" for name in (*V4_CANDIDATES, "combined")}
+V5_CANDIDATES = ("receipt_factoring", "read_consolidation", "typed_keys")
+V5_OWNERSHIP = {name: "current_store.py" for name in (*V5_CANDIDATES, "combinations")}
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -92,8 +95,37 @@ def _load_manifest(path: Path) -> dict:
         if not {"baseline", "binding"}.issubset(data) or not set(data).issubset(MANIFEST_KEYS):
             raise ValueError("legacy manifest requires baseline and binding package entries")
         return {**data, "_version": 1}
-    if type(data.get("version")) is not int or data["version"] not in {2, 3, 4}:
-        raise ValueError("manifest version must be integer 2, 3 or 4")
+    if type(data.get("version")) is not int or data["version"] not in {2, 3, 4, 5}:
+        raise ValueError("manifest version must be integer 2, 3, 4 or 5")
+    if data["version"] == 5:
+        if set(data) - {"version", "baseline", "candidates", "combinations"} or not {
+            "version",
+            "baseline",
+            "candidates",
+        }.issubset(data):
+            raise ValueError(
+                "version 5 manifest requires only version, baseline, candidates and combinations"
+            )
+        candidates = data["candidates"]
+        if not isinstance(candidates, dict) or set(candidates) != set(V5_CANDIDATES):
+            raise ValueError(
+                "version 5 manifest requires receipt_factoring, read_consolidation and typed_keys"
+            )
+        combinations = data.get("combinations", {})
+        if not isinstance(combinations, dict):
+            raise ValueError("version 5 combinations must be an object")
+        normalized = {"_version": 5, "baseline": data["baseline"], **candidates}
+        for feature_key, entry in combinations.items():
+            features = feature_key.split("+") if isinstance(feature_key, str) else []
+            if (
+                len(features) < 2
+                or features != sorted(set(features))
+                or not set(features).issubset(V5_CANDIDATES)
+                or feature_key != "+".join(features)
+            ):
+                raise ValueError("combination keys must be sorted feature names joined by '+'")
+            normalized[f"_combination:{feature_key}"] = entry
+        return normalized
     if data["version"] == 4:
         if set(data) != {"version", "baseline", "candidates", "combined"}:
             raise ValueError(
@@ -451,6 +483,51 @@ def _freeze_v4_packages(resolved, output, budget):
     return {"packages": frozen, "provenance": provenance}
 
 
+def _freeze_v5_packages(resolved, output, budget):
+    """Freeze independent store candidates and only explicitly supplied combos."""
+    frozen, provenance = {}, {}
+    for name, (source, expected_hashes) in resolved.items():
+        budget.admit(1)
+        target = output / "inputs" / name.replace(":", "-") / "oddsfox_catalogue"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tree_bounded(source, target, budget)
+        actual = _hash_package(target, budget)
+        if actual != expected_hashes:
+            raise ValueError(f"package changed while it was being frozen: {name}")
+        frozen[name] = target
+        provenance[name] = {"path": str(source), "source_hashes": actual}
+
+    baseline_hashes = _hash_package(frozen["baseline"], budget)
+    for name in resolved:
+        if name == "baseline":
+            continue
+        if name.startswith("_combination:"):
+            feature_key = name.removeprefix("_combination:")
+            entry_name = f"combination:{feature_key}"
+        else:
+            entry_name = name
+        candidate_hashes = _hash_package(frozen[name], budget)
+        eligible = _validate_variant_ownership(
+            baseline_hashes, candidate_hashes, "current_store.py"
+        )
+        provenance[entry_name] = {
+            "path": provenance[name]["path"],
+            "source_hashes": candidate_hashes,
+            "eligible": eligible,
+            "changed_files": sorted(
+                source
+                for source in baseline_hashes
+                if baseline_hashes[source] != candidate_hashes[source]
+            ),
+        }
+        if not eligible:
+            provenance[entry_name]["deferred_reason"] = "package is identical to baseline"
+        if entry_name != name:
+            provenance.pop(name, None)
+            frozen[entry_name] = frozen.pop(name)
+    return {"packages": frozen, "provenance": provenance}
+
+
 def _copy_package(source: Path, target: Path, budget) -> str:
     _copy_tree_bounded(source, target, budget)
     return bench.canonical_hash(_hash_package(target, budget))
@@ -766,10 +843,16 @@ def _run_v2(seed, output, budget, warmed, report, packages, provenance, seed_has
     budget.holdback_s = 15.0
 
 
-def _stage_sample(seed, output, package, budget, label, warmup=False, workload=None):
-    kwargs = {"warmup": warmup}
+def _stage_sample(
+    seed, output, package, budget, label, warmup=False, workload=None, attribution=False
+):
+    kwargs = {}
     if workload is not None:
         kwargs["workload"] = workload
+    if attribution:
+        kwargs.update(warmup=True, attribution=True)
+    elif warmup:
+        kwargs["warmup"] = True
     return bench.run_sample(seed, output, package, budget, "perf", label, **kwargs)
 
 
@@ -785,26 +868,57 @@ def _save_stage_sample(report, output, stage, row, category, pair=None):
     return row
 
 
-def _warm(runtime_name, package, seed, output, budget, warmed, report, workload=None):
+def _warm(
+    runtime_name,
+    package,
+    seed,
+    output,
+    budget,
+    warmed,
+    report,
+    workload=None,
+    attribution=False,
+):
     source_hash = bench.canonical_hash(_hash_package(package, budget))
-    key = (source_hash, workload)
+    key = (source_hash, workload, bool(attribution))
     warmup_key = runtime_name if workload is None else f"{runtime_name}:{workload}"
+    if attribution:
+        warmup_key = f"{warmup_key}:attribution-v1"
     if key in warmed:
-        if warmup_key not in report.get("warmups", {}):
+        existing_sample = report.get("warmups", {}).get(warmup_key, {}).get("sample")
+        cache_valid = isinstance(existing_sample, dict) and (
+            not attribution
+            or (
+                existing_sample.get("warmup_diagnostics", {}).get("version") == 1
+                and existing_sample.get("warmup_diagnostics", {}).get("attribution_mode")
+                == "direct_unprofiled"
+            )
+        )
+        if not cache_valid and warmup_key not in report.get("warmups", {}):
             existing = next(
                 (
                     row
                     for row in report.get("warmups", {}).values()
                     if row.get("source_hash") == source_hash
                     and row.get("workload", row["sample"].get("workload")) == workload
+                    and (
+                        not attribution
+                        or (
+                            row["sample"].get("warmup_diagnostics", {}).get("version") == 1
+                            and row["sample"].get("warmup_diagnostics", {}).get("attribution_mode")
+                            == "direct_unprofiled"
+                        )
+                    )
                 ),
                 None,
             )
             if existing is not None:
                 report["warmups"][warmup_key] = existing
                 return
-        else:
+        elif cache_valid:
             return
+        else:
+            report["warmups"].pop(warmup_key, None)
         # A caller may reuse the warmed set with a fresh report. Without the
         # sample in this report, rerun rather than create an incomplete alias.
         warmed.discard(key)
@@ -812,8 +926,11 @@ def _warm(runtime_name, package, seed, output, budget, warmed, report, workload=
     if workload is not None:
         warm_dir /= workload
     warm_dir.mkdir(parents=True)
+    warm_kwargs = {"workload": workload} if workload is not None else {}
+    if attribution:
+        warm_kwargs.update(warmup=True, attribution=True)
     sample = _stage_sample(
-        seed, warm_dir, package, budget, f"warm-{source_hash[:10]}", workload=workload
+        seed, warm_dir, package, budget, f"warm-{source_hash[:10]}", **warm_kwargs
     )
     warmed.add(key)
     report.setdefault("warmups", {})[warmup_key] = {
@@ -838,9 +955,12 @@ def _compare_stage(
     *,
     workload=None,
     comparison=None,
+    attribution=False,
 ):
-    _warm(left_name, left, seed, output, budget, warmed, report, workload)
-    _warm(right_name, right, seed, output, budget, warmed, report, workload)
+    _warm(left_name, left, seed, output, budget, warmed, report, workload, attribution=attribution)
+    _warm(
+        right_name, right, seed, output, budget, warmed, report, workload, attribution=attribution
+    )
     rows = {left_name: [], right_name: []}
     order = (
         (left_name, left),
@@ -872,6 +992,56 @@ def _compare_stage(
     )
     bench._save(output / "report.json", report)
     return scored
+
+
+def _run_v5_scheduler_diagnostics(seed, output, baseline, budget, report):
+    """Optional supervised, read-only scheduler cost/plan diagnostics."""
+    budget.holdback_s = 15.0  # Keep the final integrity interval protected.
+    if budget.remaining < 5.0:
+        report["scheduler_diagnostics"] = {
+            "status": "not_run",
+            "reason": "insufficient budget after protecting integrity and shutdown reserves",
+        }
+        return
+    root = output / "scheduler-diagnostics"
+    command = [
+        bench.sys.executable,
+        str(Path(bench.__file__).resolve()),
+        "--profile",
+        "perf",
+        "--output",
+        str(output),
+        "--_scheduler_diagnostics",
+        str(seed),
+        str(root),
+    ]
+    try:
+        result = bench.supervised(
+            command,
+            output,
+            baseline,
+            budget,
+            output / "scheduler-diagnostics.log",
+        )
+        if result.get("status") != "measured":
+            report["scheduler_diagnostics"] = {
+                "status": "unavailable",
+                "reason": result.get("message", "worker did not return a measurement"),
+            }
+        else:
+            report["scheduler_diagnostics"] = result
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        report["scheduler_diagnostics"] = {
+            "status": "insufficient_evidence",
+            "reason": str(exc),
+        }
+    except Exception as exc:
+        report["scheduler_diagnostics"] = {
+            "status": "unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        budget.holdback_s = 15.0
 
 
 def _v3_workloads(candidate):
@@ -1125,6 +1295,232 @@ def _run_v4_diagnostics(output, budget, report, packages):
         budget.holdback_s = 15.0
     report["claim_resource_diagnostics"] = result
     bench._save(output / "report.json", report)
+
+
+def _best_v5_candidate(report):
+    qualified = report.get("qualified_candidates", {})
+    return max(
+        (name for name in V5_CANDIDATES if name in qualified),
+        key=lambda name: (
+            qualified[name]["comparison"].get("saved_s", 0.0),
+            -V5_CANDIDATES.index(name),
+        ),
+        default=None,
+    )
+
+
+def _v5_comparison_complete(report, candidate):
+    stage = report.get("stages", {}).get(f"{candidate}_vs_baseline")
+    if not isinstance(stage, dict) or not isinstance(stage.get("comparison"), dict):
+        return False
+    if stage["comparison"].get("status") not in {"qualified", "deferred", "invalid"}:
+        return False
+    expected = {(side, pair) for side in ("baseline", candidate) for pair in (1, 2, 3)}
+    observed = {key: 0 for key in expected}
+    for sample in stage.get("samples", []):
+        key = (sample.get("category"), sample.get("pair"))
+        if key not in observed:
+            return False
+        observed[key] += 1
+    return all(count == 1 for count in observed.values())
+
+
+def _run_v5(seed, output, budget, warmed, report, packages, provenance, harness):
+    """Measure V5 store candidates independently, then one exact supplied combo."""
+    report["retained"] = []
+    report["qualified_candidates"] = {}
+    report["invalid_candidates"] = []
+    budget.holdback_s = 15.0
+    baseline = packages["baseline"]
+    baseline_warm_name = "baseline"
+    _warm(
+        baseline_warm_name,
+        baseline,
+        seed,
+        output,
+        budget,
+        warmed,
+        report,
+        attribution=True,
+    )
+    baseline_warm = report["warmups"]["baseline:attribution-v1"]["sample"]
+    largest_qualified_duration = 0.0
+
+    for name in V5_CANDIDATES:
+        if not provenance[name].get("eligible"):
+            continue
+        reserve = 1.25 * largest_qualified_duration
+        budget.holdback_s = 15.0 + reserve
+        started = time.monotonic()
+        _warm(
+            name,
+            packages[name],
+            seed,
+            output,
+            budget,
+            warmed,
+            report,
+            attribution=True,
+        )
+        candidate_warm = report["warmups"][f"{name}:attribution-v1"]["sample"]
+        estimate = _candidate_stage_estimate(baseline_warm, candidate_warm)
+        report.setdefault("admission", {})[name] = {
+            "projected_scored_seconds": estimate,
+            "headroom_fraction": 0.25,
+            "integrity_reserve_seconds": 15.0,
+            "combination_reserve_seconds": reserve,
+            "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
+        }
+        if estimate > budget.remaining:
+            report.setdefault("deferred", {})[name] = (
+                "insufficient_evidence: complete paired comparison does not fit shared budget"
+            )
+            bench._save(output / "report.json", report)
+            continue
+        stage_name = f"{name}_vs_baseline"
+        try:
+            scored = _compare_stage(
+                stage_name,
+                "baseline",
+                baseline,
+                name,
+                packages[name],
+                seed,
+                output,
+                budget,
+                warmed,
+                report,
+                attribution=True,
+            )
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
+            report.setdefault("deferred", {})[name] = (
+                f"insufficient_evidence: paired comparison incomplete ({exc})"
+            )
+            report["stages"].setdefault(stage_name, {"samples": []})["status"] = "incomplete"
+            bench._save(output / "report.json", report)
+            break
+        _assert_campaign_provenance(harness, budget)
+        duration = time.monotonic() - started
+        stage = report["stages"][stage_name]
+        stage["comparison_duration_seconds"] = duration
+        stage["projected_scored_seconds"] = estimate
+        if scored.get("status") == "qualified":
+            report["qualified_candidates"][name] = {"comparison": scored, "stage": stage_name}
+            largest_qualified_duration = max(largest_qualified_duration, duration)
+        elif scored.get("status") == "invalid":
+            report["invalid_candidates"].append(name)
+            report.setdefault("deferred", {})[name] = scored.get("reason", "invalid comparison")
+        else:
+            report.setdefault("deferred", {})[name] = scored.get(
+                "reason", scored.get("status", "incomplete")
+            )
+        bench._save(output / "report.json", report)
+
+    qualified = list(report["qualified_candidates"])
+    if not qualified:
+        eligible = [name for name in V5_CANDIDATES if provenance[name].get("eligible")]
+        if report["invalid_candidates"]:
+            report["status"] = "invalid"
+        elif eligible and all(_v5_comparison_complete(report, name) for name in eligible):
+            report["status"] = "deferred"
+        else:
+            report["status"] = "insufficient_evidence" if eligible else "deferred"
+        report["scheduler_diagnostics"] = {"status": "not_run", "reason": "no qualifying reserve"}
+        return
+    if len(qualified) == 1:
+        chosen = qualified[0]
+        report["retained"] = [chosen]
+        report["status"] = "qualified"
+        report["final_combination"] = {
+            "status": "reused_independent_evidence",
+            "features": [chosen],
+            "stage": report["qualified_candidates"][chosen]["stage"],
+        }
+        report["scheduler_diagnostics"] = {"status": "not_run", "reason": "no remaining reserve"}
+        return
+
+    feature_key = "+".join(sorted(qualified))
+    combo_name = f"combination:{feature_key}"
+    if combo_name not in packages or not provenance[combo_name].get("eligible"):
+        chosen = _best_v5_candidate(report)
+        report["retained"] = [chosen] if chosen else []
+        report["status"] = "qualified_individual_combination_deferred"
+        report.setdefault("deferred", {})[combo_name] = (
+            "exact qualified-feature combination was not supplied"
+        )
+        report["final_combination"] = {"status": "not_supplied", "features": qualified}
+        report["scheduler_diagnostics"] = {
+            "status": "not_run",
+            "reason": "combination reserve protected",
+        }
+        return
+
+    budget.holdback_s = 15.0
+    try:
+        combo_hashes = _hash_package(packages[combo_name], budget)
+        report["final_combination_source_hashes"] = combo_hashes
+        _warm(
+            combo_name,
+            packages[combo_name],
+            seed,
+            output,
+            budget,
+            warmed,
+            report,
+            attribution=True,
+        )
+        combo_warm = report["warmups"][f"{combo_name}:attribution-v1"]["sample"]
+        estimate = _candidate_stage_estimate(baseline_warm, combo_warm)
+        report.setdefault("admission", {})[combo_name] = {
+            "projected_scored_seconds": estimate,
+            "headroom_fraction": 0.25,
+            "integrity_reserve_seconds": 15.0,
+            "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
+        }
+        if estimate > budget.remaining:
+            raise TimeoutError("exact combination comparison does not fit shared budget")
+        scored = _compare_stage(
+            f"{combo_name}_vs_baseline",
+            "baseline",
+            baseline,
+            combo_name,
+            packages[combo_name],
+            seed,
+            output,
+            budget,
+            warmed,
+            report,
+            attribution=True,
+        )
+        _assert_campaign_provenance(harness, budget)
+        if _hash_package(packages[combo_name], budget) != combo_hashes:
+            raise CampaignIntegrityError("exact combination changed during its measured stage")
+    except CampaignIntegrityError:
+        raise
+    except Exception as exc:
+        chosen = _best_v5_candidate(report)
+        report["retained"] = [chosen] if chosen else []
+        report["status"] = "qualified_individual_combination_deferred"
+        report["final_combination"] = {
+            "status": "insufficient_evidence"
+            if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired))
+            else "failed",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+        report.setdefault("deferred", {})[combo_name] = str(exc)
+        return
+    if scored.get("status") == "qualified":
+        report["retained"] = qualified
+        report["status"] = "qualified"
+    else:
+        chosen = _best_v5_candidate(report)
+        report["retained"] = [chosen] if chosen else []
+        report["status"] = "qualified_individual_combination_deferred"
+        report.setdefault("deferred", {})[combo_name] = scored.get(
+            "reason", scored.get("status", "exact combination did not qualify")
+        )
+    report["final_combination"] = {"status": scored.get("status"), "comparison": scored}
+    report["scheduler_diagnostics"] = {"status": "not_run", "reason": "integrity reserve protected"}
 
 
 def _api_compare(baseline, candidate, workload):
@@ -1549,7 +1945,9 @@ def run(args, *, budget=None) -> int:
     manifest = _load_manifest(manifest_path)
     claims_mode = manifest.get("_claims_mode", "indexed")
     expected_budget = (
-        V3_CAMPAIGN_BUDGET_S
+        V5_CAMPAIGN_BUDGET_S
+        if manifest["_version"] == 5
+        else V3_CAMPAIGN_BUDGET_S
         if manifest["_version"] == 3
         else V4_CAMPAIGN_BUDGET_S
         if manifest["_version"] == 4
@@ -1572,7 +1970,11 @@ def run(args, *, budget=None) -> int:
         "started_at": bench.datetime.now(bench.UTC).isoformat(),
         "budget_seconds": expected_budget,
         "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
-        "warmup_mode": "one unprofiled fresh-worker run per distinct runtime",
+        "warmup_mode": (
+            "one direct-unprofiled attribution warm-up per distinct runtime"
+            if manifest["_version"] == 5
+            else "one unprofiled fresh-worker run per distinct runtime"
+        ),
         "samples": [],
         "stages": {},
         "deferred": {},
@@ -1589,6 +1991,17 @@ def run(args, *, budget=None) -> int:
             "scored_runs_per_runtime": 3,
             "pair_order": "AB, BA, AB",
         }
+    if manifest["_version"] == 5:
+        report["effective_settings"] = {
+            "profile": "perf",
+            "dataset": "10,000 events / 40,400 markets",
+            "interruption_after_settled_units": 50,
+            "candidate_order": list(V5_CANDIDATES),
+            "scored_runs_per_runtime": 3,
+            "pair_order": "AB, BA, AB",
+            "scored_instrumentation": "none",
+            "warmup_diagnostics_version": 1,
+        }
     output.mkdir(parents=True)
     bench._save(output / "report.json", report)
     packages = {}
@@ -1598,7 +2011,7 @@ def run(args, *, budget=None) -> int:
     harness = None
     binding_qualified = False
     try:
-        if manifest["_version"] == 4:
+        if manifest["_version"] in {4, 5}:
             report["machine_provenance"] = _machine_provenance(output.parent)
             bench._save(output / "report.json", report)
         harness = _campaign_provenance(budget)
@@ -1610,6 +2023,8 @@ def run(args, *, budget=None) -> int:
             if manifest["_version"] == 3
             else _freeze_v4_packages(resolved, output, budget)
             if manifest["_version"] == 4
+            else _freeze_v5_packages(resolved, output, budget)
+            if manifest["_version"] == 5
             else _freeze_packages(resolved, output, budget)
         )
         packages, provenance = frozen["packages"], frozen["provenance"]
@@ -1617,7 +2032,9 @@ def run(args, *, budget=None) -> int:
             provenance["_claims_mode"] = {"value": claims_mode, "source": "manifest"}
         report["inputs"] = provenance
         report_candidates = (
-            (*V4_CANDIDATES, "combined")
+            tuple(V5_CANDIDATES)
+            if manifest["_version"] == 5
+            else (*V4_CANDIDATES, "combined")
             if manifest["_version"] == 4
             else V3_CANDIDATES
             if manifest["_version"] == 3
@@ -1626,6 +2043,10 @@ def run(args, *, budget=None) -> int:
         for name in report_candidates:
             if name in provenance and not provenance[name].get("eligible"):
                 report["deferred"][name] = provenance[name]["deferred_reason"]
+        if manifest["_version"] == 5:
+            for name in packages:
+                if name.startswith("combination:") and not provenance[name].get("eligible"):
+                    report["deferred"][name] = provenance[name]["deferred_reason"]
         bench._save(output / "report.json", report)
 
         prepare = bench.supervised_prepare(
@@ -1664,6 +2085,34 @@ def run(args, *, budget=None) -> int:
             budget.holdback_s = 0.0
             _integrity_check(packages, provenance, seed, seed_hash, budget)
             _assert_campaign_provenance(harness, budget)
+            return (
+                0
+                if report["status"]
+                in {
+                    "qualified",
+                    "qualified_individual_combination_deferred",
+                    "insufficient_evidence",
+                    "deferred",
+                }
+                else 1
+            )
+        if manifest["_version"] == 5:
+            _run_v5(
+                seed,
+                output,
+                budget,
+                warmed,
+                report,
+                packages,
+                provenance,
+                harness,
+            )
+            _run_v5_scheduler_diagnostics(seed, output, packages["baseline"], budget, report)
+            bench._save(output / "report.json", report)
+            budget.holdback_s = 0.0
+            _integrity_check(packages, provenance, seed, seed_hash, budget)
+            _assert_campaign_provenance(harness, budget)
+            report["integrity_validation"] = "passed"
             return (
                 0
                 if report["status"]
@@ -1845,7 +2294,7 @@ def run(args, *, budget=None) -> int:
     except (TimeoutError, subprocess.TimeoutExpired) as exc:
         report["status"] = "insufficient_evidence"
         report["error"] = str(exc)
-        if report.get("manifest_version") == 4:
+        if report.get("manifest_version") in {4, 5}:
             report["retained"] = []
             report["integrity_validation"] = "incomplete"
         elif report.get("manifest_version") == 3:
@@ -1868,7 +2317,7 @@ def run(args, *, budget=None) -> int:
         report["interrupted_exit_code"] = (
             128 + exc.signum if isinstance(exc, bench.Terminated) else 130
         )
-        if report.get("manifest_version") == 4:
+        if report.get("manifest_version") in {4, 5}:
             report["retained"] = []
             report["integrity_validation"] = "incomplete"
         elif report.get("manifest_version") == 3:
@@ -1885,12 +2334,12 @@ def run(args, *, budget=None) -> int:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["retained"] = []
-        if report.get("manifest_version") == 4:
+        if report.get("manifest_version") in {4, 5}:
             report["integrity_validation"] = "failed"
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
-        if report.get("manifest_version") == 4:
+        if report.get("manifest_version") in {4, 5}:
             report["retained"] = []
             report["integrity_validation"] = "failed"
         elif report.get("manifest_version") == 3:

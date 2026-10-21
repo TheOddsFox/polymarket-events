@@ -783,3 +783,81 @@ contains phase/resource results, source hashes and the durable bundle checksum.
 It also records the reporting-only fixes applied after measurement; original
 reports and measured source are preserved. These synthetic results qualify no
 production optimization and establish no full-catalogue or cable-benefit estimate.
+
+### Version 5 application-boundary campaign
+
+Version 5 evaluates three store changes independently: factoring the shared receipt
+timestamp and response ID, consolidating one-to-one state reads, and transporting
+lookup keys as typed string lists. It uses the existing campaign command:
+
+```sh
+uv run --locked python scripts/benchmark-optimization-campaign.py --manifest /absolute/path/variants-v5.json --output /absolute/path/fresh-v5-campaign
+```
+
+The data-only manifest requires all three candidates and accepts explicit combinations:
+
+```json
+{
+  "version": 5,
+  "baseline": {"path": "inputs/baseline/oddsfox_catalogue", "source_hashes": {}},
+  "candidates": {
+    "receipt_factoring": {"path": "inputs/receipt_factoring/oddsfox_catalogue", "source_hashes": {}},
+    "read_consolidation": {"path": "inputs/read_consolidation/oddsfox_catalogue", "source_hashes": {}},
+    "typed_keys": {"path": "inputs/typed_keys/oddsfox_catalogue", "source_hashes": {}}
+  },
+  "combinations": {
+    "read_consolidation+receipt_factoring+typed_keys": {"path": "inputs/combined/oddsfox_catalogue", "source_hashes": {}}
+  }
+}
+```
+
+Replace illustrative empty inventories with complete package-relative Python source
+hashes. Combination keys contain at least two distinct candidate names in lexical
+order, joined with `+`; the entire `combinations` object is optional. Every supplied
+package is trusted executable local code. Inventories establish integrity, not trust.
+Unknown fields, unsafe paths and changes outside `current_store.py` are rejected.
+Review and semantic tests must also establish that each combination contains its
+declared features; file ownership alone cannot do that.
+
+The common baseline and private candidates pass correctness review before measurement.
+Fresh measured packages and one deterministic 10,000-event/40,400-market seed are
+frozen under one 10,800-second budget. Preparation, copies, warm-ups, comparisons,
+diagnostics, integrity validation and cleanup all consume that budget. Correctness
+tests are outside it. Domain clocks are frozen; production deadlines, rate limiting,
+application, prefetch, locking and publication remain active. The sequence interrupts
+after 50 settled units and resumes to completion.
+
+Candidates run in receipt-factoring, read-consolidation, typed-key order against the
+same baseline. Each measured runtime gets one unscored warm-up; each comparison has
+three fresh-worker pairs in AB, BA, AB order. Admission protects 25% headroom, the
+15-second shutdown reserve and a separate 15 seconds for final integrity. After a
+candidate qualifies, later admissions also protect a final-combination reserve of
+125% of the largest completed qualifying comparison duration.
+
+The unchanged gate requires at least 10% and one second median acquire/apply savings,
+at most 5% regression in supervised wall time, whole-worker RSS and pre-oracle peak,
+equivalent public/private state, request/cursor progression and verified publication,
+no increase in any of the four HTTP counters, and equal completed maintenance.
+Deferred cleanup cannot qualify. A single qualifier reuses its independent evidence.
+For multiple qualifiers, only the supplied exact feature combination is evaluated.
+If it is absent, fails or cannot finish, retain the qualified single with the greatest
+absolute median savings, breaking ties in the candidate order above. The driver
+does not compose the shared store file or search smaller combinations.
+
+V5 warm-ups use direct timers without cProfile and emit `warmup_diagnostics` with
+`version: 1` and `attribution_mode: "direct_unprofiled"`. Diagnostics separate SQL
+execution from result materialization and report helper timings, statement counts,
+scalar parameters and list elements. Nested timings overlap; process CPU includes
+all worker threads. Native query plans/profiles are separate diagnostic artifacts;
+their difference from client timings is not proven parameter-conversion cost.
+Scored workers have no attribution instrumentation, and measurement-version-2
+qualification fields remain unchanged. Versions 1–4 retain their existing behavior.
+
+Persist partial reports and revalidate source packages, seed and harness before
+retention. Missing pairs, source changes or unfinished integrity checks cannot
+qualify an optimization. Optional scheduler scaling diagnostics run only with
+comparison and integrity reserves protected. Keep private packages, patches, roots,
+commands, reports and a checksummed evidence bundle outside Git on the same SSD.
+Record host/software/filesystem provenance and effective settings; unavailable USB
+link information stays unknown. These synthetic results cannot establish native
+Windows acceptance, deployment acceptance, full-catalogue runtime or cable benefit.

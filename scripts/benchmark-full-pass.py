@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import cProfile
 import hashlib
 import inspect
@@ -21,6 +22,7 @@ import re
 import shutil
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -63,6 +65,7 @@ BASE_TIME = datetime(2026, 10, 14, tzinfo=UTC)
 BUDGET_S = 600.0
 SHUTDOWN_RESERVE_S = 15.0
 MEASUREMENT_VERSION = 2
+WARMUP_DIAGNOSTICS_VERSION = 1
 PROFILES = {
     "smoke": (250, 1010),
     "perf": (10_000, 40_400),
@@ -470,6 +473,288 @@ def phase_attribution(
         "runtime_sequence_wall_s": runtime_ended - runtime_started,
         "oracle_wall_s": oracle_ended - oracle_started,
     }
+
+
+def _warmup_native_profiles(root: Path, output: Path, label: str, captured: dict, settings) -> dict:
+    """Replay the slowest actual bounded lookup/write on a disposable clone."""
+    profile_dir = output / f"native-profile-{label}"
+    profile_dir.mkdir(parents=True, exist_ok=False)
+    database = profile_dir / "diagnostic.duckdb"
+    temporary_dir = profile_dir / "temporary"
+    temporary_dir.mkdir()
+    shutil.copy2(root / "catalogue.duckdb", database)
+    artifacts = {}
+    try:
+        if not {"shared_lookup", "receipt_write"}.issubset(captured):
+            return {
+                "status": "unavailable",
+                "reason": "warm-up did not capture both a shared lookup and receipt write",
+                "captured_categories": sorted(captured),
+            }
+        plans = {}
+        with duckdb.connect(str(database)) as conn:
+            from oddsfox_catalogue.current_config import _configure_connection
+
+            _configure_connection(conn, settings)
+            conn.execute("SET TimeZone='UTC'")
+            conn.execute("SET temp_directory=?", [str(temporary_dir)])
+            conn.execute(
+                "SET max_temp_directory_size=?",
+                [f"{settings.limits.max_temp_bytes}B"],
+            )
+            for category in ("shared_lookup", "receipt_write"):
+                statement = captured[category]
+                suffix = "lookup" if category == "shared_lookup" else "receipt-write"
+                profile = profile_dir / f"{suffix}.json"
+                plan = profile_dir / f"{suffix}-explain.json"
+                sql, parameters = statement["sql"], statement["parameters"]
+                explain = conn.execute("EXPLAIN " + sql, parameters).fetchall()
+                plans[category] = [str(row[-1]) for row in explain]
+                conn.execute("PRAGMA enable_profiling='json'")
+                conn.execute(
+                    "PRAGMA profiling_output='" + profile.as_posix().replace("'", "''") + "'"
+                )
+                if category == "receipt_write":
+                    conn.execute("BEGIN TRANSACTION")
+                statement_error = None
+                try:
+                    if parameters is None:
+                        conn.execute(sql)
+                    else:
+                        conn.execute(sql, parameters)
+                    conn.fetchall()
+                except BaseException as exc:
+                    statement_error = exc
+                rollback_error = None
+                if category == "receipt_write":
+                    try:
+                        conn.execute("ROLLBACK")
+                    except BaseException as exc:
+                        rollback_error = exc
+                if isinstance(statement_error, (KeyboardInterrupt, Terminated)):
+                    if rollback_error is not None:
+                        raise statement_error from rollback_error
+                    raise statement_error
+                if isinstance(rollback_error, (KeyboardInterrupt, Terminated)):
+                    if statement_error is not None:
+                        raise rollback_error from statement_error
+                    raise rollback_error
+                if statement_error is not None:
+                    if rollback_error is not None:
+                        raise statement_error from rollback_error
+                    raise statement_error
+                if rollback_error is not None:
+                    raise rollback_error
+                conn.execute("PRAGMA disable_profiling")
+                plan.write_text(json.dumps({"category": category, "plan": plans[category]}))
+                artifacts[f"{category}_profile"] = str(profile)
+                artifacts[f"{category}_explain"] = str(plan)
+                artifacts[f"{category}_observed_wall_s"] = statement["observed_wall_s"]
+                artifacts[f"{category}_parameter_bytes"] = statement["parameter_bytes"]
+        for artifact in artifacts.values():
+            if isinstance(artifact, str):
+                require(
+                    Path(artifact).is_file(), "DuckDB native profiling artifact was not written"
+                )
+                require(
+                    Path(artifact).stat().st_size <= 1024 * 1024, "native profile exceeded 1 MiB"
+                )
+        return {
+            "status": "captured",
+            "artifacts": artifacts,
+            "replayed_actual_statements": True,
+            "receipt_write_rolled_back": True,
+            "interpretation": "native query profiles are separate from client binding and conversion costs",
+        }
+    except Exception as exc:
+        return {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
+    finally:
+        active_error = sys.exc_info()[1]
+        try:
+            database.unlink(missing_ok=True)
+        except OSError:
+            if not isinstance(active_error, (KeyboardInterrupt, Terminated)):
+                raise
+
+
+def new_attribution_metrics() -> dict:
+    return {
+        "statement_count": 0,
+        "fetchone_count": 0,
+        "fetchall_count": 0,
+        "fetchmany_count": 0,
+        "parameter_scalar_count": 0,
+        "parameter_list_element_count": 0,
+        "sql_execute_wall_s": 0.0,
+        "result_materialization_wall_s": 0.0,
+        "captured_statements": {},
+    }
+
+
+class AttributedConnection:
+    """Connection proxy used only by direct, unprofiled characterization warm-ups."""
+
+    def __init__(self, context_manager, metrics):
+        self._context_manager = context_manager
+        self._connection = None
+        self._metrics = metrics
+        self._current_statement = None
+
+    def _finish_statement(self):
+        statement = self._current_statement
+        if statement is None:
+            return
+        category = statement.get("category")
+        if category is not None:
+            previous = self._metrics["captured_statements"].get(category)
+            if previous is None or statement["observed_wall_s"] > previous["observed_wall_s"]:
+                self._metrics["captured_statements"][category] = statement
+        self._current_statement = None
+
+    def __enter__(self):
+        self._connection = self._context_manager.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        finish_error = None
+        close_error = None
+        body_error = args[1] if len(args) > 1 and isinstance(args[1], BaseException) else None
+        try:
+            self._finish_statement()
+        except BaseException as exc:
+            finish_error = exc
+        try:
+            suppress = self._context_manager.__exit__(*args)
+        except BaseException as exc:
+            close_error = exc
+
+        # An operator stop must win over ordinary finalization/close errors, and
+        # must never be hidden by the wrapped context manager's suppression.
+        operator_error = next(
+            (
+                error
+                for error in (finish_error, body_error, close_error)
+                if isinstance(error, (KeyboardInterrupt, Terminated))
+            ),
+            None,
+        )
+        if operator_error is not None:
+            chained_error = next(
+                (
+                    error
+                    for error in (finish_error, body_error, close_error)
+                    if error is not None and error is not operator_error
+                ),
+                None,
+            )
+            if chained_error is not None:
+                raise operator_error from chained_error
+            raise operator_error
+
+        if close_error is not None:
+            if finish_error is not None:
+                raise finish_error from close_error
+            if body_error is not None:
+                return False
+            raise close_error
+        if finish_error is not None:
+            if body_error is not None:
+                return False
+            raise finish_error
+        if (
+            args
+            and isinstance(args[0], type)
+            and issubclass(args[0], (KeyboardInterrupt, Terminated))
+        ):
+            return False
+        return suppress
+
+    def execute(self, query, parameters=None):
+        self._finish_statement()
+        params = parameters if parameters is not None else ()
+        self._metrics["statement_count"] += 1
+        if isinstance(params, (list, tuple)):
+            self._metrics["parameter_scalar_count"] += sum(
+                not isinstance(value, (list, tuple)) for value in params
+            )
+            self._metrics["parameter_list_element_count"] += sum(
+                len(value) for value in params if isinstance(value, (list, tuple))
+            )
+        started = time.perf_counter()
+        try:
+            if parameters is None:
+                self._connection.execute(query)
+            else:
+                self._connection.execute(query, parameters)
+        finally:
+            execute_elapsed = time.perf_counter() - started
+            self._metrics["sql_execute_wall_s"] += execute_elapsed
+        normalized_sql = str(query)
+        lowered_sql = normalized_sql.lower()
+        category = None
+        if "_receipts" in lowered_sql and lowered_sql.lstrip().startswith(
+            ("insert", "update", "delete", "replace")
+        ):
+            category = "receipt_write"
+        elif (
+            lowered_sql.lstrip().startswith(("select ", "select\n", "select\t"))
+            and any(
+                table in lowered_sql
+                for table in (
+                    "events",
+                    "markets",
+                    "_receipts",
+                    "_membership",
+                    "_identity_claims",
+                )
+            )
+            and (" where " in lowered_sql or " join " in lowered_sql or " limit " in lowered_sql)
+            and (len(params) > 0 or " limit " in lowered_sql)
+            and (
+                sum(len(value) if isinstance(value, (list, tuple)) else 1 for value in params)
+                <= 2000
+            )
+        ):
+            category = "shared_lookup"
+        if category and len(normalized_sql) <= 65536:
+            try:
+                captured_params = copy.deepcopy(params)
+                encoded_params = json.dumps(captured_params, default=str, ensure_ascii=True)
+            except Exception:
+                captured_params = None
+                encoded_params = "x" * (256 * 1024 + 1)
+            if len(encoded_params.encode("utf-8")) <= 256 * 1024:
+                self._current_statement = {
+                    "category": category,
+                    "sql": normalized_sql,
+                    "parameters": captured_params,
+                    "observed_wall_s": execute_elapsed,
+                    "parameter_bytes": len(encoded_params.encode("utf-8")),
+                }
+        return self
+
+    def _fetch(self, method, *args):
+        self._metrics[f"{method}_count"] += 1
+        started = time.perf_counter()
+        try:
+            return getattr(self._connection, method)(*args)
+        finally:
+            elapsed = time.perf_counter() - started
+            self._metrics["result_materialization_wall_s"] += elapsed
+            if self._current_statement is not None:
+                self._current_statement["observed_wall_s"] += elapsed
+
+    def fetchone(self):
+        return self._fetch("fetchone")
+
+    def fetchall(self):
+        return self._fetch("fetchall")
+
+    def fetchmany(self, size=1):
+        return self._fetch("fetchmany", size)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 def publication_cleanup_warnings(result: dict, step: int) -> list[dict]:
@@ -1101,6 +1386,7 @@ def worker_argv(
     stop_after: int,
     profile: Path | None,
     workload: str | None = None,
+    attribution: bool = False,
 ):
     argv = [
         sys.executable,
@@ -1117,6 +1403,8 @@ def worker_argv(
     ]
     if profile:
         argv.extend(["--_profile", str(profile)])
+    if attribution:
+        argv.append("--_attribution")
     if workload:
         argv.extend(["--_workload", workload])
     return argv
@@ -2813,7 +3101,9 @@ def run_sample(
     label: str,
     warmup=False,
     workload: str | None = None,
+    attribution: bool = False,
 ) -> dict:
+    require(not attribution or warmup, "attribution is available only for unscored warm-ups")
     root = output / f"root-{label}"
     log = output / f"worker-{label}.log"
     stop_after = 1 if profile == "smoke" else 50
@@ -2824,8 +3114,9 @@ def run_sample(
         profile,
         label,
         stop_after,
-        output / f"profile-{label}.prof" if warmup else None,
+        output / f"profile-{label}.prof" if warmup and not attribution else None,
         workload,
+        attribution=attribution,
     )
     sample_started = time.monotonic()
     result = supervised(command, output, runtime_package, budget, log)
@@ -2875,13 +3166,24 @@ def run_sample(
         require(result.get("workload") == workload, "sample workload provenance mismatch")
         require(result.get("oracle_pass") is True, "API workload oracle failed")
     if warmup:
-        profiles = (
-            [output / f"profile-{label}.prof"]
-            if workload is not None
-            else [output / f"profile-{label}-part{part}.prof" for part in (0, 1)]
-        )
-        result["profile_files"] = [str(path) for path in profiles]
-        result["profile_summary"] = profile_summary(profiles)
+        if attribution:
+            diagnostics = result.get("warmup_diagnostics")
+            require(
+                isinstance(diagnostics, dict)
+                and diagnostics.get("version") == 1
+                and diagnostics.get("attribution_mode") == "direct_unprofiled",
+                "V5 warm-up omitted direct unprofiled attribution",
+            )
+            result["profile_files"] = []
+            result["profile_summary"] = None
+        else:
+            profiles = (
+                [output / f"profile-{label}.prof"]
+                if workload is not None
+                else [output / f"profile-{label}-part{part}.prof" for part in (0, 1)]
+            )
+            result["profile_files"] = [str(path) for path in profiles]
+            result["profile_summary"] = profile_summary(profiles)
     return result
 
 
@@ -2949,11 +3251,14 @@ def worker(
     stop_after: int,
     profile: Path | None,
     workload: str | None = None,
+    attribution: bool = False,
 ) -> int:
     from oddsfox_catalogue import current_reconcile, current_runtime, current_sync
     from oddsfox_catalogue.current_config import CurrentLimits, load_current_settings
     from oddsfox_catalogue.gamma.http import CaptureStopped
     from oddsfox_catalogue.runlock import run_lock
+
+    require(not attribution or profile is None, "V5 attribution warm-ups must not enable cProfile")
 
     started = time.monotonic()
     expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
@@ -2976,8 +3281,46 @@ def worker(
     original_gamma = current_runtime.GammaClient
     original_now = current_reconcile._now
     original_datetime = current_runtime.datetime
+    original_connect_store = current_runtime.connect_store
+    instrumented_store_functions = {}
+    store_helper_metrics = {}
     count = 0
     current_limit = [stop_after]
+
+    attribution_metrics = new_attribution_metrics()
+
+    if attribution:
+
+        def attributed_connect_store(*args, **kwargs):
+            return AttributedConnection(
+                original_connect_store(*args, **kwargs), attribution_metrics
+            )
+
+        current_runtime.connect_store = attributed_connect_store
+        for function_name in (
+            "apply",
+            "_select_in",
+            "_write_values",
+            "_write_receipts",
+            "_select_claims_by_assets",
+            "_select_claims_by_markets",
+        ):
+            original = getattr(current_sync.current_store, function_name, None)
+            if original is None:
+                continue
+            instrumented_store_functions[function_name] = original
+            store_helper_metrics[function_name] = {"calls": 0, "wall_s": 0.0}
+
+            def timed_helper(*args, __name=function_name, __original=original, **kwargs):
+                metric = store_helper_metrics[__name]
+                metric["calls"] += 1
+                started_at = time.perf_counter()
+                try:
+                    return __original(*args, **kwargs)
+                finally:
+                    metric["wall_s"] += time.perf_counter() - started_at
+
+            setattr(current_sync.current_store, function_name, timed_helper)
 
     class FrozenDateTime(datetime):
         @classmethod
@@ -3078,7 +3421,14 @@ def worker(
                 optimized_capability = expected_capability
             setup_http_attempts = probe_result.get("http_attempts", 0)
             setup_downloaded_bytes = probe_result.get("downloaded_bytes", 0)
+            for key in attribution_metrics:
+                attribution_metrics[key] = {} if key == "captured_statements" else 0
+            for metrics in store_helper_metrics.values():
+                metrics.update(calls=0, wall_s=0.0)
             runtime_sequence_started = time.monotonic()
+            attribution_wall_started = time.perf_counter() if attribution else None
+            attribution_cpu_started = time.process_time() if attribution else None
+            attribution_helper_wall_s = 0.0
             if workload is not None:
                 api_result = run_api_workload(
                     settings,
@@ -3152,6 +3502,7 @@ def worker(
                     )
                 )
                 return 0
+
             profiler = None
             for step, limit in ((0, stop_after), (1, 0)):
                 clock["now"] = BASE_TIME + timedelta(seconds=step)
@@ -3160,6 +3511,7 @@ def worker(
                 profiler = cProfile.Profile() if profile else None
                 if profiler:
                     profiler.enable()
+                helper_started = time.perf_counter() if attribution else None
                 with run_lock(settings.run_lock_path):
                     result = current_runtime.execute(
                         settings,
@@ -3167,6 +3519,8 @@ def worker(
                         {"full_pass": True},
                         time.monotonic() + settings.limits.max_duration_s,
                     )
+                if attribution:
+                    attribution_helper_wall_s += time.perf_counter() - helper_started
                 if profiler:
                     profiler.disable()
                 timings["acquire_apply_s"] += result.get("timings", {}).get("acquire_apply_s", 0)
@@ -3191,6 +3545,12 @@ def worker(
                     )
                 cleanup_warnings.extend(publication_cleanup_warnings(result, step))
             runtime_sequence_ended = time.monotonic()
+            attribution_runtime_wall_s = (
+                time.perf_counter() - attribution_wall_started if attribution else None
+            )
+            attribution_process_cpu_s = (
+                time.process_time() - attribution_cpu_started if attribution else None
+            )
             stats = source.stats
             measured_attempts, measured_bytes = validate_source_accounting(
                 stats,
@@ -3202,6 +3562,19 @@ def worker(
             for item in settled:
                 stream.write(json.dumps(item, sort_keys=True) + "\n")
         worker_peak_before_oracle_bytes = max(peak_rss_bytes, process_peak_rss_bytes())
+        native_profile_started = time.monotonic() if attribution else None
+        native_profile_diagnostics = (
+            _warmup_native_profiles(
+                root,
+                output,
+                label,
+                attribution_metrics["captured_statements"],
+                settings,
+            )
+            if attribution
+            else None
+        )
+        native_profile_wall_s = time.monotonic() - native_profile_started if attribution else None
         oracle_started = time.monotonic()
         snapshot = public_snapshot(root)
         expected_counts = {
@@ -3254,6 +3627,53 @@ def worker(
                     "publication_verified": snapshot["publication_verified"],
                     "runtime_source": str(actual_package),
                     "settings": settings_summary,
+                    **(
+                        {
+                            "warmup_diagnostics": {
+                                "version": 1,
+                                "attribution_mode": "direct_unprofiled",
+                                "production_reported_acquire_apply_s": timings["acquire_apply_s"],
+                                "store_helper_timings": {
+                                    name: {
+                                        **metric,
+                                        "inclusive": True,
+                                        "overlaps_nested_sql": True,
+                                    }
+                                    for name, metric in store_helper_metrics.items()
+                                },
+                                "runtime_execute_wall_s_including_lock_and_publication": (
+                                    attribution_helper_wall_s
+                                ),
+                                "runtime_sequence_direct_wall_s": attribution_runtime_wall_s,
+                                "process_cpu_s_all_worker_threads": attribution_process_cpu_s,
+                                "sql_execute_wall_s": attribution_metrics["sql_execute_wall_s"],
+                                "result_materialization_wall_s": attribution_metrics[
+                                    "result_materialization_wall_s"
+                                ],
+                                "nested_timings_overlap": True,
+                                "statement_count": attribution_metrics["statement_count"],
+                                "fetchone_count": attribution_metrics["fetchone_count"],
+                                "fetchall_count": attribution_metrics["fetchall_count"],
+                                "fetchmany_count": attribution_metrics["fetchmany_count"],
+                                "parameter_scalar_count": attribution_metrics[
+                                    "parameter_scalar_count"
+                                ],
+                                "parameter_list_element_count": attribution_metrics[
+                                    "parameter_list_element_count"
+                                ],
+                                "counts_are_scored": False,
+                                "counter_scope": "reconciliation_runtime_sequence_only",
+                                "native_profiles": native_profile_diagnostics,
+                                "native_profile_diagnostics_wall_s": native_profile_wall_s,
+                                "native_profile_scope": (
+                                    "bounded lookup and rolled-back receipt write on a disposable copy; "
+                                    "not a binding-overhead estimate"
+                                ),
+                            }
+                        }
+                        if attribution
+                        else {}
+                    ),
                 },
                 default=str,
             )
@@ -3267,6 +3687,111 @@ def worker(
         current_reconcile._now = original_now
         current_runtime.GammaClient = original_gamma
         current_runtime.datetime = original_datetime
+        current_runtime.connect_store = original_connect_store
+        for function_name, original in instrumented_store_functions.items():
+            setattr(current_sync.current_store, function_name, original)
+
+
+def scheduler_diagnostics_worker(seed: Path, root: Path) -> int:
+    """Run bounded, read-only scheduler queries at two synthetic scales."""
+    actual_package = Path(oddsfox_catalogue.__file__).resolve().parent
+    expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
+    require(actual_package == expected_package, "scheduler diagnostic imported a different runtime")
+    from oddsfox_catalogue.current_config import connect_store, load_current_settings
+    from oddsfox_catalogue.current_reconcile import _due, _initialize, _remaining
+
+    def measure_scale(source_root: Path, target_root: Path) -> dict:
+        if target_root.exists():
+            raise ValueError("scheduler diagnostic root must be fresh")
+        copy_root(source_root, target_root)
+        settings = load_current_settings(target_root, env=base_environment())
+        # The deterministic seed has reconciler tables initialized only in the
+        # disposable copy; never mutate the frozen source database.
+        with connect_store(settings) as writable:
+            _initialize(writable)
+        captured = {}
+
+        class CapturingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, query, parameters=None):
+                self.last_query = str(query)
+                self.last_parameters = parameters
+                if parameters is None:
+                    return self.connection.execute(query)
+                return self.connection.execute(query, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        with connect_store(settings, read_only=True) as connection:
+            event_count = connection.execute("SELECT count(*) FROM events").fetchone()[0]
+            market_count = connection.execute("SELECT count(*) FROM markets").fetchone()[0]
+            conn = CapturingConnection(connection)
+            operations = {
+                "urgent_events_due": lambda: _due(
+                    conn, "events", False, BASE_TIME, settings.limits.active_recheck_s
+                ),
+                "residual_markets_due": lambda: _due(
+                    conn,
+                    "markets",
+                    True,
+                    BASE_TIME,
+                    settings.limits.cold_recheck_s,
+                    pass_started=BASE_TIME,
+                ),
+                "full_pass_remaining": lambda: _remaining(conn, BASE_TIME),
+            }
+            for name, operation in operations.items():
+                elapsed, row_counts = [], []
+                query, parameters = None, None
+                for _ in range(3):
+                    started = time.perf_counter()
+                    result = operation()
+                    elapsed.append(time.perf_counter() - started)
+                    row_counts.append(len(result) if isinstance(result, list) else int(result))
+                    query, parameters = conn.last_query, conn.last_parameters
+                explain = connection.execute(
+                    "EXPLAIN ANALYZE " + query, parameters or []
+                ).fetchall()
+                plan = [str(row[-1]) for row in explain]
+                plan_text = "\n".join(plan)
+                require(len(plan_text.encode("utf-8")) <= 1024 * 1024, "scheduler plan too large")
+                captured[name] = {
+                    "repetitions": 3,
+                    "row_counts": row_counts,
+                    "median_wall_s": statistics.median(elapsed),
+                    "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+                    "explain_analyze": plan,
+                    "measurement_scope": "read-only synthetic scheduler diagnostics",
+                }
+        return {
+            "scale": f"{event_count} events / {market_count} markets",
+            "measurements": captured,
+        }
+
+    started = time.monotonic()
+    scale_results = [measure_scale(seed, root / "perf")]
+    smoke_root = root / "smoke-seed"
+    create_seed(smoke_root, *PROFILES["smoke"])
+    scale_results.append(measure_scale(smoke_root, root / "smoke"))
+    print(
+        json.dumps(
+            {
+                "status": "measured",
+                "scales": scale_results,
+                "wall_s": time.monotonic() - started,
+                "peak_rss_sampled_bytes": process_peak_rss_bytes(),
+                "peak_rss_scope": "whole scheduler diagnostic worker lifetime",
+                "source_access": "local synthetic databases only",
+                "production_runtime_extrapolation": False,
+                "runtime_source": str(actual_package),
+            },
+            default=str,
+        )
+    )
+    return 0
 
 
 def parser():
@@ -3285,6 +3810,13 @@ def parser():
         "--_validate", nargs=2, metavar=("BASELINE", "CANDIDATE_PACKAGE"), help=argparse.SUPPRESS
     )
     p.add_argument("--_profile", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--_attribution", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--_scheduler_diagnostics",
+        nargs=2,
+        metavar=("SEED", "ROOT"),
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--_workload", choices=API_WORKLOADS, help=argparse.SUPPRESS)
     return p
 
@@ -3296,6 +3828,11 @@ def _save(path: Path, report: dict):
 
 
 def run(args) -> int:
+    if args._scheduler_diagnostics:
+        seed, root = args._scheduler_diagnostics
+        root = Path(root)
+        root.mkdir(parents=True, exist_ok=False)
+        return scheduler_diagnostics_worker(Path(seed), root)
     if args._sample:
         seed, root, label, stop = args._sample
         return worker(
@@ -3307,6 +3844,7 @@ def run(args) -> int:
             int(stop),
             args._profile,
             args._workload,
+            args._attribution,
         )
     if args._prepare:
         try:

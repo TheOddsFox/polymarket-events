@@ -3,6 +3,25 @@
 **Status: pending.** No v1 acceptance run has been recorded. Earlier measurements were
 taken under the backup and import design that v1 removes, so they are not carried forward.
 
+## Version 5 characterization status
+
+The application-boundary campaign evaluates receipt metadata factoring, consolidated
+one-to-one state reads and typed string-key transport independently. Correctness
+review and synthetic qualification are in progress; no V5 production optimization
+or runtime improvement is accepted yet. The guide documents the V5 manifest,
+warm-up-only direct attribution and unchanged strict qualification gates.
+
+Private engineering and evidence are kept beside the checkout in
+`catalogue-evidence/application-v5-20261021T210432Z`. Engineering scratch variants
+are not measured packages. The fresh package freeze, seed, comparisons, diagnostics,
+integrity validation and shutdown share a single 10,800-second budget; correctness
+tests and engineering precede it. Final results and the durable bundle checksum
+must be recorded here before claiming qualification.
+
+Native Windows and deployment acceptance remain separate and open. This campaign
+uses synthetic offline data only and establishes no full-catalogue runtime or
+cable-benefit estimate.
+
 ## v1 bar
 
 A root meets the v1 bar only when all of these hold on the same root:
