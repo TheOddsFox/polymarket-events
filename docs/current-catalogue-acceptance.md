@@ -3,24 +3,74 @@
 **Status: pending.** No v1 acceptance run has been recorded. Earlier measurements were
 taken under the backup and import design that v1 removes, so they are not carried forward.
 
-## Version 5 characterization status
+## Version 5 Mac application campaign, 2026-10-21
 
-The application-boundary campaign evaluates receipt metadata factoring, consolidated
-one-to-one state reads and typed string-key transport independently. Correctness
-review and synthetic qualification are in progress; no V5 production optimization
-or runtime improvement is accepted yet. The guide documents the V5 manifest,
-warm-up-only direct attribution and unchanged strict qualification gates.
+**Complete: all three candidates deferred; production runtime unchanged.** The
+campaign completed in 5,954.223 seconds within one 10,800-second budget, including
+fresh preparation, freezing, seed generation, warm-ups, comparisons, diagnostics
+and final integrity validation. It used 10,000 events and 40,400 markets, a stop
+after 50 settled units and resumption to 104 settled units in every scored worker.
+The campaign ran four unscored warm-ups and 18 uninstrumented scored runs in
+AB, BA, AB pairs, warming each runtime before its comparison.
 
-Private engineering and evidence are kept beside the checkout in
-`catalogue-evidence/application-v5-20261021T210432Z`. Engineering scratch variants
-are not measured packages. The fresh package freeze, seed, comparisons, diagnostics,
-integrity validation and shutdown share a single 10,800-second budget; correctness
-tests and engineering precede it. Final results and the durable bundle checksum
-must be recorded here before claiming qualification.
+Each candidate was compared independently with the same corrected scalar-binding
+runtime from `c47c3881a64525b7c41fc110a7ee092c2876b1b7`; harness checkpoint
+`03c73261c993f405003b4cf12f3ba4c1976ace51` contains the measured developer tools.
+Median aggregate acquisition/application times were:
 
-Native Windows and deployment acceptance remain separate and open. This campaign
-uses synthetic offline data only and establishes no full-catalogue runtime or
-cable-benefit estimate.
+| Candidate | Paired baseline (s) | Candidate (s) | Savings (s) | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Receipt factoring | 373.881 | 374.277 | -0.396 | Deferred |
+| Read consolidation | 169.382 | 210.080 | -40.698 | Deferred |
+| Typed lookup keys | 166.152 | 165.989 | 0.163 | Deferred |
+
+None met both the 10% and one-second savings requirements. Read consolidation also
+failed wall/RSS guards: its median pre-oracle lifetime peak was 289,603,584 bytes
+versus 214,679,552 bytes. That peak includes setup, provider and runtime allocations;
+it is not isolated application RSS. All scored samples passed public/private state,
+request/cursor and publication comparison, completed maintenance without deferral,
+and recorded identical HTTP counters: 123 actual attempts, 123 reserved attempts,
+19,814,086 downloaded bytes and 19,686,972 runtime-accounted bytes. Final source,
+seed and harness integrity validation passed. The explicit all-three package was
+reviewed and semantically tested, but no combination was measured because no
+independent candidate qualified. All 26 delivered runtime source hashes match the
+measured baseline.
+
+Warm-up-only attribution recorded 4,084 baseline SQL statements and 859,846 scalar
+parameters; read consolidation reduced statements to 3,676, while typed keys reduced
+scalar parameters to 456,646 and increased list elements from 31,200 to 434,400.
+These operation counts and separate native plans/profiles explain the experiments;
+they do not qualify an optimization or prove parameter-conversion overhead. Nested
+timings overlap and process CPU includes all worker threads. Bounded read-only
+scheduler diagnostics covered 250/1,010 and 10,000/40,400 event/market fixtures;
+they establish no larger-scale runtime result.
+
+Observed host: MacBook Air, Apple M4, 32 GB RAM, macOS 27.0.1 arm64, Python 3.12.13,
+DuckDB 1.5.6, external APFS SSD over USB. Negotiated USB speed was unavailable.
+Host load and control timings varied substantially; the receipt controls ranged
+from 163.755 to 553.769 seconds. These observations support deferral, not causal
+claims that a candidate or cable caused a particular timing difference.
+
+Reproduce with trusted frozen packages and a fresh output directory:
+
+```sh
+EVIDENCE="/absolute/path/catalogue-evidence/application-v5-20261021T210432Z"
+uv run --locked python scripts/benchmark-optimization-campaign.py --manifest "$EVIDENCE/manifest-v5.json" --output "$EVIDENCE/fresh-campaign"
+```
+
+If relocating the private bundle, update only package paths in its data-only
+manifest to the extracted packages; preserve their complete source inventories.
+
+The private durable handoff is beside the checkout under
+`catalogue-evidence/application-v5-20261021T210432Z`, with source packages, patches,
+complete inventories, commands, reports, native profiles and partial failures.
+Archive: `application-v5-20261021T210432Z-evidence.tar`.
+SHA256: `135c9cca818e34d7d27e7693c6bbd8ee03279b3babc15f514af2a08e648deee6`.
+Final local verification commands and results are recorded in the PR and private
+verification handoff. Canonical Pad records and raw artifacts remain outside Git.
+
+Native Windows and deployment acceptance remain separate and open. Synthetic
+offline characterization establishes no full-catalogue runtime or cable benefit.
 
 ## v1 bar
 

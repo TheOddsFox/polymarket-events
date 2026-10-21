@@ -365,10 +365,14 @@ checkout:
 ```sh
 uv build
 uv run python scripts/verify-distribution.py dist/*.whl dist/*.tar.gz
-uv run python scripts/verify-installed-workflow.py --output /tmp/catalogue-installed-proof
+PROOF_PARENT="$(mktemp -d)"
+PROOF_PARENT="$(cd "$PROOF_PARENT" && pwd -P)"
+uv run python scripts/verify-installed-workflow.py --output "$PROOF_PARENT/installed-proof"
 ```
 
-The output destination must not exist. The installed-workflow check runs the same
+The temporary parent is unique and resolved to its physical path, including on
+macOS where `/tmp` is a symlink. The output destination must not exist. The
+installed-workflow check runs the same
 commands an operator would run, including `reconcile --full-pass`.
 It builds and installs offline: the uv cache must contain both the declared build
 backend and exported hash-locked runtime requirements. If it reports a cache miss,
@@ -861,3 +865,8 @@ commands, reports and a checksummed evidence bundle outside Git on the same SSD.
 Record host/software/filesystem provenance and effective settings; unavailable USB
 link information stays unknown. These synthetic results cannot establish native
 Windows acceptance, deployment acceptance, full-catalogue runtime or cable benefit.
+
+The [completed V5 Mac campaign](current-catalogue-acceptance.md#version-5-mac-application-campaign-2026-10-21)
+deferred all three candidates. Production store code remains identical to its
+measured baseline; the attribution tools and semantic regression coverage ship
+without an application speedup claim.
