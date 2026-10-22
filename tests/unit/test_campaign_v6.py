@@ -244,6 +244,44 @@ def test_v6_sample_supervises_tiny_fixed_worker_with_sibling_target(tmp_path, mo
     assert (output / f"fixed-root-{target_id}").is_dir()
 
 
+def test_v6_qualification_warmup_skips_optional_attribution_and_records_mode(tmp_path, monkeypatch):
+    assert "uninstrumented full-size warm-up" in campaign.V6_WARMUP_MODE
+    assert "no native profiles" in campaign.V6_WARMUP_MODE
+    package = tmp_path / "runtime"
+    package.mkdir()
+    output = tmp_path / "campaign"
+    output.mkdir()
+    captured = {}
+
+    def sample(_source, _requests, output, _package, _budget, label, *, attribution=False):
+        captured.update(output=output, label=label, attribution=attribution)
+        return {"wall_s": 1.0}
+
+    monkeypatch.setattr(campaign, "_v6_sample", sample)
+    report = {}
+    sample = campaign._v6_warm(
+        "candidate",
+        tmp_path / "source",
+        tmp_path / "requests.json",
+        output,
+        package,
+        campaign.bench.Budget(limit_s=60),
+        report,
+        set(),
+    )
+
+    assert sample["wall_s"] == 1.0
+    assert captured == {
+        "output": tmp_path / "campaign" / "warmups" / "candidate",
+        "label": "warm-candidate",
+        "attribution": False,
+    }
+    assert report["warmup_instrumentation"]["candidate"] == {
+        "attribution": False,
+        "native_profiles": False,
+    }
+
+
 def _measured_v6_worker_result(package: Path) -> dict:
     return {
         "status": "measured",

@@ -74,6 +74,10 @@ V4_OWNERSHIP = {name: "current_store.py" for name in (*V4_CANDIDATES, "combined"
 V5_CANDIDATES = ("receipt_factoring", "read_consolidation", "typed_keys")
 V5_OWNERSHIP = {name: "current_store.py" for name in (*V5_CANDIDATES, "combinations")}
 V6_CANDIDATES = ("claim_asset_index", "staged_state_keys", "columnar_renewals")
+V6_WARMUP_MODE = (
+    "one uninstrumented full-size warm-up and unprofiled synthetic warm-up per runtime; "
+    "no native profiles; scores uninstrumented"
+)
 V6_OWNERSHIP = {
     "claim_asset_index": {
         "current_store.py",
@@ -901,10 +905,16 @@ def _v6_warm(name, source_root, requests_path, output, package, budget, report, 
         package,
         budget,
         f"warm-{name}",
-        attribution=True,
+        # Attribution replays native profiles on another full database copy. Keep
+        # qualification warm-ups representative and leave that optional work out.
+        attribution=False,
     )
     warmed.add(key)
     report.setdefault("warmups", {})[name] = sample
+    report.setdefault("warmup_instrumentation", {})[name] = {
+        "attribution": False,
+        "native_profiles": False,
+    }
     bench._save(output / "report.json", report)
     return sample
 
@@ -2999,7 +3009,7 @@ def run(args, *, budget=None) -> int:
         "warmup_mode": (
             "one direct-unprofiled attribution warm-up per distinct runtime"
             if manifest["_version"] == 5
-            else "one attributed full-size warm-up and unprofiled synthetic warm-up per runtime; scores uninstrumented"
+            else V6_WARMUP_MODE
             if manifest["_version"] == 6
             else "one unprofiled fresh-worker run per distinct runtime"
         ),

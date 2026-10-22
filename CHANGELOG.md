@@ -11,6 +11,9 @@
   full-pass nonregression guard. Production changes require complete qualification.
   The bounded Mac campaign retained none: the index experiment hit the memory ceiling
   and the common baseline evidence window was incomplete.
+- A bounded live acceptance record on an isolated full-size copy. Recalibration and
+  API controls passed; interrupted progress does not establish full-catalogue
+  runtime, sustained freshness or optimization qualification.
 - Version-5 synthetic comparisons for receipt metadata factoring, consolidated state
   reads and typed lookup keys. Direct warm-up attribution separates SQL execution
   from result materialization; scored workers preserve the existing performance,
@@ -42,6 +45,9 @@
 
 ### Fixed
 
+- Version-6 qualification warm-ups omit optional attribution and native-profile
+  replay, avoiding an additional full database copy while preserving scored runs,
+  equivalence checks and performance gates. Reports identify the warm-up mode.
 - Version-6 offline oversized responses exercise the real client byte guard and
   ID-batch splitting, with explicit marker accounting and visible single-ID failures.
 - Version-6 verification and oracle work use the shared campaign allowance while

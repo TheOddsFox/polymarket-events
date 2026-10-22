@@ -898,7 +898,11 @@ records; its attempts and bytes remain accounted. A single oversized record stil
 fails visibly, and the provider's separate construction limit remains enforced.
 
 Each measured runtime/workload gets an unscored warm-up and three fresh-worker
-AB, BA, AB pairs. Retention requires at least 10% and one second lower median
+AB, BA, AB pairs. Default V6 warm-ups are uninstrumented and omit optional native
+profiling, which otherwise copies and replays another full database. Reports record
+the warm-up instrumentation mode. Attribution remains an optional developer
+diagnostic and never runs in scored samples.
+Retention requires at least 10% and one second lower median
 acquisition/application time, at most 5% regression in wall and both worker-lifetime
 RSS metrics, equivalent completed work and publication, no increased HTTP counters,
 and completed maintenance. A qualifying candidate must also pass the canonical
@@ -928,3 +932,7 @@ retained no optimization. The index failed the full-size memory envelope, and th
 baseline evidence window stopped before a complete comparison. The subsequent
 benchmark deadline correction is correctness-tested, without another performance
 campaign. Production store code remains identical to the frozen baseline.
+The [bounded live follow-up](current-catalogue-acceptance.md#bounded-live-follow-up-2026-10-22)
+records isolated-copy recalibration, probe and interrupted full-pass progress.
+Host waiting consumes its wall-clock allowance; partial progress cannot establish
+a full-catalogue runtime or freshness acceptance.

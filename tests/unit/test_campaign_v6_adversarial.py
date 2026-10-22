@@ -772,7 +772,7 @@ def test_v6_fixed_comparison_rejects_equal_but_incomplete_unit_counts(tmp_path, 
         )
 
 
-def test_v6_attribution_is_confined_to_warmups_and_never_scored_samples(tmp_path, monkeypatch):
+def test_v6_warmups_are_uninstrumented_and_scored_samples_never_attributed(tmp_path, monkeypatch):
     requests = _frozen_requests(tmp_path / "requests.json")
     baseline = _package(tmp_path / "baseline", store="BASELINE = 1\n")
     candidate = _package(tmp_path / "candidate", store="CANDIDATE = 1\n")
@@ -797,7 +797,7 @@ def test_v6_attribution_is_confined_to_warmups_and_never_scored_samples(tmp_path
         set(),
     )
     assert result["status"] == "qualified"
-    assert calls[:2] == [("baseline", True), ("candidate", True)]
+    assert calls[:2] == [("baseline", False), ("candidate", False)]
     assert calls[2:] == [
         ("baseline", False),
         ("candidate", False),

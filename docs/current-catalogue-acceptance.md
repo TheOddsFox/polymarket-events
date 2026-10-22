@@ -3,6 +3,43 @@
 **Status: pending.** No v1 acceptance run has been recorded. Earlier measurements were
 taken under the backup and import design that v1 removes, so they are not carried forward.
 
+## Bounded live follow-up, 2026-10-22
+
+**Full-catalogue runtime and freshness remain pending.** This follow-up permits
+live Gamma requests on a fresh isolated SSD copy. Its separate 10,800-second
+wall-clock allowance includes preparation and waiting for unrelated jobs; waiting
+does not reset or extend the deadline. Production limits remain unchanged.
+
+The common runtime is unchanged from upstream `9007eb9`: all 24 runtime files
+match the frozen baseline. The developer harness now omits optional attribution
+and native-profile replay from default V6 warm-ups. Scored samples, correctness
+oracles and qualification thresholds are unchanged. No optimization comparison
+could be admitted after preparation and host contention, so no production
+optimization is retained.
+
+The isolated copy matched the original source inventory. Explicit publication
+recalibration produced a fresh verified release; pre-commit publication work took
+158.206 seconds. This phase timing is not a complete invocation measurement. The
+ordinary version-2 live probe passed with 13 requests, 179,284 downloaded bytes,
+no retries and 4.791 seconds elapsed. A probe proves the selected controls, not
+complete source coverage or sustained freshness.
+
+Full-pass work was interrupted when unrelated refresh and test jobs restarted.
+The interruptions and partial work are preserved, not scored or selectively
+replaced. A local status snapshot after interruption reported a pass start of
+`2026-10-22T16:33:08.011842+00:00`, no completion timestamp, 5,426,384 remaining
+known event/market receipts, 18,974 overdue active records and zero unresolved
+memberships. The initial overdue count was 21,874. These point-in-time counts
+prove resumable progress, not a full-pass duration or deployment acceptance.
+
+Independent `scripts/verify-fast` and `scripts/verify` each passed 1,675 tests.
+The evidence, isolated copy, interrupted logs and continuation reports remain
+outside Git at
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-evidence/qualification-resume-20261022T153731Z`.
+The original catalogue remains read-only. Later full-pass and freshness acceptance
+requires completion and verification on the same root; no cable-benefit or
+end-to-end speedup is inferred from this attempt.
+
 ## Version 6 full-size Mac campaign, 2026-10-22
 
 **Insufficient evidence: no production optimization retained.** The campaign
