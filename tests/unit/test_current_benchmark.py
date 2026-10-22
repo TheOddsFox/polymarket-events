@@ -712,10 +712,6 @@ def test_aggregate_usage_rejects_special_files(tmp_path):
 
 
 @pytest.mark.parametrize("entry_type", ["file", "directory"])
-@pytest.mark.skipif(
-    benchmark.os.name == "nt",
-    reason="POSIX mode-bit contract; native ACL denial has separate coverage",
-)
 def test_aggregate_usage_rejects_unreadable_entries(tmp_path, entry_type):
     entry = tmp_path / "unreadable"
     entry.mkdir() if entry_type == "directory" else entry.write_bytes(b"data")

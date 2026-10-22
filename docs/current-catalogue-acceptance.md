@@ -33,8 +33,9 @@ and recorded identical HTTP counters: 123 actual attempts, 123 reserved attempts
 19,814,086 downloaded bytes and 19,686,972 runtime-accounted bytes. Final source,
 seed and harness integrity validation passed. The explicit all-three package was
 reviewed and semantically tested, but no combination was measured because no
-independent candidate qualified. All 26 delivered runtime source hashes match the
-measured baseline.
+independent candidate qualified. At campaign completion, all 26 delivered runtime source hashes matched the
+measured baseline. Subsequent removal of Windows support changes that source
+inventory without changing the measured historical evidence.
 
 Warm-up-only attribution recorded 4,084 baseline SQL statements and 859,846 scalar
 parameters; read consolidation reduced statements to 3,676, while typed keys reduced
@@ -69,7 +70,8 @@ SHA256: `135c9cca818e34d7d27e7693c6bbd8ee03279b3babc15f514af2a08e648deee6`.
 Final local verification commands and results are recorded in the PR and private
 verification handoff. Canonical Pad records and raw artifacts remain outside Git.
 
-Native Windows and deployment acceptance remain separate and open. Synthetic
+Native Windows support and its acceptance requirement were retired by user decision
+on 2026-10-22. Deployment acceptance remains open. Synthetic
 offline characterization establishes no full-catalogue runtime or cable benefit.
 
 ## v1 bar
@@ -118,11 +120,10 @@ runtime or a benefit from changing the storage cable.
 
 
 The 2026-10-18 local campaign was stopped by user direction with one scored queue
-pair and no qualified optimization. Code and correctness fixes continue, while full
-runs and performance comparisons move to the native Windows workstation. Native
-Windows filesystem/process/ACL proofs and deployment acceptance remain unrecorded.
-The Windows run needs a fresh common portable baseline; earlier POSIX measurements
-are not a substitute. No full-catalogue or cable-benefit estimate follows from this PR.
+pair and no qualified optimization. At the time, full comparisons were deferred to
+a Windows workstation. That requirement was retired on 2026-10-22: execution and
+future qualification target the MacBook. Deployment acceptance remains unrecorded.
+The interrupted evidence establishes no full-catalogue or cable-benefit estimate.
 
 ## Version 4 Mac store-application campaign, 2026-10-20
 
@@ -195,4 +196,4 @@ The original `source-evidence-bundle.zip` SHA-256 is
 It includes frozen packages, patches, candidate tests, measured harness, reports and
 logs; large synthetic databases remain beside it. Candidate-only traversal-count
 tests stay in that private bundle; unconditional application regressions ship.
-Native Windows acceptance and deployment acceptance remain open.
+Windows acceptance is retired; deployment acceptance remains open.

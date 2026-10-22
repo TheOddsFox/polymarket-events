@@ -10,7 +10,7 @@ import stat
 import tomllib
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 import duckdb
 
@@ -19,9 +19,7 @@ from oddsfox_catalogue.config import GammaSettings, _build_section
 from oddsfox_catalogue.current_contract import STORE_CONTRACT, CurrentError
 from oddsfox_catalogue.limits import StorageMeter, directory_bytes
 from oddsfox_catalogue.platform_support import (
-    is_link_or_reparse,
-    pinned_path,
-    require_durability,
+    is_symlink,
     sync_directory,
 )
 
@@ -110,11 +108,9 @@ def safe_path(path: Path) -> Path:
     """Check the supplied spelling before resolving away dangerous ancestors."""
     if ".." in path.parts:
         raise CurrentError("parent traversal is not allowed")
-    if os.name == "nt":
-        _validate_windows_path(path)
     path = Path(os.path.abspath(path))
     for ancestor in (path, *path.parents):
-        if is_link_or_reparse(ancestor):
+        if is_symlink(ancestor):
             raise CurrentError("catalogue path contains a symlink")
         if (
             ancestor.exists()
@@ -123,16 +119,6 @@ def safe_path(path: Path) -> Path:
         ):
             raise CurrentError("catalogue path contains a special file")
     return path
-
-
-def _validate_windows_path(path: Path | PureWindowsPath) -> None:
-    for part in path.parts:
-        if part in {path.anchor, path.drive}:
-            continue
-        if ":" in part:
-            raise CurrentError("alternate data streams are not allowed")
-        if part.endswith((" ", ".")):
-            raise CurrentError("ambiguous Windows path component")
 
 
 def validate_root(root: Path, *, initialize: bool = False) -> Path:
@@ -161,14 +147,7 @@ def validate_root(root: Path, *, initialize: bool = False) -> Path:
         raise CurrentError("nonempty unstamped root; preserve it and select a fresh v3 root")
     if not initialize:
         raise CurrentError("catalogue root is not initialized")
-    anchor = root.parent
-    while not anchor.exists():
-        if anchor.parent == anchor:
-            raise CurrentError("catalogue path has no existing filesystem ancestor")
-        anchor = anchor.parent
-    require_durability(anchor)
-    with pinned_path(anchor):
-        root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     root = safe_path(root)
     atomic_write_bytes(stamp, json.dumps({"contract": STORE_CONTRACT}).encode())
     sync_directory(root.parent)

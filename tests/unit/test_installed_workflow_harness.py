@@ -16,14 +16,7 @@ assert spec and spec.loader
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 
-POSIX_GROUPS = pytest.mark.skipif(
-    os.name == "nt", reason="POSIX process-group contract; Windows Job coverage is separate"
-)
 
-
-@pytest.mark.skipif(
-    os.name == "nt", reason="POSIX mode-bit contract; native ACL freeze has separate coverage"
-)
 def test_resource_freeze_preserves_inventory_and_detects_tampering(tmp_path):
     (tmp_path / "__init__.py").write_text("project")
     (tmp_path / "cli.py").write_text("profile")
@@ -148,7 +141,6 @@ def patch_process(monkeypatch, process, killpg):
     monkeypatch.setattr(harness.os, "killpg", killpg)
 
 
-@POSIX_GROUPS
 def test_cleanup_signals_group_after_leader_already_exited(tmp_path, monkeypatch):
     process = FakeProcess(polls=[0, 0])
     signals = []
@@ -160,7 +152,6 @@ def test_cleanup_signals_group_after_leader_already_exited(tmp_path, monkeypatch
     assert process.waits == [600, 5, 5]
 
 
-@POSIX_GROUPS
 def test_cleanup_ignores_missing_process_group(tmp_path, monkeypatch):
     process = FakeProcess()
 
@@ -172,7 +163,6 @@ def test_cleanup_ignores_missing_process_group(tmp_path, monkeypatch):
     harness.run_command(["unused"], tmp_path, {}, tmp_path / "child.log")
 
 
-@POSIX_GROUPS
 def test_term_permission_race_retries_after_leader_exit(tmp_path, monkeypatch):
     process = FakeProcess(polls=[None, 0, 0])
     signals = []
@@ -187,7 +177,6 @@ def test_term_permission_race_retries_after_leader_exit(tmp_path, monkeypatch):
     assert signals == [signal.SIGTERM, signal.SIGTERM, signal.SIGKILL]
 
 
-@POSIX_GROUPS
 def test_kill_permission_race_retries_after_leader_exit(tmp_path, monkeypatch):
     process = FakeProcess(polls=[0, None, 0])
     signals = []
@@ -203,7 +192,6 @@ def test_kill_permission_race_retries_after_leader_exit(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("polls", [[None, None, 0], [0, 0]])
-@POSIX_GROUPS
 def test_genuine_permission_failure_is_preserved_and_final_wait_runs(tmp_path, monkeypatch, polls):
     process = FakeProcess(polls=polls)
     signals = []
@@ -220,7 +208,6 @@ def test_genuine_permission_failure_is_preserved_and_final_wait_runs(tmp_path, m
     assert process.waits == [600, 5]
 
 
-@POSIX_GROUPS
 def test_repeated_permission_failure_after_exit_retry_is_visible(tmp_path, monkeypatch):
     process = FakeProcess(polls=[None, 0, 0])
     signals = []
@@ -237,7 +224,6 @@ def test_repeated_permission_failure_after_exit_retry_is_visible(tmp_path, monke
     assert process.waits == [600, 5]
 
 
-@POSIX_GROUPS
 def test_final_wait_runs_when_kill_signal_fails(tmp_path, monkeypatch):
     process = FakeProcess()
 
@@ -251,7 +237,6 @@ def test_final_wait_runs_when_kill_signal_fails(tmp_path, monkeypatch):
     assert process.waits == [600, 5, 5]
 
 
-@POSIX_GROUPS
 def test_successful_cleanup_preserves_original_command_error(tmp_path, monkeypatch):
     original = subprocess.TimeoutExpired(["unused"], 1)
     process = FakeProcess(initial_wait_error=original)
@@ -294,7 +279,6 @@ time.sleep(60)
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
-@POSIX_GROUPS
 def test_operator_signal_cleans_child_group_and_records_failure(tmp_path, signum):
     heartbeat = tmp_path / "heartbeat"
     group = tmp_path / "child-group"

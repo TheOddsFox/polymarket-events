@@ -53,7 +53,7 @@ from oddsfox_catalogue.current_rows import project_response  # noqa: E402
 from oddsfox_catalogue.current_runtime import _publish  # noqa: E402
 from oddsfox_catalogue.current_store import apply, initialize, set_state  # noqa: E402
 from oddsfox_catalogue.platform_support import (  # noqa: E402
-    is_link_or_reparse,
+    is_symlink,
     operator_signals,
 )
 from oddsfox_catalogue.platform_support import (  # noqa: E402
@@ -1285,7 +1285,7 @@ def copy_runtime(target: Path, source: Path | None = None) -> str:
     target.mkdir(parents=True)
     casefolded: set[str] = set()
     for path in sorted(source.rglob("*.py")):
-        require(not is_link_or_reparse(path), "runtime source contains a link or reparse point")
+        require(not is_symlink(path), "runtime source contains a link or reparse point")
         portable = path.relative_to(source).as_posix()
         if portable.casefold() in casefolded:
             raise ValueError("runtime source contains case-colliding paths")
@@ -1301,7 +1301,7 @@ def copy_runtime(target: Path, source: Path | None = None) -> str:
 def source_hashes(package: Path) -> dict[str, str]:
     hashes = {}
     for path in sorted(package.rglob("*.py")):
-        require(not is_link_or_reparse(path), "runtime package contains a link or reparse point")
+        require(not is_symlink(path), "runtime package contains a link or reparse point")
         name = path.relative_to(package).as_posix()
         if name.casefold() in {entry.casefold() for entry in hashes}:
             raise ValueError("runtime package contains case-colliding paths")
@@ -1315,8 +1315,6 @@ def harness_provenance() -> dict:
         REPO / "tests" / "fakes" / "world.py",
         REPO / "tests" / "fakes" / "capacity_source.py",
         REPO / "src" / "oddsfox_catalogue" / "platform_support.py",
-        REPO / "src" / "oddsfox_catalogue" / "_windows.py",
-        REPO / "src" / "oddsfox_catalogue" / "_process_gate.py",
         REPO / "scripts" / "verify-installed-workflow.py",
     ]
     return {
@@ -1329,11 +1327,9 @@ def harness_provenance() -> dict:
 
 def validate_tree(root: Path, *, python_only=False) -> None:
     root = safe_path(root)
-    require(
-        root.is_dir() and not is_link_or_reparse(root), "baseline tree must be a regular directory"
-    )
+    require(root.is_dir() and not is_symlink(root), "baseline tree must be a regular directory")
     for path in root.rglob("*"):
-        require(not is_link_or_reparse(path), "baseline contains a link or reparse point")
+        require(not is_symlink(path), "baseline contains a link or reparse point")
         mode = path.lstat().st_mode
         require(
             stat.S_ISDIR(mode) or stat.S_ISREG(mode), "baseline contains a symlink or special file"
@@ -1472,9 +1468,7 @@ def claim_resource_diagnostics(
     """Measure synthetic claim-index cost; do not infer a production admission model."""
     package = safe_path(package)
     output = safe_path(output)
-    require(
-        package.is_dir() and not is_link_or_reparse(package), "claim candidate package is unsafe"
-    )
+    require(package.is_dir() and not is_symlink(package), "claim candidate package is unsafe")
     result_root = output / "claim-scale"
     require(not result_root.exists(), "claim diagnostic output must be fresh")
     result_root.parent.mkdir(parents=True, exist_ok=True)
@@ -2692,13 +2686,9 @@ def _claim_lookup_diagnostics(conn, count):
 
 
 def _claim_storage_metrics(directory: Path, temporary_directory: Path) -> dict:
-    files = [
-        path for path in directory.rglob("*") if path.is_file() and not is_link_or_reparse(path)
-    ]
+    files = [path for path in directory.rglob("*") if path.is_file() and not is_symlink(path)]
     temporary_files = [
-        path
-        for path in temporary_directory.rglob("*")
-        if path.is_file() and not is_link_or_reparse(path)
+        path for path in temporary_directory.rglob("*") if path.is_file() and not is_symlink(path)
     ]
     database_files = [path for path in files if path.suffix == ".duckdb"]
     wal_files = [path for path in files if path.suffix == ".wal"]
@@ -3923,7 +3913,7 @@ def run(args) -> int:
     baseline_dir = safe_path(args.compare) if args.compare else None
     if baseline_dir:
         require(
-            not is_link_or_reparse(baseline_dir) and baseline_dir.is_dir(),
+            not is_symlink(baseline_dir) and baseline_dir.is_dir(),
             "baseline must be a regular directory",
         )
         validate_disjoint(output, baseline_dir)

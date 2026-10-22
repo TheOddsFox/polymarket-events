@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import multiprocessing
-import os
 import time
-from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from .current_config import admit, connect_store, publication_reserve
 from .current_contract import CurrentError
 from .current_store import get_state, initialize, set_state, summary
 from .gamma.http import CaptureStopped, GammaClient, RequestBudgetExceeded
-from .platform_support import WindowsJob, peak_rss_bytes, pinned_path, require_durability
+from .platform_support import peak_rss_bytes
 from .runlock import RunBusy, run_lock
 from .signals import SIGNALS, Terminated
 
@@ -138,21 +136,7 @@ def _persist_probe_result(conn, result, options, probe_options):
 
 
 def execute(settings, operation, options, deadline):
-    if os.name != "nt":
-        return _execute(settings, operation, options, deadline)
-    with _windows_root_guard(settings, operation):
-        return _execute(settings, operation, options, deadline)
-
-
-@contextmanager
-def _windows_root_guard(settings, operation):
-    # Opening a missing/stamped root may create DuckDB state even for commands
-    # that are nominally read-only. Require the supported volume durability
-    # contract for every native Windows invocation until those paths are truly
-    # side-effect free.
-    require_durability(settings.root)
-    with pinned_path(settings.root):
-        yield
+    return _execute(settings, operation, options, deadline)
 
 
 def _execute(settings, operation, options, deadline):
@@ -326,14 +310,8 @@ def _execute(settings, operation, options, deadline):
 
 def _child(pipe, settings, operation, options, deadline):
     try:
-        # The worker can outlive its parent, including while no database is open.
-        guard = _windows_root_guard(settings, operation) if os.name == "nt" else None
-        if guard is None:
-            with run_lock(settings.run_lock_path):
-                result = execute(settings, operation, options, deadline)
-        else:
-            with guard, run_lock(settings.run_lock_path):
-                result = _execute(settings, operation, options, deadline)
+        with run_lock(settings.run_lock_path):
+            result = execute(settings, operation, options, deadline)
         pipe.send((True, result))
     except Exception as exc:
         pipe.send(
@@ -351,24 +329,8 @@ def _child(pipe, settings, operation, options, deadline):
         pipe.close()
 
 
-def _child_after_gate(pipe, settings, operation, options, deadline, gate):
-    try:
-        try:
-            if gate.recv() is not True:
-                return
-        except EOFError:
-            return
-        finally:
-            gate.close()
-        _child(pipe, settings, operation, options, deadline)
-    finally:
-        gate.close()
-
-
 def supervise(settings, operation, options, *, duration):
     """The worker owns the writer lock; the parent drains it before spill cleanup."""
-    if os.name == "nt":
-        return _supervise_windows(settings, operation, options, duration)
     context = multiprocessing.get_context("spawn")
     deadline = time.monotonic() + duration
     receive, send = context.Pipe(duplex=False)
@@ -403,67 +365,3 @@ def supervise(settings, operation, options, *, duration):
             receive.close()
         if stopped.signum is not None:
             raise Terminated(stopped.signum)
-
-
-def _supervise_windows(settings, operation, options, duration):
-    """Gate spawned work until it is contained; the gate also fails closed on parent death."""
-    context = multiprocessing.get_context("spawn")
-    deadline = time.monotonic() + duration
-    receive, send = context.Pipe(duplex=False)
-    gate_receive, gate_send = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_child_after_gate,
-        args=(send, settings, operation, options, deadline, gate_receive),
-    )
-    started_process = False
-    assigned = False
-    with WindowsJob() as job:
-        try:
-            with SIGNALS.hold() as started:
-                process.start()
-                started_process = True
-                send.close()
-                gate_receive.close()
-                job.assign(process.sentinel)
-                assigned = True
-                if SIGNALS.pending is not None:
-                    raise Terminated(SIGNALS.pending)
-                gate_send.send(True)
-                gate_send.close()
-            if started.signum is not None:
-                raise Terminated(started.signum)
-            if not receive.poll(max(0, deadline - time.monotonic())):
-                raise CurrentError(
-                    "invocation deadline exhausted; verify the current pointer before retrying"
-                )
-            try:
-                success, result = receive.recv()
-            except EOFError as exc:
-                raise CurrentError("worker stopped; committed progress can be resumed") from exc
-            process.join(timeout=max(0, deadline - time.monotonic()))
-            if process.is_alive():
-                raise CurrentError("worker did not finish within the invocation deadline")
-            return success, result
-        finally:
-            with SIGNALS.hold() as stopped:
-                gate_send.close()
-                gate_receive.close()
-                if started_process:
-                    try:
-                        if assigned:
-                            job.terminate()
-                    finally:
-                        process.join(timeout=2)
-                        if process.is_alive():
-                            if assigned:
-                                raise CurrentError(
-                                    "contained worker did not stop after Job termination"
-                                )
-                            process.terminate()
-                            process.join(timeout=2)
-                            if process.is_alive():
-                                raise CurrentError("gated worker did not exit after gate closure")
-                send.close()
-                receive.close()
-            if stopped.signum is not None:
-                raise Terminated(stopped.signum)

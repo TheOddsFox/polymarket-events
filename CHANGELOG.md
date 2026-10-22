@@ -14,17 +14,13 @@
   certified market-ID retrieval and dense/sparse keyset discovery. Independent
   workload oracles, exact supplied combinations and one shared three-hour budget
   preserve the earlier manifest workflows and measurement-version-2 guards.
-  Index installation remains deferred without a safe admission model. Full runs and
-  performance qualification move to the Windows workstation; no speedup is claimed.
+  Index installation remains deferred without a safe admission model. Performance qualification remains separate; no speedup is claimed.
 - Version-4 synthetic campaign support for independently comparing outcome grouping
   and reverse claim lookup, an explicitly supplied combined package, and diagnostic-only
   claim-index measurements. Both complete Mac comparisons failed qualification;
   neither production optimization is retained.
 - Selective unindexed claim lookups, linear full-pass queue handling, and explicitly
   certified market-ID/keyset acquisition with version-2 replay compatibility.
-- Native Windows process containment, RSS accounting, reparse-safe storage and
-  fail-closed NTFS volume durability. Real Windows validation remains pending.
-  Existing verification wrappers are runnable with Python on either platform.
 
 - Versioned full-pass phase measurements and independent outcome/queue campaign
   comparisons, preserving legacy manifests and whole-worker performance guards.
@@ -65,6 +61,10 @@
   their groups, while retaining descendant cleanup and genuine permission failures.
 
 ### Changed
+
+- Retired native Windows support, launch gates, filesystem backend and acceptance
+  requirements. macOS on the MacBook is the supported execution target; existing
+  catalogue roots, public output and POSIX safety protections are preserved.
 
 - Post-commit publication maintenance cooperatively defers work near its deadline,
   preserving completed deletion statistics and warnings for later resumption.

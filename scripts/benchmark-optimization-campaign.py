@@ -222,7 +222,7 @@ def _validate_package_tree(package: Path, budget=None) -> list[Path]:
     for path in sorted(package.rglob("*")):
         if budget:
             budget.admit(0.001)
-        if bench.is_link_or_reparse(path):
+        if bench.is_symlink(path):
             raise ValueError("runtime package contains a link or reparse point")
         mode = path.lstat().st_mode
         if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
@@ -561,8 +561,6 @@ def _campaign_provenance(budget) -> dict:
         Path(bench.REPO) / "tests" / "fakes" / "world.py",
         Path(bench.REPO) / "tests" / "fakes" / "capacity_source.py",
         Path(bench.REPO) / "src" / "oddsfox_catalogue" / "platform_support.py",
-        Path(bench.REPO) / "src" / "oddsfox_catalogue" / "_windows.py",
-        Path(bench.REPO) / "src" / "oddsfox_catalogue" / "_process_gate.py",
         Path(bench.REPO) / "scripts" / "verify-installed-workflow.py",
     ]
     return {

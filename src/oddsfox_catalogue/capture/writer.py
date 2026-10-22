@@ -18,9 +18,8 @@ from typing import Any
 
 from oddsfox_catalogue.ids import canonical_json, sha256_bytes
 from oddsfox_catalogue.platform_support import (
-    is_link_or_reparse,
+    is_symlink,
     open_regular_nofollow,
-    pinned_path,
     replace_file,
     sync_directory,
 )
@@ -32,22 +31,17 @@ MAX_MANIFEST_BYTES = 1024**2
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     for ancestor in path.parents:
-        if is_link_or_reparse(ancestor):
+        if is_symlink(ancestor):
             raise ValueError("output path contains a symlink")
-    anchor = path.parent
-    while not anchor.exists():
-        anchor = anchor.parent
-    with pinned_path(anchor):
-        path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with pinned_path(path.parent):
-        fd = open_regular_nofollow(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    if is_link_or_reparse(path):
-        raise ValueError("output path is a reparse point")
+    fd = open_regular_nofollow(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if is_symlink(path):
+        raise ValueError("output path is a symlink")
     replace_file(tmp, path)
     _fsync_dir(path.parent)
 
@@ -111,7 +105,7 @@ def read_regular_bytes(path: Path, *, max_bytes: int, trusted_root: Path | None 
         if not path.is_relative_to(root):
             raise ValueError("raw path leaves trusted root")
     for ancestor in (path, *path.parents):
-        if is_link_or_reparse(ancestor):
+        if is_symlink(ancestor):
             raise ValueError("raw path contains a symlink")
     if not stat.S_ISREG(path.stat().st_mode):
         raise ValueError("raw path is not a regular file")

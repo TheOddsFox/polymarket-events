@@ -108,10 +108,6 @@ def test_bounded_failure_diagnostic_never_echoes_child_credentials(tmp_path, ove
 
 
 @pytest.mark.parametrize("parent_exits", [False, True])
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="POSIX group/signal contract; native Job containment has separate coverage",
-)
 def test_bounded_timeout_kills_term_ignoring_descendant_with_open_pipe(tmp_path, parent_exits):
     heartbeat, group = tmp_path / "heartbeat", tmp_path / "group"
     descendant = """
@@ -353,10 +349,6 @@ def test_command_result_rejects_incomplete_or_nonfinal_objects(tmp_path, output)
         capacity.command_result(log)
 
 
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="POSIX group/signal contract; native Job containment has separate coverage",
-)
 def test_capacity_sigterm_reaps_child_group_restores_handlers_and_retains_report(tmp_path):
     heartbeat, group = tmp_path / "heartbeat", tmp_path / "child-group"
     seed, root, output = tmp_path / "seed", tmp_path / "candidate", tmp_path / "evidence"

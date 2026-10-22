@@ -8,13 +8,12 @@ import logging
 import os
 import signal
 import sys
-from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
 from .current_contract import CurrentError
-from .platform_support import operator_signals, pinned_path, require_durability
+from .platform_support import operator_signals
 from .runlock import RunBusy, run_lock
 from .signals import SIGNALS, Terminated
 
@@ -82,7 +81,7 @@ def build_parser():
 def _metadata(args):
     from .current_config import load_current_settings
     from .ids import sha256_bytes
-    from .metadata import GammaClient, _existing_ancestor, refresh_metadata
+    from .metadata import GammaClient, refresh_metadata
 
     root = args.root
     if root is None and os.environ.get("CATALOGUE_ROOT"):
@@ -106,18 +105,7 @@ def _metadata(args):
             raise CurrentError("metadata.v1 requires isolated producer and output roots")
     client = None
     try:
-        if os.name == "nt":
-            from .current_runtime import _windows_root_guard
-
-            if not producer.root.exists():
-                ancestor = _existing_ancestor(producer.root)
-                require_durability(ancestor)
-                with pinned_path(ancestor):
-                    producer.root.mkdir(parents=True, exist_ok=True)
-            guard = _windows_root_guard(producer, "metadata")
-        else:
-            guard = nullcontext()
-        with guard, run_lock(producer.run_lock_path):
+        with run_lock(producer.run_lock_path):
             client = GammaClient(
                 producer.gamma,
                 max_body_bytes=args.max_response_bytes,

@@ -14,7 +14,7 @@ Response application and progress commit atomically. Verified immutable Parquet 
 
 ## Verification
 
-Development: scripts/verify-fast. Completion: scripts/verify. Both are Python scripts; invoke them with `python` on native Windows. Both run diff/Ruff/pytest; pytest uses every available core (`-n auto`). Completion checks/syncs the lockfile. Pass `-n0` to run one test in-process. Distribution audit and the installed-workflow proof are the local commands in the guide. Tests must never contact live Gamma. CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9 and CATALOGUE_GAMMA_ALLOW_LOOPBACK=1 are the default offline test environment.
+Development: scripts/verify-fast. Completion: scripts/verify. Both are Python scripts. macOS on the MacBook is the supported execution target; native Windows support is retired. Both run diff/Ruff/pytest; pytest uses every available core (`-n auto`). Completion checks/syncs the lockfile. Pass `-n0` to run one test in-process. Distribution audit and the installed-workflow proof are the local commands in the guide. Tests must never contact live Gamma. CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9 and CATALOGUE_GAMMA_ALLOW_LOOPBACK=1 are the default offline test environment.
 
 Test current projections, atomic progress, membership ordering, exact native identity, corruption detection, publication, raw retention by reference, resource boundaries, process deadlines, forced full-pass resumption, metadata.v1 isolation, and offline refresh/reconcile on a minimal initialized root. Performance and freshness are acceptance gates, never assumptions.
 

@@ -8,17 +8,13 @@ import contextlib
 import hashlib
 import json
 import os
-import queue
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-import uuid
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -27,23 +23,18 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 
 from fakes.current_gamma import CurrentGammaServer  # noqa: E402
-from oddsfox_catalogue.current_config import CurrentLimits, safe_path  # noqa: E402
+from oddsfox_catalogue.current_config import CurrentLimits  # noqa: E402
 from oddsfox_catalogue.platform_support import (  # noqa: E402
-    WindowsJob,
-    is_link_or_reparse,
+    is_symlink,
     operator_signals,
 )
 from oddsfox_catalogue.signals import SIGNALS, Terminated  # noqa: E402
 
 
 def resource_inventory(root: Path) -> dict[str, dict[str, object]]:
-    if os.name == "nt":
-        safe_path(root)
     inventory = {}
     for path in sorted(root.rglob("*")):
-        if os.name == "nt":
-            safe_path(path)
-        if is_link_or_reparse(path) or not (path.is_dir() or path.is_file()):
+        if is_symlink(path) or not (path.is_dir() or path.is_file()):
             raise ValueError("installed package resource is not a regular file or directory")
         if path.is_file():
             inventory[path.relative_to(root).as_posix()] = {
@@ -56,61 +47,26 @@ def resource_inventory(root: Path) -> dict[str, dict[str, object]]:
 
 
 def freeze_resources(root: Path) -> None:
-    if os.name == "nt":
-        raise ValueError("Windows installed-resource freeze requires a restorable ACL snapshot")
     for path in root.rglob("*"):
         path.chmod(0o500 if path.is_dir() else 0o400)
     root.chmod(0o500)
 
 
 def assert_resources_frozen(root: Path) -> None:
-    if os.name == "nt":
-        for path in (root, *root.rglob("*")):
-            if path.is_dir():
-                probe = path / f".codex-freeze-probe-{uuid.uuid4().hex}"
-                try:
-                    probe.open("xb").close()
-                except PermissionError:
-                    continue
-                with suppress(FileNotFoundError):
-                    probe.unlink()
-                raise ValueError("installed package directory remained writable")
-            try:
-                path.open("ab").close()
-            except PermissionError:
-                continue
-            raise ValueError("installed package file remained writable")
-        return
     if any(stat.S_IMODE(path.stat().st_mode) & 0o222 for path in (root, *root.rglob("*"))):
         raise ValueError("installed package resources became writable")
 
 
-def _icacls(*arguments: str) -> None:
-    result = subprocess.run(["icacls", *arguments], capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        raise ValueError("Windows ACL operation failed; installed workflow proof is unsupported")
-
-
 @contextlib.contextmanager
-def frozen_resources(root: Path, acl_snapshot: Path):
-    if os.name != "nt":
-        modes = {path: stat.S_IMODE(path.stat().st_mode) for path in (root, *root.rglob("*"))}
-        freeze_resources(root)
-        try:
-            yield
-        finally:
-            for path, mode in modes.items():
-                with suppress(FileNotFoundError):
-                    path.chmod(mode)
-        return
-    _icacls(str(root), "/save", str(acl_snapshot), "/T", "/C")
-    if not acl_snapshot.is_file() or acl_snapshot.stat().st_size == 0:
-        raise ValueError("Windows ACL snapshot is empty; installed workflow proof is unsupported")
+def frozen_resources(root: Path):
+    modes = {path: stat.S_IMODE(path.stat().st_mode) for path in (root, *root.rglob("*"))}
+    freeze_resources(root)
     try:
-        _icacls(str(root), "/deny", "*S-1-1-0:(WD,AD,DC,DE)", "/T", "/C")
         yield
     finally:
-        _icacls(str(root.parent), "/restore", str(acl_snapshot), "/C")
+        for path, mode in modes.items():
+            with suppress(FileNotFoundError):
+                path.chmod(mode)
 
 
 def assert_accounting(report: dict, measured: dict, allowed_paths: set[str]) -> None:
@@ -157,9 +113,6 @@ def run_command(
 ) -> None:
     if max_output_bytes is not None and (type(max_output_bytes) is not int or max_output_bytes < 1):
         raise ValueError("command output allowance must be a positive integer")
-    if os.name == "nt":
-        _run_command_windows(argv, cwd, env, log, timeout, max_output_bytes)
-        return
     with log.open("wb") as output:
         with SIGNALS.hold() as started:
             process = subprocess.Popen(
@@ -238,163 +191,7 @@ def run_command(
         raise ValueError(f"command failed ({code}); inspect {log}{reason}")
 
 
-def _run_command_windows(
-    argv: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    log: Path,
-    timeout: float,
-    max_output_bytes: int | None,
-) -> None:
-    """Start through a gated shim so no target work can escape Job assignment."""
-    import msvcrt
-
-    command = list(argv)
-    if not Path(command[0]).is_absolute():
-        local = cwd / command[0]
-        resolved = str(local.resolve()) if local.exists() else shutil.which(command[0])
-        if resolved:
-            command[0] = resolved
-
-    gate_read, gate_write = os.pipe()
-    gate_handle = msvcrt.get_osfhandle(gate_read)
-    os.set_handle_inheritable(gate_handle, True)
-    shim = REPO / "src" / "oddsfox_catalogue" / "_process_gate.py"
-    child_env = dict(env)
-    child_env["CATALOGUE_PROCESS_GATE_HANDLE"] = str(gate_handle)
-    startup = subprocess.STARTUPINFO()
-    startup.lpAttributeList = {"handle_list": [gate_handle]}
-    reader_thread = None
-    chunks: queue.Queue[bytes | None] | None = None
-    failure: BaseException | None = None
-    code: int | None = None
-    process = None
-    with log.open("wb") as output, WindowsJob() as job:
-        try:
-            with SIGNALS.hold() as started:
-                process = subprocess.Popen(
-                    [sys.executable, str(shim), "--gate-handle", str(gate_handle), "--", *command],
-                    cwd=cwd,
-                    env=child_env,
-                    stdin=None,
-                    stdout=output if max_output_bytes is None else subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    close_fds=True,
-                    startupinfo=startup,
-                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                )
-                os.close(gate_read)
-                gate_read = -1
-                job.assign(process)
-                if SIGNALS.pending is not None:
-                    raise Terminated(SIGNALS.pending)
-                os.write(gate_write, b"\x01")
-                os.close(gate_write)
-                gate_write = -1
-            if started.signum is not None:
-                raise Terminated(started.signum)
-            if max_output_bytes is not None:
-                chunks = queue.Queue(maxsize=2)
-
-                def read_output() -> None:
-                    try:
-                        while block := process.stdout.read(65536):
-                            chunks.put(block)
-                    finally:
-                        chunks.put(None)
-
-                reader_thread = threading.Thread(target=read_output, daemon=True)
-                reader_thread.start()
-            deadline = time.monotonic() + timeout
-            written = 0
-            if chunks is None:
-                code = process.wait(timeout=max(0, deadline - time.monotonic()))
-            else:
-                finished = False
-                while not finished:
-                    if time.monotonic() >= deadline:
-                        raise subprocess.TimeoutExpired(argv, timeout)
-                    try:
-                        block = chunks.get(timeout=min(0.1, deadline - time.monotonic()))
-                    except queue.Empty:
-                        if (
-                            process.poll() is not None
-                            and reader_thread
-                            and not reader_thread.is_alive()
-                        ):
-                            finished = True
-                        continue
-                    if block is None:
-                        finished = True
-                    else:
-                        remaining = max_output_bytes - written
-                        if len(block) > remaining:
-                            output.write(block[:remaining])
-                            written += remaining
-                            raise ValueError(f"command output allowance exhausted; inspect {log}")
-                        output.write(block)
-                        written += len(block)
-                code = process.wait(timeout=max(0, deadline - time.monotonic()))
-        except BaseException as exc:
-            failure = exc
-        finally:
-            if gate_read >= 0:
-                os.close(gate_read)
-            if gate_write >= 0:
-                os.close(gate_write)
-            if process is not None:
-                with SIGNALS.hold() as stopped:
-                    try:
-                        if process.poll() is None and hasattr(signal, "CTRL_BREAK_EVENT"):
-                            with suppress(OSError, ValueError):
-                                process.send_signal(signal.CTRL_BREAK_EVENT)
-                        with suppress(subprocess.TimeoutExpired):
-                            process.wait(timeout=5)
-                    finally:
-                        try:
-                            job.terminate()
-                        finally:
-                            try:
-                                process.wait(timeout=5)
-                            except subprocess.TimeoutExpired as exc:
-                                if failure is None:
-                                    failure = exc
-                    if reader_thread is not None:
-                        drain_until = time.monotonic() + 5
-                        while reader_thread.is_alive() and time.monotonic() < drain_until:
-                            with suppress(queue.Empty):
-                                chunks.get(timeout=0.05)
-                        reader_thread.join(timeout=5)
-                    if process.stdout is not None:
-                        process.stdout.close()
-                if stopped.signum is not None:
-                    failure = Terminated(stopped.signum)
-            if chunks is not None:
-                while True:
-                    try:
-                        block = chunks.get_nowait()
-                    except queue.Empty:
-                        break
-                    if block:
-                        continue
-    if failure is not None:
-        raise failure
-    if code:
-        with log.open("rb") as diagnostics:
-            diagnostics.seek(0, os.SEEK_END)
-            diagnostics.seek(max(0, diagnostics.tell() - 8192))
-            tail = diagnostics.read(8192).lower()
-        reason = ""
-        if b"not found in the cache" in tail or b"needs to be downloaded from a registry" in tail:
-            reason = "; diagnostic: offline_cache_miss"
-        elif b"hash mismatch" in tail:
-            reason = "; diagnostic: dependency_hash_mismatch"
-        raise ValueError(f"command failed ({code}); inspect {log}{reason}")
-
-
 def verify(output: Path) -> dict:
-    if os.name == "nt":
-        safe_path(output)
     env = {
         key: value
         for key, value in os.environ.items()
@@ -409,8 +206,8 @@ def verify(output: Path) -> dict:
     )
     dist, runtime, venv = output / "dist", output / "runtime", output / "venv"
     runtime.mkdir()
-    scripts = venv / ("Scripts" if os.name == "nt" else "bin")
-    python = scripts / ("python.exe" if os.name == "nt" else "python")
+    scripts = venv / "bin"
+    python = scripts / "python"
     requirements = output / "requirements.txt"
     run_command(
         ["uv", "build", "--offline", "--python", sys.executable, "--out-dir", str(dist)],
@@ -487,16 +284,14 @@ def verify(output: Path) -> dict:
         output / "installed-origin.log",
     )
     origin = Path((output / "installed-origin.log").read_text().strip())
-    if os.name == "nt":
-        safe_path(origin)
     if origin.is_relative_to(REPO) or not origin.is_relative_to(venv):
         raise ValueError("package was imported from checkout instead of installed wheel")
     package = origin.parent
     before = resource_inventory(package)
-    with frozen_resources(package, output / "installed-package.acl"):
+    with frozen_resources(package):
         root = runtime / "catalogue"
         steps = []
-        executable = scripts / ("catalogue.exe" if os.name == "nt" else "catalogue")
+        executable = scripts / "catalogue"
 
         def call(name, arguments, *, source=None, selected_root=root):
             child_env = dict(env)
@@ -604,7 +399,7 @@ def main() -> int:
     if output.is_relative_to(REPO):
         parser.error("installed proof must run outside the checkout")
     if args.output:
-        if output.exists() or any(is_link_or_reparse(path) for path in (output, *output.parents)):
+        if output.exists() or any(is_symlink(path) for path in (output, *output.parents)):
             parser.error("output must be fresh and confined by regular directories")
         output.mkdir(parents=True)
     started = time.monotonic()

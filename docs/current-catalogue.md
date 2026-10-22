@@ -304,52 +304,17 @@ Interrupted work resumes from committed progress and pending responses. A failed
 publication keeps the last verified pointer. Verify the pointer before redirecting
 consumers.
 
-## Native Windows
+## Supported platform
 
-The native port targets 64-bit Python 3.12 on Windows 10/11. Real Windows execution
-and performance validation are pending the workstation run. POSIX and mocked-platform
-tests do not establish native NTFS, Job Object or ACL behavior.
-
-Use a local fixed NTFS drive and an elevated PowerShell session with volume-flush
-access. Network paths, mounted subvolumes, junctions/reparse points, alternate data
-streams and ambiguous trailing-dot/space names are rejected. Keep roots and evidence
-outside OneDrive and other reparse-managed locations. All catalogue operations require
-this durability access, including nominal reads whose existing implementation can
-initialize database or temporary state. Unsupported storage or missing access fails
-before the worker opens its lock or database.
-
-Windows durability uses an explicit volume `FlushFileBuffers`, rather than treating
-POSIX directory fsync as a no-op. This requires administrative privileges and can
-add substantial I/O; measure it on the target machine. See Microsoft's
-[volume-flush contract](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers).
-Workers enter a kill-on-close [Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
-before their launch gate opens. Capped pipe output, deadlines and descendant cleanup
-remain supervised. Windows peak RSS is the process peak working set in bytes;
-comparisons across operating systems are rejected.
-
-The existing verification wrappers also run as Python on Windows:
-
-```powershell
-uv sync --locked
-uv build
-$env:UV_OFFLINE = "1"
-$env:UV_LINK_MODE = "copy"
-python scripts/verify-fast
-python scripts/verify
-uv run python scripts/verify-installed-workflow.py --output C:\catalogue-evidence\installed-proof
-uv run python scripts/benchmark-optimization-campaign.py --manifest C:\catalogue-evidence\manifest.json --output C:\catalogue-evidence\campaign
-```
-
-Populate the dependency/build cache before enabling offline mode. Tests and campaign
-workers use synthetic loopback HTTP only. Output directories must be fresh and outside
-the checkout. The installed proof uses restrictive, restorable Windows ACLs and checks
-that writes are denied; Windows read-only mode bits alone are not an equivalent proof.
-The native-only Job, parent-death, rename, reparse and ACL tests must run on Windows.
+Run the catalogue on macOS on the MacBook. Native Windows support and its
+acceptance requirement were retired on 2026-10-22. Existing catalogue roots and
+public output are unchanged. POSIX process-group supervision, no-follow file opens,
+atomic replacement and directory fsync remain active.
 
 ## Verification
 
 Run `scripts/verify-fast` during development and `scripts/verify` before completion.
-On Windows, invoke them with `python`; arguments are forwarded to pytest.
+Arguments are forwarded to pytest.
 Tests use synthetic loopback fixtures and never contact live Gamma. Pytest runs them
 in parallel (`-n auto`); pass `-n0` to run one test in-process. The offline
 environment is `CATALOGUE_GAMMA_BASE_URL=http://127.0.0.1:9` with
@@ -666,7 +631,7 @@ not establish a full-catalogue runtime or USB cable benefit.
 
 The interrupted local POSIX campaign used runtime baseline commit
 `0e03fcf45902ae3adba588f7e839193b8b86c081` and measurement version 2. This commit
-predates the native Windows foundation and is not a usable native Windows baseline.
+is the historical source snapshot for that campaign.
 Earlier campaign timings are not reused.
 
 Claim diagnostics completed both requested scales under the existing limits:
@@ -707,11 +672,10 @@ pair completed (350.080 s baseline versus 364.180 s candidate acquisition/applic
 while three pairs are required. Completed samples, failed preparation and all source
 inventories remain private. No scored sample was selectively rerun.
 
-The user moved full runs and performance comparisons to native Windows and authorized
-merging code with that testing to follow. Accordingly, this change makes no speedup
-claim. The Windows comparison must start a fresh campaign from a common portable
-foundation, use matching OS/measurement versions and frozen source inventories, and
-compare the delivered feature set. Historical POSIX timings cannot qualify that run.
+At the time, the user deferred full comparisons to a Windows workstation. That
+requirement was retired on 2026-10-22 in favor of the MacBook. The interrupted
+campaign remains incomplete and makes no speedup claim; historical timings cannot
+qualify changes to a different source snapshot.
 
 ### Version 4 store application campaign
 
@@ -863,8 +827,8 @@ qualify an optimization. Optional scheduler scaling diagnostics run only with
 comparison and integrity reserves protected. Keep private packages, patches, roots,
 commands, reports and a checksummed evidence bundle outside Git on the same SSD.
 Record host/software/filesystem provenance and effective settings; unavailable USB
-link information stays unknown. These synthetic results cannot establish native
-Windows acceptance, deployment acceptance, full-catalogue runtime or cable benefit.
+link information stays unknown. These synthetic results cannot establish deployment acceptance, full-catalogue
+runtime or cable benefit.
 
 The [completed V5 Mac campaign](current-catalogue-acceptance.md#version-5-mac-application-campaign-2026-10-21)
 deferred all three candidates. Production store code remains identical to its

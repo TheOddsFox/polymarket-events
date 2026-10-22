@@ -28,7 +28,6 @@ from .current_store import validate_public as _integrity
 from .fingerprints import semantic_fingerprint
 from .limits import directory_bytes
 from .platform_support import (
-    remove_tree,
     replace_directory,
     replace_file,
     sync_directory,
@@ -182,10 +181,7 @@ def _maintenance_cutoff(deadline):
 
 
 def _remove_tree(path):
-    if os.name == "nt":
-        remove_tree(path)
-    else:
-        shutil.rmtree(path)
+    shutil.rmtree(path)
 
 
 def _fsync_completed(directory, before, after, primary=None, *, force=False):

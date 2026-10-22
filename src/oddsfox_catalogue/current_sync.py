@@ -23,7 +23,7 @@ from .gamma.http import (
     RetriesExhausted,
 )
 from .gamma.paginators import _window_params, unpack
-from .platform_support import is_link_or_reparse
+from .platform_support import is_symlink
 
 LANES = ("events", "markets")
 _RAW_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -41,7 +41,7 @@ POLICY = {
 def _pending_manifest(directory, root):
     path = directory / "p000001.manifest.json"
     manifest = read_manifest(path, trusted_root=root)
-    if manifest is None and (path.exists() or is_link_or_reparse(path)):
+    if manifest is None and (path.exists() or is_symlink(path)):
         raise CurrentError("corrupt pending response manifest")
     return manifest
 
