@@ -787,7 +787,13 @@ def _campaign_provenance(budget) -> dict:
 
 
 def _v6_worker_result(command, output, package, budget, label):
-    result = bench.supervised(command, output, package, budget, output / f"{label}.log")
+    # V6 fixed-work workers enforce the unchanged production operation deadline
+    # internally. Their bounded streaming oracle runs after that operation, so
+    # the outer process must be bounded by the shared campaign budget instead of
+    # applying the legacy whole-worker 1,200-second cap.
+    result = bench.supervised_prepare(
+        command, output, budget, output / f"{label}.log", package_root=package
+    )
     if result.get("status") != "measured":
         raise ValueError(result.get("message", f"{label} worker failed"))
     if Path(result.get("runtime_source", "")).resolve() != package.resolve():
@@ -1222,7 +1228,7 @@ def _v6_run(
     reserve = 15.0
     budget.holdback_s = reserve
 
-    for name in V6_CANDIDATES:
+    for candidate_index, name in enumerate(V6_CANDIDATES):
         if not provenance[name].get("eligible"):
             report["deferred"][name] = provenance[name].get(
                 "deferred_reason", "candidate is unchanged"
@@ -1345,6 +1351,11 @@ def _v6_run(
         except (TimeoutError, subprocess.TimeoutExpired) as exc:
             report["deferred"][name] = f"insufficient_evidence: {exc}"
             report["stages"].setdefault(stage, {"samples": []})["status"] = "incomplete"
+            for unvisited in V6_CANDIDATES[candidate_index + 1 :]:
+                report["deferred"].setdefault(
+                    unvisited,
+                    f"not_attempted: {name} comparison exhausted the available worker budget",
+                )
             bench._save(output / "report.json", report)
             break
 

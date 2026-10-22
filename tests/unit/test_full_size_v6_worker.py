@@ -149,6 +149,19 @@ def test_observation_clock_includes_latest_membership_and_identity_invalidation(
     conn.close()
 
 
+def test_fixed_worker_rejects_publication_that_exceeds_operation_deadline(monkeypatch):
+    monkeypatch.setattr(bench.time, "monotonic", lambda: 10.0)
+
+    with pytest.raises(TimeoutError, match="production deadline before standalone verification"):
+        bench._require_operation_deadline(10.0, "standalone verification")
+
+
+def test_fixed_worker_allows_standalone_verification_before_operation_deadline(monkeypatch):
+    monkeypatch.setattr(bench.time, "monotonic", lambda: 9.9)
+
+    bench._require_operation_deadline(10.0, "standalone verification")
+
+
 def test_fixed_worker_warmup_exposes_direct_attribution(tmp_path, monkeypatch, capsys):
     source = tmp_path / "source"
     bench.create_seed(source, 4, 20)

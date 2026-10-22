@@ -242,3 +242,137 @@ def test_v6_sample_supervises_tiny_fixed_worker_with_sibling_target(tmp_path, mo
     assert sample["settled_units"] == 3
     target_id = hashlib.sha256(str(sample_output).encode()).hexdigest()[:16]
     assert (output / f"fixed-root-{target_id}").is_dir()
+
+
+def _measured_v6_worker_result(package: Path) -> dict:
+    return {
+        "status": "measured",
+        "runtime_source": str(package),
+        "acquire_apply_s": 1.0,
+        "runtime_sequence_wall_s": 1.0,
+        "wall_s": 2.0,
+        "peak_rss_bytes": 100,
+        "worker_peak_before_oracle_bytes": 90,
+        "http_attempts": 1,
+        "downloaded_bytes": 10,
+        "runtime_reserved_attempts": 1,
+        "runtime_downloaded_bytes": 10,
+        "source_stats": {},
+        "publication_verified": True,
+        "semantic_hash": "state",
+        "settled_requests": [],
+        "settled_units": 1,
+        "completed_work": {},
+        "classification_signature": {},
+        "capture_units": [],
+        "scheduler_cursor_progression": "fixed-work",
+        "publication_noop": True,
+    }
+
+
+def test_v6_worker_supervision_uses_campaign_budget_not_legacy_cap(tmp_path, monkeypatch):
+    package = tmp_path / "runtime"
+    package.mkdir()
+    captured = {}
+
+    def prepare(command, output, budget, log, *, package_root):
+        captured.update(
+            command=command,
+            output=output,
+            remaining=budget.remaining,
+            log=log,
+            package_root=package_root,
+        )
+        return _measured_v6_worker_result(package)
+
+    monkeypatch.setattr(campaign.bench, "supervised_prepare", prepare)
+    monkeypatch.setattr(
+        campaign.bench,
+        "supervised",
+        lambda *_args, **_kwargs: pytest.fail("legacy worker cap used for V6 fixed workload"),
+    )
+    monkeypatch.setattr(campaign.bench, "validate_source_accounting", lambda *_args: None)
+    budget = campaign.bench.Budget(limit_s=2000)
+
+    row = campaign._v6_worker_result(["worker"], tmp_path, package, budget, "fullsize-warmup")
+
+    assert row["status"] == "measured"
+    assert captured["package_root"] == package
+    assert captured["remaining"] > 1200
+    assert captured["log"] == tmp_path / "fullsize-warmup.log"
+
+
+def test_legacy_supervisor_keeps_1200_second_whole_worker_cap(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    script = repo / "scripts" / "verify-installed-workflow.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        "import json\n"
+        "def run_command(argv, cwd, env, log, *, timeout, max_output_bytes):\n"
+        "    log.write_text(json.dumps({'status': 'measured', 'timeout': timeout}))\n"
+    )
+    package = tmp_path / "runtime"
+    package.mkdir()
+    monkeypatch.setattr(campaign.bench, "REPO", repo)
+    monkeypatch.setattr(campaign.bench, "base_environment", lambda: {})
+
+    result = campaign.bench.supervised(
+        ["worker"], tmp_path, package, campaign.bench.Budget(limit_s=2000), tmp_path / "legacy.log"
+    )
+
+    assert result == {"status": "measured", "timeout": 1200}
+
+
+def test_v6_timeout_marks_later_candidates_not_attempted(tmp_path, monkeypatch):
+    packages = {name: tmp_path / name for name in ("baseline", *campaign.V6_CANDIDATES)}
+    for package in packages.values():
+        package.mkdir()
+    package_names = []
+
+    def fixed_warm(name, _source, _requests, _output, _package, _budget, _report, _warmed):
+        package_names.append(name)
+        return {"wall_s": 1.0}
+
+    def synthetic_warm(name, _package, _seed, _output, _budget, _warmed, report):
+        report.setdefault("warmups", {})[name] = {"sample": {"wall_s": 1.0}}
+
+    fixed_calls = []
+
+    def timeout_comparison(stage, left_name, *_args, **_kwargs):
+        fixed_calls.append((stage, left_name))
+        raise TimeoutError("first candidate exhausted its allocated comparison budget")
+
+    monkeypatch.setattr(campaign, "_v6_warm", fixed_warm)
+    monkeypatch.setattr(campaign, "_warm", synthetic_warm)
+    monkeypatch.setattr(campaign, "_v6_fixed_comparison", timeout_comparison)
+    output = tmp_path / "campaign"
+    output.mkdir()
+    report = {
+        "stages": {},
+        "warmups": {},
+        "catalogue_source": {"request_manifest_sha256": "frozen"},
+    }
+    provenance = {name: {"eligible": True} for name in campaign.V6_CANDIDATES}
+
+    campaign._v6_run(
+        tmp_path / "seed",
+        "seed-hash",
+        tmp_path / "source-snapshot",
+        tmp_path / "requests.json",
+        output,
+        campaign.bench.Budget(limit_s=2000),
+        set(),
+        report,
+        packages,
+        provenance,
+        {},
+    )
+
+    timed_out_candidate = campaign.V6_CANDIDATES[1]
+    unvisited_candidate = campaign.V6_CANDIDATES[2]
+    assert fixed_calls == [(f"{timed_out_candidate}_fixed_catalogue_vs_baseline", "baseline")]
+    assert report["stages"][f"{timed_out_candidate}_fixed_catalogue_vs_baseline"]["status"] == (
+        "incomplete"
+    )
+    assert "not_attempted" in report["deferred"][unvisited_candidate]
+    assert f"{unvisited_candidate}_fixed" not in package_names

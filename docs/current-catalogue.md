@@ -908,6 +908,12 @@ One 10,800-second budget includes preparation, copies, index experiments, warm-u
 comparisons and integrity validation. Admissions include 25% headroom, 15 seconds
 for shutdown, 15 seconds for final integrity and a protected combination reserve.
 Missing comparisons or unfinished validation defer the affected candidate.
+V6 bounds the whole worker by that remaining allowance. Its production operation
+keeps the existing 1,200-second deadline through publication return; standalone
+verification, native profiles and the oracle can run afterward. Phase checks are
+cooperative: a blocking operation can overrun, but an operation that returns after
+its production deadline cannot qualify. The outer supervisor remains the final
+bound. Legacy worker limits are unchanged.
 
 Index diagnostics separately report installation, executed query plans, bounded
 replacement/deletion/conflict workloads, checkpointing, sampled storage and lifetime
@@ -916,3 +922,9 @@ cannot qualify without both installation/write-resource evidence and an actually
 indexed measured target. No index is automatically installed on an operator root.
 Preserve commands, runtime inventories, partial failures and checksummed evidence
 outside Git. Results establish neither live freshness nor end-to-end runtime.
+
+The [2026-10-22 Mac campaign](current-catalogue-acceptance.md#version-6-full-size-mac-campaign-2026-10-22)
+retained no optimization. The index failed the full-size memory envelope, and the
+baseline evidence window stopped before a complete comparison. The subsequent
+benchmark deadline correction is correctness-tested, without another performance
+campaign. Production store code remains identical to the frozen baseline.

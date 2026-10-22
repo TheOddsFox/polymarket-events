@@ -3,6 +3,82 @@
 **Status: pending.** No v1 acceptance run has been recorded. Earlier measurements were
 taken under the backup and import design that v1 removes, so they are not carried forward.
 
+## Version 6 full-size Mac campaign, 2026-10-22
+
+**Insufficient evidence: no production optimization retained.** The campaign
+charged 5,795.006 seconds against its one 10,800-second allowance, including
+preparation, preserved failures, conservative recovery charges and a pause for
+unrelated tests. Final source, seed, runtime and harness integrity validation passed.
+No scored pair or complete full-state comparison was produced.
+
+The read-only source contained 1,138,596 events, 4,321,358 markets and 17,278,766
+identity claims. All writes used isolated SSD copies. The common runtime is
+`adfc0056fc4ebce18cdff0a85e2a35687aa4a24a`, based on upstream `5cb015c`; the measured
+attempt used the response-splitting correction in `cb14bd9`. All 24 delivered
+runtime source files remain identical to the frozen baseline. The three
+independent implementations and explicit combinations remain private artifacts.
+
+| Candidate | Evidence | Decision |
+| --- | --- | --- |
+| Asset-claim index | Full-size checkpoint failed at the unchanged 2 GiB DuckDB memory limit; no safe installation/write envelope established | Deferred |
+| Staged state keys | Common baseline warm-up reached the old 1,200-second whole-worker limit before completing its evidence output | Insufficient evidence |
+| Columnar renewals | Not attempted after the common baseline warm-up stopped | Insufficient evidence |
+
+The failed index resource worker took 123.161 seconds including its copy and
+reported a 2,339,143,680-byte process-lifetime peak. These are not isolated build
+cost or index-memory measurements. No production index, index command or resource
+ledger is shipped, and no index was installed on the original catalogue.
+
+The fixed workload requested 32 closed and four active event batches, plus 16
+orphan markets. Read-only inspection after shutdown confirmed 37 committed units,
+3,600 renewed event memberships and receipts for 94,171 owned markets plus the
+16 orphans. Fresh publication and standalone verification completed, and native
+profiling artifacts were produced. The full-state oracle did not complete,
+so these completion checks do not qualify a sample or establish equivalence.
+The saved 200.770-second publication measurement belongs to this unscored worker;
+it establishes no speedup or full-catalogue runtime estimate.
+
+Two benchmark boundary problems were corrected with deterministic regression
+tests: V6 oversized responses now exercise canonical client-side splitting, and
+V6 evidence work uses the shared campaign allowance rather than the production
+operation's 1,200-second window. The production deadline remains enforced through
+publication return; later verification, profiles and the oracle are separate.
+Later candidates are explicitly marked unattempted after an earlier timeout.
+The deadline/reporting correction received correctness verification without a
+second performance campaign. No missing samples were replaced or selectively rerun.
+
+Before freezing, semantic suites passed for the baseline (44 tests), index (52),
+staged keys (50), columnar renewals (56), supplied pair (62) and all-three package
+(70). Final independent `scripts/verify-fast` and `scripts/verify` each passed
+1,674 tests; focused final campaign/worker checks passed 20 tests. These results
+establish regression coverage, not performance qualification.
+
+Observed host: MacBook Air M4, 32 GB RAM, macOS 27.0.1 arm64, Python 3.12.13,
+DuckDB 1.5.6 and an APFS external SSD. `system_profiler -json SPUSBHostDataType`
+reported the Portable SSD at **10 Gb/s**. This is negotiated link speed, not
+measured storage throughput or a cable-benefit comparison.
+
+Durable evidence is outside Git at
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-evidence/database-v6-20261022T135052Z-provider-fixed`.
+Its adjacent `database-v6-20261022T135052Z-provider-fixed-evidence.tar` has SHA-256
+`3848ee407ac3fcf813dce7132279fc66cd866ce13792e4c9406461139516e271`.
+The bundle contains frozen packages, patches, exact orchestration scripts,
+manifests, logs, profiles and partial reports. Database copies and response bodies
+remain in the evidence directory. The preserved negative index result was reused
+only to forbid retention; the effective override is recorded in
+`continuation-accounting.json`. Post-timeout receipt proof and later correctness
+evidence are supplemental files, not a completed performance sample.
+
+For a separately authorized fresh campaign, use a fresh output directory:
+
+```sh
+uv run --locked python scripts/benchmark-optimization-campaign.py --manifest "/absolute/path/manifest-v6.json" --output "/absolute/path/fresh-v6-campaign"
+```
+
+The original root retains its historical reservation until an operator explicitly
+runs `publish --recalibrate` with the updated executable. Full-catalogue runtime,
+sustained freshness and deployment acceptance remain open.
+
 ## Version 5 Mac application campaign, 2026-10-21
 
 **Complete: all three candidates deferred; production runtime unchanged.** The

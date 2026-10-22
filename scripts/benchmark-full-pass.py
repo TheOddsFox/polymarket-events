@@ -4333,6 +4333,12 @@ def _fixed_classification_signature(conn) -> dict:
     }
 
 
+def _require_operation_deadline(deadline: float, phase: str) -> None:
+    """Reject fixed-work samples whose production operation deadline elapsed."""
+    if time.monotonic() >= deadline:
+        raise TimeoutError(f"fixed workload exceeded its production deadline before {phase}")
+
+
 def _verify_fixed_work_receipts(conn, request_spec: dict, stamp: datetime) -> dict:
     """Require every frozen event and owned/orphan market unit to be durably observed."""
     event_ids = list(
@@ -5032,6 +5038,7 @@ def fixed_catalogue_worker(
                     settings, conn, repair_deadline, recalibrate=True
                 )
                 publication_wall = time.monotonic() - publication_started
+                _require_operation_deadline(repair_deadline, "standalone verification")
                 require(
                     publication.get("noop") is False and publication.get("valid") is True,
                     "fixed workload did not create a fresh verified publication",

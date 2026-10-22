@@ -9,6 +9,8 @@
 - Version-6 full-size application characterization for optional asset-claim indexing,
   reusable state keys and columnar renewal writes, with an independent canonical
   full-pass nonregression guard. Production changes require complete qualification.
+  The bounded Mac campaign retained none: the index experiment hit the memory ceiling
+  and the common baseline evidence window was incomplete.
 - Version-5 synthetic comparisons for receipt metadata factoring, consolidated state
   reads and typed lookup keys. Direct warm-up attribution separates SQL execution
   from result materialization; scored workers preserve the existing performance,
@@ -42,6 +44,9 @@
 
 - Version-6 offline oversized responses exercise the real client byte guard and
   ID-batch splitting, with explicit marker accounting and visible single-ID failures.
+- Version-6 verification and oracle work use the shared campaign allowance while
+  preserving the production operation deadline and legacy worker limits. An earlier
+  timeout explicitly labels later candidates unattempted.
 - Acquisition now reports an actionable error before HTTP or checkpoint changes
   when its saved publication reservation consumes the entire invocation, instead
   of repeatedly making no progress. Publication and verification remain usable.
