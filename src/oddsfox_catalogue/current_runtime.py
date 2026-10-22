@@ -26,11 +26,14 @@ def _publishing(settings, conn, operation, options):
     return age >= settings.limits.full_pass_publish_interval_s
 
 
-def _publish(settings, conn, deadline):
+def _publish(settings, conn, deadline, *, recalibrate=False):
     from .current_publish import publish
 
     started = time.monotonic()
-    result = publish(settings, conn, deadline=deadline)
+    if recalibrate:
+        result = publish(settings, conn, deadline=deadline, force=True)
+    else:
+        result = publish(settings, conn, deadline=deadline)
     elapsed = time.monotonic() - started
     # A cheap no-op must not erase the measured cost of exporting a changed store.
     if not result.get("noop") or get_state(conn, "previous_publish_seconds") is None:
@@ -161,7 +164,9 @@ def _execute(settings, operation, options, deadline):
         if operation in {"verify", "current"}:
             return verify_current(settings, connection=conn)
         if operation == "publish":
-            return _publish(settings, conn, deadline)[0]
+            return _publish(
+                settings, conn, deadline, recalibrate=options.get("recalibrate", False)
+            )[0]
         from .current_sync import (
             _pending_work,
             discover,
@@ -172,6 +177,12 @@ def _execute(settings, operation, options, deadline):
 
         publishing = _publishing(settings, conn, operation, options)
         reserve = publication_reserve(settings, conn)
+        if operation in {"refresh", "reconcile"} and reserve >= settings.limits.max_duration_s:
+            raise CurrentError(
+                f"saved publication reservation ({reserve:.2f}s) consumes the configured "
+                f"invocation limit ({settings.limits.max_duration_s:.2f}s); run "
+                "catalogue --root <ROOT> publish --recalibrate before acquisition"
+            )
         acquisition_deadline = deadline if operation == "probe" else deadline - reserve
         with GammaClient(
             settings.gamma,

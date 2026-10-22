@@ -828,6 +828,7 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
 
     from fakes.world import make_event, make_market
     from oddsfox_catalogue import current_publish, current_runtime, current_store, current_sync
+    from oddsfox_catalogue.current_contract import CurrentError
     from oddsfox_catalogue.current_rows import project_response
 
     root = benchmark.validate_root(tmp_path / "seed", initialize=True)
@@ -920,6 +921,12 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
             assert prepared["elapsed_s"] == publication_seconds + 7
             assert prepared["preparation_publication_deadline_monotonic"] == started + 14400
             assert current_store.get_state(conn, "previous_publish_seconds") == publication_seconds
+            measured_reserve = current_runtime.publication_reserve(settings, conn)
+            assert measured_reserve == max(
+                settings.limits.publication_reserve_s, 1.5 * publication_seconds
+            )
+            if publication_seconds == 40:
+                assert measured_reserve < settings.limits.max_duration_s
             assert current_store.get_state(conn, "fetch_pending") == prepared["fetch_pending"]
             assert source.stats["http_attempts"] == 1
             assert all(
@@ -931,22 +938,24 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
             monkeypatch.setattr(current_publish, "publish", original_publish)
             normal_deadline = clock[0] + 1200
             reserve = max(settings.limits.publication_reserve_s, 1.5 * publication_seconds)
-            assert reserve >= 1200
+            assert reserve >= settings.limits.max_duration_s
             if publication_seconds == 1199:
                 assert reserve == 1798.5
             normal_requests = []
+            runtime_client_calls = []
 
             def normal_client(gamma, **kwargs):
+                runtime_client_calls.append(kwargs)
                 assert kwargs["max_duration_s"] == 1200
                 assert kwargs["deadline"] == normal_deadline - reserve
-                assert kwargs["deadline"] <= clock[0]
                 return original_client(
                     gamma,
                     **kwargs,
                     clock=lambda: clock[0],
                     transport=httpx.MockTransport(
                         lambda request: (
-                            normal_requests.append(request) or pytest.fail("no acquisition budget")
+                            normal_requests.append(request)
+                            or pytest.fail("reservation guard should prevent HTTP acquisition")
                         )
                     ),
                 )
@@ -956,11 +965,29 @@ def test_preparation_calibrates_changed_publication_without_relaxing_refresh_bud
                 settings,
                 gamma=benchmark.replace(settings.gamma, base_url=source.url, allow_loopback=True),
             )
-            result = current_runtime.execute(local, "refresh", {}, normal_deadline)
-            assert result["budget_exhausted"] and result["pending"]
-            assert result["http_attempts"] == 0
+            with benchmark.connect_store(settings) as conn:
+                progress_before = {
+                    key: current_store.get_state(conn, key)
+                    for key in ("fetch_pending", "full_pass", "discovery")
+                }
+            with pytest.raises(
+                CurrentError,
+                match=(
+                    r"saved publication reservation \(.*s\) consumes the configured "
+                    r"invocation limit \(1200\.00s\); run catalogue --root <ROOT> "
+                    r"publish --recalibrate before acquisition"
+                ),
+            ):
+                current_runtime.execute(local, "refresh", {}, normal_deadline)
+            assert runtime_client_calls == []
+            assert source.stats["http_attempts"] == 1
             assert normal_requests == []
             with benchmark.connect_store(settings) as conn:
+                progress_after = {
+                    key: current_store.get_state(conn, key)
+                    for key in ("fetch_pending", "full_pass", "discovery")
+                }
+                assert progress_after == progress_before
                 assert (
                     current_store.get_state(conn, "previous_publish_seconds") == publication_seconds
                 )

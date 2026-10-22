@@ -548,10 +548,7 @@ def repair_resumed_identities(settings, conn, client, resumed, *, now, stop, res
 
 def repair_pending(settings, conn, client, *, deadline):
     """One bounded parent unit after discovery; never a sweep of known entities."""
-    reserve = max(
-        settings.limits.publication_reserve_s,
-        1.5 * current_store.get_state(conn, "previous_publish_seconds", 0),
-    )
+    reserve = publication_reserve(settings, conn)
     if time.monotonic() >= deadline - reserve:
         return {"responses": 0}
     _initialize(conn)

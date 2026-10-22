@@ -1,9 +1,9 @@
 """Full-pass queue behavior for batching, urgency and prefetch."""
 
-import time
 from collections import deque
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import duckdb
 import httpx
@@ -79,11 +79,19 @@ def seed(conn, records, age):
     )
 
 
-def run(settings, conn, handler):
+def run(settings, conn, handler, monkeypatch):
+    from fakes.harness import FakeClock
+
+    clock = FakeClock(t=1000.0)
+    monkeypatch.setattr(reconcile, "time", SimpleNamespace(monotonic=clock))
     client = GammaClient(
-        settings.gamma, transport=httpx.MockTransport(handler), sleep=lambda _: None
+        settings.gamma,
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+        sleep=clock.sleep,
+        now=lambda: NOW + timedelta(seconds=1 + clock()),
     )
-    return reconcile.reconcile(settings, conn, client, deadline=time.monotonic() + 30)
+    return reconcile.reconcile(settings, conn, client, deadline=clock() + 30)
 
 
 def test_take_and_preview_skip_settled_ids_and_preview_does_not_mutate():
@@ -122,7 +130,7 @@ def test_scattered_urgent_ids_are_skipped_and_prefetch_tracks_next_eligible_batc
         calls.append(ids)
         return httpx.Response(200, json=[event(key) for key in ids])
 
-    run(settings, conn, handler)
+    run(settings, conn, handler, monkeypatch)
 
     expected = [str(i) for i in range(1, 251) if str(i) not in urgent_ids]
     assert calls == [["2", "55", "201"], expected[:100], expected[100:200], expected[200:]]
@@ -156,7 +164,7 @@ def test_all_remaining_urgent_batches_stay_nonempty_and_bounded(setup, monkeypat
         calls.append(batch)
         return httpx.Response(200, json=[event(key) for key in batch])
 
-    run(settings, conn, handler)
+    run(settings, conn, handler, monkeypatch)
 
     assert calls and all(1 <= len(batch) <= 100 for batch in calls)
     flattened = [key for batch in calls for key in batch]
@@ -183,7 +191,7 @@ def test_id_becoming_urgent_during_the_pass_is_skipped_from_the_cold_queue(setup
         calls.append(batch)
         return httpx.Response(200, json=[event(key) for key in batch])
 
-    run(settings, conn, handler)
+    run(settings, conn, handler, monkeypatch)
 
     assert calls[0] == ids[:100]
     assert calls[1] == ["120"]

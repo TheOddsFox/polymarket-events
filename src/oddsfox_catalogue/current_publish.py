@@ -468,7 +468,7 @@ def _cleanup(settings, keep):
         _fsync_dir(directory)
 
 
-def publish(settings, conn, *, deadline=None):
+def publish(settings, conn, *, deadline=None, force=False):
     """Publish one read snapshot. The caller must hold the catalogue writer lock."""
     publication_started = time.monotonic()
     validate_root(settings.root)
@@ -492,7 +492,8 @@ def publish(settings, conn, *, deadline=None):
                 unchanged = None
                 manifest_hash = None
             if (
-                unchanged is not None
+                not force
+                and unchanged is not None
                 and unchanged.get("generation") == generation(conn)
                 and manifest_hash == pointer.get("manifest_sha256")
                 and _release_bytes_match(release, unchanged)
@@ -561,7 +562,7 @@ def publish(settings, conn, *, deadline=None):
                     previous = fallback
             else:
                 previous = pointer["release_id"]
-                if verified["generation"] == generation(conn):
+                if verified["generation"] == generation(conn) and not force:
                     _cleanup(
                         settings, {pinned.get("release_id"), pinned.get("previous_release_id")}
                     )

@@ -138,7 +138,7 @@ only settled keyset metadata, preserving rows and numeric frontiers.
 
 Claim ownership lookups now use bounded scalar predicates with exact per-chunk
 namespace filtering. They work without ART indexes. Index build/drop commands are
-not included: safe build and ongoing-write admission still need workstation evidence.
+not included: safe build and ongoing-write admission still need full-size Mac evidence.
 The full-pass queue uses a deque and lazy urgent-ID skipping; batch size, prefetch,
 omission confirmation and settled cursor semantics are unchanged. These changes have
 correctness coverage, but their performance remains unqualified.
@@ -150,6 +150,23 @@ including publication. Publication time is reserved inside that deadline: the re
 at least 60 seconds, or 1.5 times the previous measured publication if that is larger.
 Every `reconcile --full-pass` invocation keeps this reserve, including when publication
 is initially deferred by cadence, because the pass may complete during acquisition.
+
+If the saved publication reservation consumes the entire configured invocation,
+`refresh` and `reconcile` stop before HTTP acquisition or progress changes with an
+actionable error. Recalibrate explicitly after investigating the prior slow publish:
+
+```sh
+uv run catalogue --root /srv/catalogue-v3 publish --recalibrate
+```
+
+Recalibration exports and verifies a fresh release even when the store is unchanged.
+It retains the existing deadline, storage admission and current/previous release
+protections. Only a successful fresh publication replaces the saved measurement;
+an ordinary cheap no-op does not. Failures retain the existing publication recovery
+semantics, including a valid promoted release if failure occurs after pointer
+promotion. Recalibration does not lower the reserve or raise any resource limit;
+if fresh publication itself cannot finish, preserve the root and investigate.
+`status`, `verify` and publication remain usable while acquisition is blocked.
 
 ```sh
 uv run catalogue --root /srv/catalogue-v3 refresh
@@ -834,3 +851,62 @@ The [completed V5 Mac campaign](current-catalogue-acceptance.md#version-5-mac-ap
 deferred all three candidates. Production store code remains identical to its
 measured baseline; the attribution tools and semantic regression coverage ship
 without an application speedup claim.
+
+### Version 6 full-size application campaign
+
+V6 evaluates an optional asset-ID claim index, reusable staged state keys and
+columnar receipt/membership writes against one common runtime. It uses the existing
+command with a fresh output directory:
+
+```sh
+uv run --locked python scripts/benchmark-optimization-campaign.py --manifest /absolute/path/variants-v6.json --output /absolute/path/fresh-v6-campaign
+```
+
+The data-only manifest contains `version: 6`, `baseline`, `candidates`,
+`combinations` and `catalogue_source`. Runtime entries contain `path` and complete
+package-relative Python `source_hashes`. Candidate names are `claim_asset_index`,
+`staged_state_keys` and `columnar_renewals`. The explicit all-three combination is
+required under the lexically sorted key
+`claim_asset_index+columnar_renewals+staged_state_keys`; optional pair entries use
+the same naming rule. Shared-file combinations are supplied and reviewed, never
+assembled automatically by the driver.
+
+`catalogue_source` contains a trusted local root `path` and complete root-relative
+regular-file SHA-256 `source_hashes`, excluding only the root `.catalogue.lock`
+control file, whose owner metadata changes when taking the required writer lock.
+Unsafe paths, links, pending acquisition and
+changed inputs are rejected. The source is locked while establishing a consistent
+snapshot and remains otherwise read-only. All application, publication, indexing
+and oracle work uses fresh isolated copies on the same SSD. The isolated common
+seed is recalibrated through a genuine fresh publication before measurement.
+
+The primary workload is a frozen sequence of 32 closed-event batches, four active
+event batches including fanout tails, and orphan-market work. Event batches contain
+at most 100 IDs. Canonical acquisition, application, native confirmation and verified
+publication remain active. This is fixed-work application characterization at full
+database size, not a completed full-catalogue scheduler pass. Whole-table streaming
+semantic digests preserve public and private state comparison without materializing
+millions of rows in Python. Generated references are normalized only in declared
+reference fields. Optional index resource-ledger metadata is checked against exact
+stored claim accounting before its physical-optimization differences are normalized;
+it cannot hide domain, receipt or progress differences.
+
+Each measured runtime/workload gets an unscored warm-up and three fresh-worker
+AB, BA, AB pairs. Retention requires at least 10% and one second lower median
+acquisition/application time, at most 5% regression in wall and both worker-lifetime
+RSS metrics, equivalent completed work and publication, no increased HTTP counters,
+and completed maintenance. A qualifying candidate must also pass the canonical
+10,000-event/40,400-market interrupted/resumed full-pass nonregression guard.
+
+One 10,800-second budget includes preparation, copies, index experiments, warm-ups,
+comparisons and integrity validation. Admissions include 25% headroom, 15 seconds
+for shutdown, 15 seconds for final integrity and a protected combination reserve.
+Missing comparisons or unfinished validation defer the affected candidate.
+
+Index diagnostics separately report installation, executed query plans, bounded
+replacement/deletion/conflict workloads, checkpointing, sampled storage and lifetime
+RSS. They do not alone establish a safe resource envelope. An indexed candidate
+cannot qualify without both installation/write-resource evidence and an actually
+indexed measured target. No index is automatically installed on an operator root.
+Preserve commands, runtime inventories, partial failures and checksummed evidence
+outside Git. Results establish neither live freshness nor end-to-end runtime.

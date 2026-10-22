@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from . import current_store
 from .capture.writer import read_body, read_manifest, write_page
-from .current_config import admit, safe_path, validate_root
+from .current_config import admit, publication_reserve, safe_path, validate_root
 from .current_contract import PROJECTION_VERSION, CurrentError
 from .current_rows import _incomplete, entity_id, project_response
 from .gamma.http import (
@@ -551,10 +551,7 @@ def discover(settings, conn, client, *, deadline):
     )
     if state.get("version") != 2:
         raise CurrentError("incompatible discovery policy; explicit reset required")
-    reserve = max(
-        settings.limits.publication_reserve_s,
-        1.5 * current_store.get_state(conn, "previous_publish_seconds", 0),
-    )
+    reserve = publication_reserve(settings, conn)
     stop = deadline - reserve
     counters = {"requests": 0, "responses": 0, "records": 0}
     visited = set()

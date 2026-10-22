@@ -4,6 +4,11 @@
 
 ### Added
 
+- `publish --recalibrate` creates a fresh verified release to remeasure publication
+  cost without changing resource limits or manually editing catalogue state.
+- Version-6 full-size application characterization for optional asset-claim indexing,
+  reusable state keys and columnar renewal writes, with an independent canonical
+  full-pass nonregression guard. Production changes require complete qualification.
 - Version-5 synthetic comparisons for receipt metadata factoring, consolidated state
   reads and typed lookup keys. Direct warm-up attribution separates SQL execution
   from result materialization; scored workers preserve the existing performance,
@@ -35,6 +40,9 @@
 
 ### Fixed
 
+- Acquisition now reports an actionable error before HTTP or checkpoint changes
+  when its saved publication reservation consumes the entire invocation, instead
+  of repeatedly making no progress. Publication and verification remain usable.
 - Version-4 campaigns preserve invalid-comparison failures, distinguish complete
   deferrals from incomplete evidence, and tolerate unavailable Windows filesystem
   metadata without changing measured performance gates.

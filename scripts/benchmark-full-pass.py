@@ -2647,6 +2647,48 @@ def _claim_lookup_query_plan(conn, column, ids):
     return [str(row[-1]) for row in rows]
 
 
+def _claim_lookup_explain_analyze(conn, column, ids):
+    """Capture DuckDB's executed plan for the exact bounded lookup predicate."""
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"EXPLAIN ANALYZE SELECT venue, market_id, role, asset_kind, asset_id "
+        f"FROM _identity_claims WHERE {column} IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return [str(row[-1]) for row in rows]
+
+
+def _replace_market_claims_diagnostic(conn, venue: str, market_id: str) -> list[tuple]:
+    """Replace one complete namespaced market claim multiset and return its rows."""
+    rows = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims "
+        "WHERE venue=? AND market_id=?",
+        [venue, market_id],
+    ).fetchall()
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        conn.execute(
+            "DELETE FROM _identity_claims WHERE venue=? AND market_id=?", [venue, market_id]
+        )
+        if rows:
+            conn.executemany("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", rows)
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            conn.execute("ROLLBACK")
+        raise
+    restored = conn.execute(
+        "SELECT venue, market_id, role, asset_kind, asset_id FROM _identity_claims "
+        "WHERE venue=? AND market_id=?",
+        [venue, market_id],
+    ).fetchall()
+    require(
+        _claim_multiset(restored) == _claim_multiset(rows),
+        "market replacement failed to restore exact namespaced claim rows",
+    )
+    return rows
+
+
 def _claim_lookup_diagnostics(conn, count):
     from oddsfox_catalogue.current_store import _select_claims_by_assets, _select_claims_by_markets
 
@@ -3784,6 +3826,1386 @@ def scheduler_diagnostics_worker(seed: Path, root: Path) -> int:
     return 0
 
 
+def _regular_tree_hashes(root: Path) -> dict[str, str]:
+    """Hash catalogue content; exclude the mutable root writer-lock file."""
+    root = safe_path(root)
+    require(root.is_dir() and not is_symlink(root), "catalogue source is not a regular directory")
+    result = {}
+    for path in sorted(root.rglob("*")):
+        require(not is_symlink(path), "catalogue source contains a symlink")
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        require(stat.S_ISREG(mode), "catalogue source contains a special file")
+        if path == root / ".catalogue.lock":
+            continue
+        result[path.relative_to(root).as_posix()] = digest(path)
+    return result
+
+
+def _admit_catalogue_copy(source: Path, target: Path, limits) -> dict[str, int]:
+    """Bound a full-tree copy against catalogue retained and filesystem free-space limits."""
+    require(
+        target.parent.is_dir() and not is_symlink(target.parent),
+        "catalogue copy destination parent must be a regular directory",
+    )
+    size_bytes = 0
+    for path in source.rglob("*"):
+        require(not is_symlink(path), "catalogue source contains a symlink")
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        require(stat.S_ISREG(mode), "catalogue source contains a special file")
+        if path != source / ".catalogue.lock":
+            size_bytes += path.stat().st_size
+    require(
+        size_bytes <= limits.max_retained_bytes,
+        f"catalogue copy size {size_bytes} exceeds retained limit {limits.max_retained_bytes}",
+    )
+    free_bytes = shutil.disk_usage(target.parent).free
+    require(
+        free_bytes - size_bytes >= limits.free_reserve_bytes,
+        "catalogue copy would violate free-space reserve "
+        f"(copy={size_bytes}, free={free_bytes}, reserve={limits.free_reserve_bytes})",
+    )
+    return {
+        "copy_bytes": size_bytes,
+        "destination_free_bytes_before": free_bytes,
+        "free_reserve_bytes": limits.free_reserve_bytes,
+        "retained_limit_bytes": limits.max_retained_bytes,
+    }
+
+
+def _remaining_spill_bytes(maximum: int, existing: int) -> int:
+    remaining = maximum - existing
+    require(remaining > 0, "temporary storage allowance exhausted before oracle")
+    return remaining
+
+
+def catalogue_observation_clock(conn, *, now: datetime | None = None) -> datetime:
+    """Return one frozen instant later than all persisted observation clocks."""
+    expressions = [
+        "SELECT receipt AS observed_at FROM _receipts",
+        "SELECT receipt FROM _membership",
+        "SELECT latest_receipt FROM _membership",
+        "SELECT invalidated_at FROM _identity",
+    ]
+    tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+    if "_reconcile_attempts" in tables:
+        expressions.append("SELECT last_attempt FROM _reconcile_attempts")
+    latest = conn.execute(
+        "SELECT max(observed_at) FROM (" + " UNION ALL ".join(expressions) + ")"
+    ).fetchone()[0]
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if latest is not None:
+        latest = latest.astimezone(UTC)
+    return max(value for value in (latest, current) if value is not None) + timedelta(
+        microseconds=1
+    )
+
+
+def snapshot_catalogue(source: Path, target: Path, requests_path: Path) -> dict:
+    """Take a consistent source copy; V6 requests are finalized after clone recalibration."""
+    result = snapshot_catalogue_unrecalibrated(source, target, requests_path)
+    with duckdb.connect(str(target / "catalogue.duckdb"), read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        requests = fixed_catalogue_requests(conn)
+        frozen_clock = catalogue_observation_clock(conn)
+    requests_path.parent.mkdir(parents=True, exist_ok=True)
+    _save(requests_path, {"requests": requests, "domain_clock": frozen_clock.isoformat()})
+    return {
+        **result,
+        "request_manifest": str(requests_path),
+        "request_counts": {
+            "closed_batches": len(requests["closed_event_batches"]),
+            "active_batches": len(requests["active_event_batches"]),
+            "orphan_market_ids": len(requests["orphan_market_ids"]),
+        },
+        "source_counts": requests["counts"],
+        "domain_clock": frozen_clock.isoformat(),
+    }
+
+
+def snapshot_catalogue_unrecalibrated(source: Path, target: Path, requests_path: Path) -> dict:
+    """Take a consistent, lock-protected copy of a quiescent catalogue."""
+    from oddsfox_catalogue import current_sync
+    from oddsfox_catalogue.current_config import CurrentLimits, load_current_settings
+    from oddsfox_catalogue.runlock import run_lock
+
+    source, target, requests_path = map(safe_path, (source, target, requests_path))
+    validate_disjoint(source, target)
+    validate_disjoint(source, requests_path)
+    validate_disjoint(target, requests_path)
+    require(not target.exists(), "catalogue snapshot destination must be fresh")
+    require(not requests_path.exists(), "request manifest destination must be fresh")
+    require(not is_symlink(source) and source.is_dir(), "catalogue source root is unsafe")
+    validate_tree(source)
+    settings = load_current_settings(source)
+    with run_lock(settings.run_lock_path):
+        copy_admission = _admit_catalogue_copy(source, target, settings.limits)
+        before = _regular_tree_hashes(source)
+        with duckdb.connect(
+            str(source / "catalogue.duckdb"),
+            read_only=True,
+            config={
+                "memory_limit": f"{CurrentLimits().duckdb_memory_bytes}B",
+                "threads": str(CurrentLimits().duckdb_threads),
+                "max_temp_directory_size": "0B",
+            },
+        ) as conn:
+            conn.execute("SET TimeZone='UTC'")
+            states = {
+                key: json.loads(value)
+                for key, value in conn.execute("SELECT key,value FROM sync_state").fetchall()
+            }
+            require(
+                not current_sync._pending_work(conn),
+                "catalogue source has pending acquisition work",
+            )
+            full_pass = states.get("full_pass")
+            require(
+                not isinstance(full_pass, dict) or full_pass.get("completed_at") is not None,
+                "catalogue source has an unfinished full pass",
+            )
+            requests = fixed_catalogue_requests(conn)
+            frozen_clock = catalogue_observation_clock(conn)
+        shutil.copytree(source, target, symlinks=True)
+        after = _regular_tree_hashes(source)
+        require(before == after, "catalogue source changed during locked snapshot")
+    return {
+        "status": "snapshotted",
+        "source_hashes": before,
+        "snapshot_hashes": _regular_tree_hashes(target),
+        "copy_admission": copy_admission,
+        "request_counts": {
+            "closed_batches": len(requests["closed_event_batches"]),
+            "active_batches": len(requests["active_event_batches"]),
+            "orphan_market_ids": len(requests["orphan_market_ids"]),
+        },
+        "source_counts": requests["counts"],
+        "domain_clock": frozen_clock.isoformat(),
+    }
+
+
+def locked_catalogue_hash(source: Path) -> dict:
+    """Recheck the complete source inventory while excluding concurrent writers."""
+    from oddsfox_catalogue.current_config import load_current_settings
+    from oddsfox_catalogue.runlock import run_lock
+
+    source = safe_path(source)
+    require(source.is_dir() and not is_symlink(source), "catalogue source root is unsafe")
+    validate_tree(source)
+    settings = load_current_settings(source)
+    with run_lock(settings.run_lock_path):
+        hashes = _regular_tree_hashes(source)
+    return {"status": "hashed", "source_hashes": hashes}
+
+
+def prepare_v6_snapshot(source: Path, requests_path: Path) -> dict:
+    """Recalibrate the isolated copy, then freeze its final request set and clock."""
+    from oddsfox_catalogue import current_runtime
+    from oddsfox_catalogue.current_config import load_current_settings
+    from oddsfox_catalogue.current_publish import verify_current
+
+    source, requests_path = map(safe_path, (source, requests_path))
+    validate_disjoint(source, requests_path)
+    require(source.is_dir() and not is_symlink(source), "V6 snapshot root is unsafe")
+    require(
+        requests_path.is_file() and not is_symlink(requests_path), "request manifest is missing"
+    )
+    snapshot_hashes_before_recalibration = _regular_tree_hashes(source)
+    settings = load_current_settings(source)
+    success, result = current_runtime.supervise(
+        settings,
+        "publish",
+        {"recalibrate": True},
+        duration=settings.limits.max_duration_s,
+    )
+    require(success, result.get("message", "isolated catalogue recalibration failed"))
+    require(
+        result.get("noop") is False and result.get("valid") is True,
+        "isolated catalogue recalibration did not create a fresh release",
+    )
+    verification = verify_current(settings)
+    require(verification.get("valid") is True, "recalibrated snapshot failed verification")
+    with duckdb.connect(str(source / "catalogue.duckdb"), read_only=True) as conn:
+        conn.execute("SET TimeZone='UTC'")
+        requests = fixed_catalogue_requests(conn)
+        frozen_clock = catalogue_observation_clock(conn)
+    _save(requests_path, {"requests": requests, "domain_clock": frozen_clock.isoformat()})
+    after = _regular_tree_hashes(source)
+    return {
+        "status": "prepared",
+        "publication": normalized_publication(result),
+        "verification": verification,
+        "snapshot_hashes_before_recalibration": snapshot_hashes_before_recalibration,
+        "snapshot_hashes": after,
+        "request_manifest": str(requests_path),
+        "request_counts": {
+            "closed_batches": len(requests["closed_event_batches"]),
+            "active_batches": len(requests["active_event_batches"]),
+            "orphan_market_ids": len(requests["orphan_market_ids"]),
+        },
+        "source_counts": requests["counts"],
+        "domain_clock": frozen_clock.isoformat(),
+    }
+
+
+def fixed_catalogue_requests(conn) -> dict:
+    """Freeze deterministic event batches across numeric ranges and fanout tails."""
+    counts = {}
+    for table in ("events", "markets", "event_markets", "outcomes", "_identity_claims"):
+        counts[table] = conn.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+    batches = {}
+    for label, closed, batch_count, fanout_order in (
+        ("closed_event_batches", True, 32, False),
+        ("active_event_batches", False, 4, True),
+    ):
+        if fanout_order:
+            query = """WITH fanout AS (
+                SELECT e.event_id, count(em.market_id) AS n
+                FROM events e LEFT JOIN event_markets em USING(venue,event_id)
+                WHERE e.venue='polymarket' AND e.closed IS NOT DISTINCT FROM ?
+                GROUP BY e.event_id
+            ), ranked AS (
+                SELECT event_id,n,row_number() OVER (ORDER BY try_cast(event_id AS HUGEINT)) AS rn,
+                    count(*) OVER () AS total
+                FROM fanout
+            ), spread AS (
+                SELECT event_id,n,floor((rn-1)*?::DOUBLE/total)::INTEGER AS region,
+                    row_number() OVER (
+                        PARTITION BY floor((rn-1)*?::DOUBLE/total)::INTEGER
+                        ORDER BY n DESC,try_cast(event_id AS HUGEINT)
+                    ) AS local_rank
+                FROM ranked
+            ) SELECT event_id FROM spread WHERE local_rank<=100
+                ORDER BY region,local_rank"""
+            values = [closed, batch_count, batch_count]
+        else:
+            query = """WITH ranked AS (
+                SELECT event_id,row_number() OVER (ORDER BY try_cast(event_id AS HUGEINT)) AS rn,
+                    count(*) OVER () AS total
+                FROM events WHERE venue='polymarket' AND closed IS NOT DISTINCT FROM ?
+            ), spread AS (
+                SELECT event_id,floor((rn-1)*?::DOUBLE/total)::INTEGER AS region,
+                    row_number() OVER (
+                        PARTITION BY floor((rn-1)*?::DOUBLE/total)::INTEGER
+                        ORDER BY try_cast(event_id AS HUGEINT)
+                    ) AS local_rank
+                FROM ranked
+            ) SELECT event_id FROM spread WHERE local_rank<=100 ORDER BY region,local_rank"""
+            values = [closed, batch_count, batch_count]
+        ids = [str(row[0]) for row in conn.execute(query, values).fetchall()]
+        require(len(ids) == batch_count * 100, f"source has fewer than 100 ids per {label} region")
+        batches[label] = [ids[index : index + 100] for index in range(0, len(ids), 100)]
+    orphan_ids = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT m.market_id FROM markets m ANTI JOIN event_markets em "
+            "ON em.venue=m.venue AND em.market_id=m.market_id WHERE m.venue='polymarket' "
+            "ORDER BY try_cast(m.market_id AS HUGEINT) LIMIT 100"
+        ).fetchall()
+    ]
+    require(orphan_ids, "catalogue source has no orphan markets for the fixed workload")
+    return {**batches, "orphan_market_ids": orphan_ids, "counts": counts}
+
+
+def stream_catalogue_oracle(
+    root: Path, settings=None, *, generated_responses: dict[str, str] | None = None
+) -> dict:
+    """Hash public/private state, normalizing only explicitly supplied fresh captures."""
+    from oddsfox_catalogue.fingerprints import semantic_fingerprint
+
+    with duckdb.connect(str(root / "catalogue.duckdb"), read_only=True) as conn:
+        if settings is not None:
+            from oddsfox_catalogue.current_config import admit
+
+            usage = admit(settings)
+            remaining_spill = _remaining_spill_bytes(
+                settings.limits.max_temp_bytes, usage["temporary_bytes"]
+            )
+            conn.execute(f"SET memory_limit='{int(settings.limits.duckdb_memory_bytes)}B'")
+            conn.execute(f"SET threads={int(settings.limits.duckdb_threads)}")
+            conn.execute("SET TimeZone='UTC'")
+            conn.execute("SET temp_directory=?", [str(settings.temporary_dir)])
+            conn.execute(
+                "SET max_temp_directory_size=?",
+                [f"{remaining_spill}B"],
+            )
+        names = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+        fingerprints = {}
+        for table in sorted(names):
+            if table.startswith("_") or table in {"events", "markets", "event_markets", "outcomes"}:
+                fingerprints[table] = None
+        generated_responses = generated_responses or {}
+        require(
+            isinstance(generated_responses, dict)
+            and all(
+                isinstance(source, str) and source and isinstance(stable, str) and stable
+                for source, stable in generated_responses.items()
+            ),
+            "generated response reference map is malformed",
+        )
+        require(
+            len(set(generated_responses.values())) == len(generated_responses),
+            "generated response references must map one-to-one to capture units",
+        )
+        if generated_responses:
+            require(
+                "_v6_generated_response_map" not in names,
+                "reserved V6 response-map table name is already present",
+            )
+            conn.execute(
+                "CREATE TEMP TABLE _v6_generated_response_map "
+                "(source_ref VARCHAR PRIMARY KEY, unit_ref VARCHAR NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO _v6_generated_response_map VALUES (?, ?)",
+                list(generated_responses.items()),
+            )
+
+        def normalized_query(table):
+            columns = [row[0] for row in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+            generated_columns = {
+                "_receipts": {"response"},
+                "_membership": {"response", "latest_response"},
+                "_identity": {"invalidated_response"},
+            }.get(table, set())
+            projected = []
+            for column in columns:
+                if column not in generated_columns:
+                    projected.append(f'source."{column}"')
+                    continue
+                expression = f'source."{column}"'
+                if generated_responses:
+                    expression = f"coalesce(generated_map.unit_ref, {expression})"
+                projected.append(f'{expression} AS "{column}"')
+            joins = ""
+            if table in {"_receipts", "_membership", "_identity"} and generated_responses:
+                join_column = {
+                    "_receipts": "response",
+                    "_membership": "response",
+                    "_identity": "invalidated_response",
+                }[table]
+                if table == "_membership":
+                    # Both receipt columns are normalized through the same exact map.
+                    # Two bounded joins preserve their independent column association.
+                    joins = (
+                        " LEFT JOIN _v6_generated_response_map AS generated_map "
+                        'ON source."response"=generated_map.source_ref '
+                        "LEFT JOIN _v6_generated_response_map AS latest_map "
+                        'ON source."latest_response"=latest_map.source_ref'
+                    )
+                    projected = [
+                        (
+                            f"coalesce({'latest_map' if column == 'latest_response' else 'generated_map'}."
+                            f'unit_ref, source."{column}") AS "{column}"'
+                            if column in generated_columns
+                            else f'source."{column}"'
+                        )
+                        for column in columns
+                    ]
+                else:
+                    joins = (
+                        " LEFT JOIN _v6_generated_response_map AS generated_map "
+                        f'ON source."{join_column}"=generated_map.source_ref'
+                    )
+            return f'SELECT {", ".join(projected)} FROM "{table}" AS source{joins}'
+
+        state = {}
+        for key, value in conn.execute("SELECT key,value FROM sync_state ORDER BY key").fetchall():
+            parsed = json.loads(value)
+            if key == "bulk_policy" and isinstance(parsed, dict):
+                origin = parsed.get("origin")
+                if isinstance(origin, str) and re.fullmatch(r"http://127\.0\.0\.1:\d+", origin):
+                    parsed["origin"] = "http://127.0.0.1:<ephemeral>"
+            if key == "previous_publish_seconds":
+                parsed = "<measured-publication-duration>"
+            if key == "claim_index_resource_ledger_v1":
+                ledger = conn.execute(
+                    "SELECT count(*),coalesce(sum(strlen(venue)+strlen(market_id)+strlen(role)+"
+                    "strlen(asset_kind)+strlen(asset_id)),0) FROM _identity_claims"
+                ).fetchone()
+                if (
+                    not isinstance(parsed, dict)
+                    or parsed.get("version") != 1
+                    or parsed.get("rows") != int(ledger[0])
+                    or parsed.get("identifier_bytes") != int(ledger[1])
+                    or parsed.get("distinct_asset_ids")
+                    != int(
+                        conn.execute(
+                            "SELECT count(DISTINCT asset_id) FROM _identity_claims"
+                        ).fetchone()[0]
+                    )
+                    or set(parsed) != {"version", "rows", "identifier_bytes", "distinct_asset_ids"}
+                ):
+                    raise ValueError("claim-index resource ledger disagrees with stored claim rows")
+                parsed = {
+                    "version": 1,
+                    "rows": int(ledger[0]),
+                    "identifier_bytes": int(ledger[1]),
+                    "distinct_asset_ids": int(
+                        conn.execute(
+                            "SELECT count(DISTINCT asset_id) FROM _identity_claims"
+                        ).fetchone()[0]
+                    ),
+                    "normalized_resource_ledger": True,
+                }
+            if key == "last_run" and isinstance(parsed, dict):
+                timings = parsed.get("timings")
+                if isinstance(timings, dict):
+                    parsed["timings"] = {name: "<measured-duration>" for name in timings}
+                for volatile in (
+                    "at",
+                    "elapsed_s",
+                    "peak_rss_bytes",
+                    "storage",
+                    "requests",
+                    "http_attempts",
+                    "downloaded_bytes",
+                    "freshness",
+                ):
+                    if volatile in parsed:
+                        parsed[volatile] = "<runtime-diagnostic>"
+            state[key] = parsed
+        if "claim_index_resource_ledger_v1" not in state:
+            ledger = conn.execute(
+                "SELECT count(*),coalesce(sum(strlen(venue)+strlen(market_id)+strlen(role)+"
+                "strlen(asset_kind)+strlen(asset_id)),0) FROM _identity_claims"
+            ).fetchone()
+            state["claim_index_resource_ledger_v1"] = {
+                "version": 1,
+                "rows": int(ledger[0]),
+                "identifier_bytes": int(ledger[1]),
+                "distinct_asset_ids": int(
+                    conn.execute(
+                        "SELECT count(DISTINCT asset_id) FROM _identity_claims"
+                    ).fetchone()[0]
+                ),
+                "normalized_resource_ledger": True,
+            }
+        for table in fingerprints:
+            fingerprints[table] = semantic_fingerprint(conn, normalized_query(table))
+        return {
+            "tables": fingerprints,
+            "state": state,
+            "generated_capture_units": sorted(set(generated_responses.values())),
+        }
+
+
+def _v6_normalized_publication(manifest: dict) -> dict:
+    """Keep publication semantics while excluding only nonsemantic file fingerprints."""
+    keys = (
+        "contract",
+        "projection_version",
+        "generation",
+        "counts",
+        "coverage",
+        "backlog",
+        "full_pass",
+        "relations",
+    )
+    result = copy.deepcopy({key: manifest[key] for key in keys if key in manifest})
+    for descriptor in result.get("relations", {}).values():
+        if isinstance(descriptor, dict):
+            descriptor.pop("sha256", None)
+            descriptor.pop("bytes", None)
+    return result
+
+
+def _fixed_classification_signature(conn) -> dict:
+    """Compact deterministic lifecycle/coverage counts for fixed-work comparisons."""
+    events = conn.execute(
+        "SELECT coalesce(cast(closed AS VARCHAR), '<null>'), count(*) FROM events "
+        "GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    markets = conn.execute(
+        "SELECT coalesce(cast(closed AS VARCHAR), '<null>'), count(*) FROM markets "
+        "GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    receipt_counts = conn.execute(
+        "SELECT kind, count(*) FROM _receipts GROUP BY kind ORDER BY kind"
+    ).fetchall()
+    return {
+        "event_lifecycle_counts": [[str(value), int(count)] for value, count in events],
+        "market_lifecycle_counts": [[str(value), int(count)] for value, count in markets],
+        "receipt_counts": [[str(kind), int(count)] for kind, count in receipt_counts],
+    }
+
+
+def _verify_fixed_work_receipts(conn, request_spec: dict, stamp: datetime) -> dict:
+    """Require every frozen event and owned/orphan market unit to be durably observed."""
+    event_ids = list(
+        dict.fromkeys(
+            str(value)
+            for batch in request_spec["closed_event_batches"] + request_spec["active_event_batches"]
+            for value in batch
+        )
+    )
+    orphan_ids = list(dict.fromkeys(str(value) for value in request_spec["orphan_market_ids"]))
+    event_placeholders = ",".join("?" for _ in event_ids)
+    event_receipts = conn.execute(
+        "SELECT id, receipt FROM _receipts WHERE kind='event' AND venue='polymarket' "
+        f"AND id IN ({event_placeholders})",
+        event_ids,
+    ).fetchall()
+    event_by_id = {str(key): value for key, value in event_receipts}
+    require(
+        len(event_by_id) == len(event_ids)
+        and all(value >= stamp for value in event_by_id.values()),
+        "fixed event units are missing committed receipts at the frozen clock",
+    )
+    memberships = conn.execute(
+        "SELECT event_id, receipt, latest_receipt FROM _membership "
+        f"WHERE venue='polymarket' AND event_id IN ({event_placeholders})",
+        event_ids,
+    ).fetchall()
+    membership_by_id = {str(row[0]): (row[1], row[2]) for row in memberships}
+    require(
+        all(
+            event_id in membership_by_id
+            and membership_by_id[event_id][0] >= stamp
+            and membership_by_id[event_id][1] >= stamp
+            for event_id in event_ids
+        ),
+        "fixed event memberships are not fully renewed at the frozen clock",
+    )
+    owned_markets = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT em.market_id FROM event_markets em JOIN "
+            "(SELECT unnest(?::VARCHAR[]) AS event_id) k USING(event_id) "
+            "WHERE em.venue='polymarket'",
+            [event_ids],
+        ).fetchall()
+    ]
+    expected_market_ids = list(dict.fromkeys(owned_markets + orphan_ids))
+    market_key_placeholders = ",".join("?" for _ in expected_market_ids)
+    market_receipts = conn.execute(
+        "SELECT id, receipt FROM _receipts WHERE kind='market' AND venue='polymarket' "
+        f"AND id IN ({market_key_placeholders})",
+        expected_market_ids,
+    ).fetchall()
+    market_by_id = {str(key): value for key, value in market_receipts}
+    require(
+        len(market_by_id) == len(expected_market_ids)
+        and all(value >= stamp for value in market_by_id.values()),
+        "fixed owned/orphan market units are missing committed receipts at the frozen clock",
+    )
+    return {
+        "event_ids": len(event_ids),
+        "event_memberships": len(memberships),
+        "owned_market_ids": len(owned_markets),
+        "orphan_market_ids": len(orphan_ids),
+        "market_ids_with_receipts": len(market_by_id),
+        "receipt_clock": stamp.isoformat(),
+    }
+
+
+def claim_resource_worker(source_root: Path, target_root: Path, output: Path) -> int:
+    """Build and exercise the private claim-index experiment on a fresh full-size copy."""
+    source_root, target_root, output = map(safe_path, (source_root, target_root, output))
+    # Validate every path before creating a report or entering the failure-persistence
+    # handler. A malformed output path must never be used to write into the read-only
+    # source tree, even when the diagnostic fails immediately.
+    validate_disjoint(source_root, target_root)
+    validate_disjoint(source_root, output)
+    validate_disjoint(target_root, output)
+    require(not target_root.exists(), "claim resource target must be fresh")
+    require(output.is_dir() and not is_symlink(output), "claim resource output must be regular")
+    validate_tree(source_root)
+    report_path = output / "claim-resource.json"
+    require(
+        not report_path.exists() and not is_symlink(report_path),
+        "claim resource report destination must be fresh",
+    )
+    report = {
+        "status": "in_progress",
+        "source_root": str(source_root),
+        "target_root": str(target_root),
+        "resource_envelope": None,
+        "qualification": False,
+        "memory_limit": "2GiB",
+        "threads": 2,
+    }
+    started = time.monotonic()
+    try:
+        from oddsfox_catalogue import current_claim_indexes, current_store
+        from oddsfox_catalogue.current_config import (
+            CurrentLimits,
+            connect_store,
+            load_current_settings,
+        )
+        from oddsfox_catalogue.runlock import run_lock
+
+        actual_package = Path(oddsfox_catalogue.__file__).resolve().parent
+        expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
+        require(actual_package == expected_package, "claim resource imported a different runtime")
+
+        source_settings = load_current_settings(source_root)
+        with run_lock(source_settings.run_lock_path):
+            source_hashes_before = _regular_tree_hashes(source_root)
+            copy_admission = _admit_catalogue_copy(source_root, target_root, source_settings.limits)
+            source_stat_before = (
+                source_settings.store_path.stat().st_size,
+                source_settings.store_path.stat().st_mtime_ns,
+            )
+            copy_root(source_root, target_root)
+            require(
+                source_hashes_before == _regular_tree_hashes(source_root),
+                "claim resource source changed during locked copy",
+            )
+            source_stat_after = (
+                source_settings.store_path.stat().st_size,
+                source_settings.store_path.stat().st_mtime_ns,
+            )
+        require(
+            source_stat_before == source_stat_after,
+            "claim resource source database changed during locked copy",
+        )
+        report.update(
+            status="copied",
+            source_hashes=source_hashes_before,
+            copy_admission=copy_admission,
+            source_database_identity={
+                "size": source_stat_before[0],
+                "mtime_ns": source_stat_before[1],
+            },
+            copy_wall_s=time.monotonic() - started,
+        )
+        _save(report_path, report)
+
+        settings = load_current_settings(target_root)
+        require(
+            settings.limits == CurrentLimits(), "claim resource settings differ from production"
+        )
+        post_close_storage = {}
+
+        def record_post_close_storage():
+            post_close_storage.update(_claim_storage_metrics(target_root, settings.temporary_dir))
+
+        with _claim_diagnostic_store(
+            settings, connect_store, run_lock, record_post_close_storage
+        ) as conn:
+            usage_before = current_claim_indexes.claim_usage(conn)
+            require(usage_before["rows"] > 0, "claim resource source contains no claims")
+            support = getattr(current_claim_indexes, "SUPPORTED_ENVELOPE", None)
+            candidate_supported_envelope = (
+                None
+                if support is None
+                else {
+                    "max_rows": support.max_rows,
+                    "max_identifier_bytes": support.max_identifier_bytes,
+                    "max_distinct_asset_ids": support.max_distinct_asset_ids,
+                }
+            )
+            sampled_keys = conn.execute(
+                "SELECT DISTINCT venue, asset_kind, asset_id FROM _identity_claims "
+                "ORDER BY asset_id LIMIT 100"
+            ).fetchall()
+            sampled_asset_ids = list(dict.fromkeys(str(row[2]) for row in sampled_keys))
+            require(sampled_asset_ids, "claim index query plan has no sampled asset IDs")
+            plan_before = _claim_lookup_query_plan(conn, "asset_id", sampled_asset_ids)
+            executed_plan_before = _claim_lookup_explain_analyze(
+                conn, "asset_id", sampled_asset_ids
+            )
+            sampled_markets = conn.execute(
+                "SELECT DISTINCT venue, market_id FROM _identity_claims "
+                "ORDER BY market_id LIMIT 100"
+            ).fetchall()
+            sampled_market_ids = list(dict.fromkeys(str(row[1]) for row in sampled_markets))
+            market_plan_before = _claim_lookup_query_plan(conn, "market_id", sampled_market_ids)
+            market_executed_plan_before = _claim_lookup_explain_analyze(
+                conn, "market_id", sampled_market_ids
+            )
+            query_samples = []
+            for _ in range(3):
+                query_started = time.monotonic()
+                rows = current_store._select_claims_by_assets(conn, sampled_keys)
+                query_samples.append(time.monotonic() - query_started)
+                require(rows, "selective asset claim query returned no rows")
+
+            storage_before = _claim_storage_metrics(target_root, settings.temporary_dir)
+            report.update(
+                status="measuring",
+                usage_before=usage_before,
+                candidate_supported_envelope=candidate_supported_envelope,
+                index_plan_before=plan_before,
+                index_executed_plan_before=executed_plan_before,
+                market_index_plan_before=market_plan_before,
+                market_index_executed_plan_before=market_executed_plan_before,
+                storage_before=storage_before,
+            )
+            _save(report_path, report)
+            build_started = time.monotonic()
+            build_result = current_claim_indexes.build_index_experiment(conn)
+            build_seconds = time.monotonic() - build_started
+            plan_after = _claim_lookup_query_plan(conn, "asset_id", sampled_asset_ids)
+            executed_plan_after = _claim_lookup_explain_analyze(conn, "asset_id", sampled_asset_ids)
+            market_plan_after = _claim_lookup_query_plan(conn, "market_id", sampled_market_ids)
+            market_executed_plan_after = _claim_lookup_explain_analyze(
+                conn, "market_id", sampled_market_ids
+            )
+            index_used = any(
+                marker in "\n".join(executed_plan_after).upper()
+                for marker in ("ART_INDEX_SCAN", "INDEX SCAN")
+            )
+            report.update(
+                index_build=build_result,
+                index_build_seconds=build_seconds,
+                index_plan_after=plan_after,
+                index_executed_plan_after=executed_plan_after,
+                market_index_plan_after=market_plan_after,
+                market_index_executed_plan_after=market_executed_plan_after,
+                index_used=index_used,
+            )
+            _save(report_path, report)
+            query_after_samples = []
+            for _ in range(3):
+                query_started = time.monotonic()
+                rows_after = current_store._select_claims_by_assets(conn, sampled_keys)
+                query_after_samples.append(time.monotonic() - query_started)
+                require(
+                    _claim_multiset(rows_after) == _claim_multiset(rows),
+                    "indexed claim lookup changed result contents",
+                )
+
+            selected = conn.execute(
+                "SELECT venue,market_id FROM _identity_claims ORDER BY venue,market_id LIMIT 1"
+            ).fetchone()
+            require(selected is not None, "claim resource source has no row for bounded writes")
+            market_venue, market_id = str(selected[0]), str(selected[1])
+            write_rows = conn.execute(
+                "SELECT venue,market_id,role,asset_kind,asset_id FROM _identity_claims "
+                "WHERE venue=? AND market_id=?",
+                [market_venue, market_id],
+            ).fetchall()
+            require(write_rows, "selected market has no complete claim multiset")
+            asset_id = write_rows[0][4]
+            asset_rows = conn.execute(
+                "SELECT venue,market_id,role,asset_kind,asset_id FROM _identity_claims "
+                "WHERE asset_id=?",
+                [asset_id],
+            ).fetchall()
+            write_results = {}
+            write_started = time.monotonic()
+            replaced_rows = _replace_market_claims_diagnostic(conn, market_venue, market_id)
+            write_results["replacement_seconds"] = time.monotonic() - write_started
+            require(
+                _claim_multiset(replaced_rows) == _claim_multiset(write_rows),
+                "market replacement changed a duplicate or role claim",
+            )
+
+            conflict_suffix = 0
+            conflict_market = f"v6-diagnostic-conflict-{conflict_suffix}"
+            while conn.execute(
+                "SELECT 1 FROM _identity_claims WHERE venue=? AND market_id=? LIMIT 1",
+                [market_venue, conflict_market],
+            ).fetchone():
+                conflict_suffix += 1
+                conflict_market = f"v6-diagnostic-conflict-{conflict_suffix}"
+            conflict = (market_venue, conflict_market, "candidate", write_rows[0][3], asset_id)
+            write_started = time.monotonic()
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", conflict)
+                conn.execute(
+                    "DELETE FROM _identity_claims WHERE venue=? AND market_id=?",
+                    [market_venue, conflict_market],
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    conn.execute("ROLLBACK")
+                raise
+            write_results["conflicting_owner_insert_delete_seconds"] = (
+                time.monotonic() - write_started
+            )
+
+            write_started = time.monotonic()
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute("DELETE FROM _identity_claims WHERE asset_id=?", [asset_id])
+                conn.executemany("INSERT INTO _identity_claims VALUES (?, ?, ?, ?, ?)", asset_rows)
+                conn.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    conn.execute("ROLLBACK")
+                raise
+            write_results["asset_delete_restore_seconds"] = time.monotonic() - write_started
+            require(
+                _claim_multiset(
+                    conn.execute(
+                        "SELECT venue,market_id,role,asset_kind,asset_id FROM _identity_claims WHERE asset_id=?",
+                        [asset_id],
+                    ).fetchall()
+                )
+                == _claim_multiset(asset_rows),
+                "asset deletion workload failed to restore exact rows",
+            )
+            require(
+                current_claim_indexes.claim_usage(conn) == usage_before,
+                "claim write diagnostics changed the claim multiset totals",
+            )
+
+            checkpoint_started = time.monotonic()
+            conn.execute("CHECKPOINT")
+            checkpoint_seconds = time.monotonic() - checkpoint_started
+            storage_before_close = _claim_storage_metrics(target_root, settings.temporary_dir)
+            usage_after = current_claim_indexes.claim_usage(conn)
+            report.update(
+                bounded_write_seconds=write_results,
+                checkpoint_seconds=checkpoint_seconds,
+                storage_before_close=storage_before_close,
+                usage_after=usage_after,
+            )
+            _save(report_path, report)
+
+        storage_after_close = post_close_storage
+        report.update(
+            status="measured",
+            usage_before=usage_before,
+            usage_after=usage_after,
+            index_build=build_result,
+            index_build_seconds=build_seconds,
+            index_query_plan_before=plan_before,
+            index_query_plan_after=plan_after,
+            index_executed_plan_before=executed_plan_before,
+            index_executed_plan_after=executed_plan_after,
+            market_index_query_plan_before=market_plan_before,
+            market_index_query_plan_after=market_plan_after,
+            market_index_executed_plan_before=market_executed_plan_before,
+            market_index_executed_plan_after=market_executed_plan_after,
+            index_used=index_used,
+            candidate_supported_envelope=candidate_supported_envelope,
+            lookup_seconds_before=query_samples,
+            lookup_seconds_after=query_after_samples,
+            bounded_write_seconds=write_results,
+            checkpoint_seconds=checkpoint_seconds,
+            storage_before=storage_before,
+            storage_before_close=storage_before_close,
+            storage_after_close=storage_after_close,
+            peak_rss_bytes=process_peak_rss_bytes(),
+            peak_rss_scope="whole resource worker lifetime; not an isolated index-build peak",
+            resource_envelope=None,
+            supported_envelope_established=False,
+            reason="one source-scale diagnostic does not establish a safe production envelope",
+            wall_s=time.monotonic() - started,
+            runtime_source=str(actual_package),
+        )
+        _save(report_path, report)
+        print(json.dumps(report, default=str))
+        return 0
+    except BaseException as exc:
+        report.update(
+            status="failed" if isinstance(exc, Exception) else "interrupted",
+            message=f"{type(exc).__name__}: {exc}",
+            wall_s=time.monotonic() - started,
+            peak_rss_bytes=process_peak_rss_bytes(),
+            peak_rss_scope="whole resource worker lifetime; not an isolated index-build peak",
+            resource_envelope=None,
+            supported_envelope_established=False,
+        )
+        with contextlib.suppress(Exception):
+            _save(report_path, report)
+        if not isinstance(exc, Exception):
+            raise
+        print(json.dumps(report, default=str))
+        return 3
+
+
+def fixed_catalogue_worker(
+    source_root: Path,
+    root: Path,
+    output: Path,
+    label: str,
+    requests_path: Path,
+    *,
+    attribution: bool = False,
+) -> int:
+    """Apply the same frozen full-size units to an isolated source copy."""
+    from oddsfox_catalogue import current_reconcile, current_runtime, current_sync
+    from oddsfox_catalogue.current_config import CurrentLimits, connect_store, load_current_settings
+    from oddsfox_catalogue.runlock import run_lock
+
+    started = time.monotonic()
+    source_root, root, output, requests_path = map(
+        safe_path, (source_root, root, output, requests_path)
+    )
+    validate_disjoint(source_root, root)
+    validate_disjoint(source_root, output)
+    validate_disjoint(source_root, requests_path)
+    validate_disjoint(root, output)
+    validate_disjoint(root, requests_path)
+    validate_disjoint(output, requests_path)
+    require(not root.exists(), "fixed-work target must be fresh")
+    require(
+        output.is_dir() and not is_symlink(output), "fixed-work output must be a regular directory"
+    )
+    validate_tree(source_root)
+    actual_package = Path(oddsfox_catalogue.__file__).resolve().parent
+    expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
+    require(actual_package == expected_package, "fixed-work worker imported a different runtime")
+    source_settings_for_copy = load_current_settings(source_root)
+    with run_lock(source_settings_for_copy.run_lock_path):
+        source_copy_hashes = _regular_tree_hashes(source_root)
+        copy_admission = _admit_catalogue_copy(source_root, root, source_settings_for_copy.limits)
+        require(
+            source_copy_hashes == _regular_tree_hashes(source_root),
+            "fixed-work source changed before its locked copy",
+        )
+        copy_root(source_root, root)
+        require(
+            source_copy_hashes == _regular_tree_hashes(source_root),
+            "fixed-work source changed during its locked copy",
+        )
+    request_data = json.loads(requests_path.read_text())
+    request_spec = request_data["requests"]
+    clock = {"now": datetime.fromisoformat(request_data["domain_clock"])}
+    original_gamma, original_now = current_runtime.GammaClient, current_reconcile._now
+    original_datetime = current_runtime.datetime
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"].astimezone(tz or UTC)
+
+    current_reconcile._now = lambda: clock["now"]
+    current_runtime.datetime = FrozenDateTime
+    response_clock = {"calls": 0}
+
+    def gamma_factory(*args, **kwargs):
+        def next_receipt_time():
+            response_clock["calls"] += 1
+            return clock["now"] + timedelta(microseconds=response_clock["calls"])
+
+        kwargs["now"] = next_receipt_time
+        return original_gamma(*args, **kwargs)
+
+    original_sync_fetch_apply = current_sync.fetch_apply
+    original_reconcile_fetch_apply = current_reconcile.fetch_apply
+    native_repair_requests = []
+    settled_request_order = []
+    capture_units = []
+    generated_responses = {}
+    indexed_claim_module = None
+
+    original_write_response = current_sync._write_response
+    attribution_metrics = new_attribution_metrics()
+    helper_metrics = {}
+    original_connect_store = connect_store
+    instrumented_helpers = {}
+    require(
+        not attribution or label.startswith("warm-"),
+        "fixed-work SQL attribution is warm-up-only; label must start with 'warm-'",
+    )
+
+    if attribution:
+
+        def attributed_connect_store(*args, **kwargs):
+            return AttributedConnection(
+                original_connect_store(*args, **kwargs), attribution_metrics
+            )
+
+        connect_store = attributed_connect_store
+        for function_name in (
+            "apply",
+            "_select_in",
+            "_write_values",
+            "_write_receipts",
+            "_write_columnar",
+            "_select_claims_by_assets",
+            "_select_claims_by_markets",
+        ):
+            original = getattr(current_sync.current_store, function_name, None)
+            if original is None:
+                continue
+            instrumented_helpers[function_name] = original
+            helper_metrics[function_name] = {"calls": 0, "wall_s": 0.0}
+
+            def measured_helper(*args, _name=function_name, _original=original, **kwargs):
+                helper_metrics[_name]["calls"] += 1
+                helper_started = time.perf_counter()
+                try:
+                    return _original(*args, **kwargs)
+                finally:
+                    helper_metrics[_name]["wall_s"] += time.perf_counter() - helper_started
+
+            setattr(current_sync.current_store, function_name, measured_helper)
+
+    def traced_write_response(given_settings, raw_dir, response, request):
+        result = original_write_response(given_settings, raw_dir, response, request)
+        response_id = raw_dir.name
+        if response_id not in generated_responses:
+            unit_ref = f"capture-unit:{len(capture_units) + 1:06d}"
+            generated_responses[response_id] = unit_ref
+            capture_units.append(
+                {
+                    "unit_ref": unit_ref,
+                    "request": copy.deepcopy(request),
+                    "status": response.status,
+                }
+            )
+        elif (
+            capture_units[int(generated_responses[response_id].rsplit(":", 1)[1]) - 1]["request"]
+            != request
+        ):
+            raise ValueError("one capture reference was reused for a different request")
+        return result
+
+    def traced_fetch_apply(*args, **kwargs):
+        result = original_sync_fetch_apply(*args, **kwargs)
+        if kwargs.get("native"):
+            request = {
+                "lane": str(args[3]),
+                "ids": [str(key) for key in args[4]],
+                "native": True,
+                "response_received": bool(result.get("responses")),
+            }
+            native_repair_requests.append(request)
+            settled_request_order.append(request)
+        return result
+
+    current_sync.fetch_apply = traced_fetch_apply
+    current_reconcile.fetch_apply = traced_fetch_apply
+    current_sync._write_response = traced_write_response
+    audit = output / f"fixed-source-{label}.jsonl"
+    try:
+        with CapacitySource(source_root, audit, delay_s=0, source_root=source_root) as source:
+            settings = load_current_settings(
+                root, env=child_environment(source.url, expected_package)
+            )
+            require(
+                settings.limits == CurrentLimits(),
+                "fixed-workload settings changed production limits",
+            )
+            if (actual_package / "current_claim_indexes.py").is_file():
+                from oddsfox_catalogue import current_claim_indexes
+
+                validator = getattr(current_claim_indexes, "validate_owned_index", None)
+                require(callable(validator), "indexed candidate has no owned-index validator")
+                require(
+                    current_claim_indexes.SUPPORTED_ENVELOPE is not None,
+                    "indexed candidate has no measured supported resource envelope",
+                )
+                with run_lock(settings.run_lock_path), connect_store(settings) as index_conn:
+                    require(
+                        validator(index_conn) is True,
+                        "indexed candidate requires an explicitly installed, valid claim index",
+                    )
+                indexed_claim_module = current_claim_indexes
+            controls = source.controls
+            probe_ids = {
+                f"{kind[:-1]}_ids": {
+                    status: [controls[f"{status}_{kind[:-1]}_id"]]
+                    for status in ("open", "closed", "absent")
+                }
+                for kind in ("events", "markets")
+            }
+            operation_deadline = time.monotonic() + settings.limits.max_duration_s
+            with run_lock(settings.run_lock_path):
+                probe = current_runtime.execute(
+                    settings,
+                    "probe",
+                    probe_ids,
+                    operation_deadline,
+                )
+            require(
+                all(lane.get("supported") is True for lane in probe.get("lanes", {}).values()),
+                "full-size source probe did not certify both acquisition lanes",
+            )
+            runtime_started = time.monotonic()
+            setup_wall = runtime_started - started
+            operation_results = []
+            acquisition_started = runtime_started
+            index_ledger_refresh_s = 0.0
+            attribution_wall_started = time.perf_counter() if attribution else None
+            attribution_cpu_started = time.process_time() if attribution else None
+            with (
+                run_lock(settings.run_lock_path),
+                connect_store(settings) as conn,
+                gamma_factory(
+                    settings.gamma,
+                    max_body_bytes=settings.limits.max_response_bytes,
+                    max_requests=settings.limits.max_requests,
+                    max_download_bytes=settings.limits.max_download_bytes,
+                    max_duration_s=settings.limits.max_duration_s,
+                    deadline=operation_deadline,
+                ) as client,
+            ):
+                if indexed_claim_module is not None:
+                    ledger_started = time.monotonic()
+                    indexed_claim_module.refresh_writer_ledger(
+                        conn, indexed_claim_module.SUPPORTED_ENVELOPE
+                    )
+                    index_ledger_refresh_s = time.monotonic() - ledger_started
+                groups = [
+                    ("events", request_spec["closed_event_batches"]),
+                    ("events", request_spec["active_event_batches"]),
+                    ("markets", [request_spec["orphan_market_ids"]]),
+                ]
+                unit_number = 0
+                from oddsfox_catalogue.current_config import publication_reserve
+
+                acquisition_cutoff = operation_deadline - publication_reserve(settings, conn)
+                for lane, lane_batches in groups:
+                    for batch in lane_batches:
+                        if time.monotonic() >= acquisition_cutoff:
+                            raise TimeoutError("fixed workload reached its publication reserve")
+                        unit_number += 1
+                        result, omitted = current_sync.fetch_unit(
+                            settings,
+                            conn,
+                            client,
+                            lane,
+                            batch,
+                            progress={"v6_fixed_work_progress": {"unit": unit_number}},
+                        )
+                        operation_results.append(
+                            {
+                                "lane": lane,
+                                "ids": batch,
+                                "omitted": omitted,
+                                "responses": result.get("responses", 0),
+                            }
+                        )
+                        settled_request_order.append(
+                            {
+                                "lane": lane,
+                                "ids": [str(key) for key in batch],
+                                "omitted": [str(key) for key in omitted],
+                                "native": False,
+                            }
+                        )
+                        if omitted:
+                            current_reconcile._confirm_omitted(
+                                settings, conn, client, lane, omitted
+                            )
+                        current_reconcile.repair_identities(
+                            settings,
+                            conn,
+                            client,
+                            lane,
+                            batch,
+                            clock["now"],
+                            acquisition_cutoff,
+                            response_counter=None,
+                        )
+                        repair_count_now = conn.execute(
+                            "SELECT count(*) FROM _parent_repairs"
+                        ).fetchone()[0]
+                        if repair_count_now:
+                            # A later operation can add a nomination; these are part of the
+                            # same bounded fixed work and are drained below before commit.
+                            pass
+                repair_deadline = operation_deadline
+                for _ in range(1000):
+                    if time.monotonic() >= acquisition_cutoff:
+                        raise TimeoutError("fixed workload reached its publication reserve")
+                    repaired = current_reconcile.repair_pending(
+                        settings, conn, client, deadline=repair_deadline
+                    )
+                    if not repaired.get("responses"):
+                        break
+                else:
+                    raise RuntimeError("fixed workload did not drain parent repair work")
+                acquisition_wall = time.monotonic() - acquisition_started
+                attribution_runtime_wall_s = (
+                    time.perf_counter() - attribution_wall_started if attribution else None
+                )
+                attribution_process_cpu_s = (
+                    time.process_time() - attribution_cpu_started if attribution else None
+                )
+                coverage_validation_started = time.monotonic()
+                fixed_receipt_coverage = _verify_fixed_work_receipts(
+                    conn, request_spec, clock["now"]
+                )
+                coverage_validation_wall_s = time.monotonic() - coverage_validation_started
+                publication_started = time.monotonic()
+                publication, _publish_time = _publish(
+                    settings, conn, repair_deadline, recalibrate=True
+                )
+                publication_wall = time.monotonic() - publication_started
+                require(
+                    publication.get("noop") is False and publication.get("valid") is True,
+                    "fixed workload did not create a fresh verified publication",
+                )
+                verification_started = time.monotonic()
+                verification = verify_current(settings, connection=conn)
+                verification_wall = time.monotonic() - verification_started
+                require(
+                    verification.get("valid") is True,
+                    "fixed workload publication verification failed",
+                )
+                classification_signature = _fixed_classification_signature(conn)
+                client_stats = client.stats.as_dict()
+                repair_count = len(native_repair_requests)
+                provider_stats = copy.deepcopy(source.stats)
+                source_failure = source.failure
+            runtime_wall = time.monotonic() - runtime_started
+            require(source_failure is None, "frozen catalogue provider failed")
+            require(
+                provider_stats["http_attempts"]
+                >= client_stats["requests"] + probe.get("http_attempts", 0),
+                "provider observed fewer requests than the runtime clients",
+            )
+            require(
+                provider_stats["downloaded_bytes"]
+                >= client_stats["downloaded_bytes"] + probe.get("downloaded_bytes", 0),
+                "provider observed fewer bytes than the runtime clients",
+            )
+        native_profile_started = time.monotonic() if attribution else None
+        native_profile_diagnostics = (
+            _warmup_native_profiles(
+                root,
+                output,
+                label,
+                attribution_metrics["captured_statements"],
+                settings,
+            )
+            if attribution
+            else None
+        )
+        native_profile_wall_s = time.monotonic() - native_profile_started if attribution else None
+        worker_peak_before_oracle_bytes = process_peak_rss_bytes()
+        oracle_started = time.monotonic()
+        oracle = stream_catalogue_oracle(root, settings, generated_responses=generated_responses)
+        oracle_wall = time.monotonic() - oracle_started
+        publication_view = _v6_normalized_publication(publication)
+        semantic_value = {
+            "oracle": oracle,
+            "settled_requests": settled_request_order,
+            "capture_units": capture_units,
+            "publication": publication_view,
+        }
+        semantic_hash = hashlib.sha256(
+            json.dumps(
+                semantic_value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            ).encode()
+        ).hexdigest()
+        print(
+            json.dumps(
+                {
+                    "status": "measured",
+                    "workload": "fixed_catalogue_application",
+                    "workload_label": "fixed application characterization, not a canonical full scheduler pass",
+                    "measurement_version": MEASUREMENT_VERSION,
+                    "acquire_apply_s": acquisition_wall,
+                    "index_ledger_refresh_s": index_ledger_refresh_s,
+                    "coverage_validation_s": coverage_validation_wall_s,
+                    "runtime_sequence_wall_s": runtime_wall,
+                    "publication_s": publication_wall,
+                    "verification_s": verification_wall,
+                    "publish_verify_s": publication_wall + verification_wall,
+                    "worker_setup_wall_s": setup_wall,
+                    "oracle_wall_s": oracle_wall,
+                    "wall_s": time.monotonic() - started,
+                    "peak_rss_bytes": max(
+                        worker_peak_before_oracle_bytes, process_peak_rss_bytes()
+                    ),
+                    "worker_peak_before_oracle_bytes": worker_peak_before_oracle_bytes,
+                    "http_attempts": provider_stats["http_attempts"],
+                    "downloaded_bytes": provider_stats["downloaded_bytes"],
+                    "runtime_reserved_attempts": client_stats["requests"]
+                    + probe.get("http_attempts", 0),
+                    "runtime_downloaded_bytes": client_stats["downloaded_bytes"]
+                    + probe.get("downloaded_bytes", 0),
+                    "settled_requests": settled_request_order,
+                    "native_repair_requests": len(native_repair_requests),
+                    "native_repair_responses": sum(
+                        1 for item in native_repair_requests if item.get("response_received")
+                    ),
+                    "fixed_receipt_coverage": True,
+                    "capture_units": capture_units,
+                    "settled_units": len(operation_results),
+                    "completed_work": {
+                        "closed_batches_requested": len(request_spec["closed_event_batches"]),
+                        "active_batches_requested": len(request_spec["active_event_batches"]),
+                        "event_ids_requested": sum(
+                            len(batch)
+                            for batch in request_spec["closed_event_batches"]
+                            + request_spec["active_event_batches"]
+                        ),
+                        "orphan_market_ids_requested": len(request_spec["orphan_market_ids"]),
+                        "omission_ids_confirmed": sum(
+                            len(item["omitted"]) for item in operation_results
+                        ),
+                        "native_repair_requests": len(native_repair_requests),
+                        "native_repair_responses": sum(
+                            1 for item in native_repair_requests if item.get("response_received")
+                        ),
+                    },
+                    "scheduler_cursor_progression": "not_applicable_fixed_work_units",
+                    "cleanup_warnings": publication_cleanup_warnings(publication, 0),
+                    "cleanup_deferred": bool(publication_cleanup_warnings(publication, 0)),
+                    "semantic_hash": semantic_hash,
+                    "publication_verified": True,
+                    "publication_noop": bool(publication.get("noop")),
+                    "publication": publication_view,
+                    "counts": request_spec["counts"],
+                    "classification_signature": classification_signature,
+                    "fixed_receipt_coverage_details": fixed_receipt_coverage,
+                    "deterministic_response_clock_calls": response_clock["calls"],
+                    "source_stats": source.stats,
+                    "parent_repairs_settled": repair_count,
+                    "source_failure": source_failure,
+                    "source_hashes": source_copy_hashes,
+                    "copy_admission": copy_admission,
+                    "settings": {"limits": asdict(settings.limits)},
+                    "runtime_source": str(actual_package),
+                    "attribution_diagnostics": (
+                        {
+                            "mode": "warmup_only_direct_unprofiled",
+                            "application_wall_s": attribution_runtime_wall_s,
+                            "application_wall_includes_nested_helpers": True,
+                            "process_cpu_s_includes_all_worker_threads": attribution_process_cpu_s,
+                            "sql_execute_wall_s": attribution_metrics["sql_execute_wall_s"],
+                            "result_materialization_wall_s": attribution_metrics[
+                                "result_materialization_wall_s"
+                            ],
+                            "statement_count": attribution_metrics["statement_count"],
+                            "fetchone_count": attribution_metrics["fetchone_count"],
+                            "fetchall_count": attribution_metrics["fetchall_count"],
+                            "fetchmany_count": attribution_metrics["fetchmany_count"],
+                            "parameter_scalar_count": attribution_metrics["parameter_scalar_count"],
+                            "parameter_list_element_count": attribution_metrics[
+                                "parameter_list_element_count"
+                            ],
+                            "helper_metrics": helper_metrics,
+                            "captured_statement_categories": sorted(
+                                attribution_metrics["captured_statements"]
+                            ),
+                            "native_profiles": native_profile_diagnostics,
+                            "native_profile_wall_s_excluded_from_runtime": native_profile_wall_s,
+                            "nested_timings_overlap": True,
+                        }
+                        if attribution
+                        else None
+                    ),
+                },
+                default=str,
+            )
+        )
+        return 0
+    except Exception as exc:
+        print(json.dumps({"status": "blocked", "message": f"{type(exc).__name__}: {exc}"}))
+        return 3
+    finally:
+        current_runtime.GammaClient = original_gamma
+        current_runtime.datetime = original_datetime
+        current_reconcile._now = original_now
+        current_sync.fetch_apply = original_sync_fetch_apply
+        current_reconcile.fetch_apply = original_reconcile_fetch_apply
+        current_sync._write_response = original_write_response
+        connect_store = original_connect_store
+        for function_name, original in instrumented_helpers.items():
+            setattr(current_sync.current_store, function_name, original)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--profile", choices=PROFILES, required=True)
@@ -3793,6 +5215,31 @@ def parser():
         "--_sample", nargs=4, metavar=("SEED", "ROOT", "LABEL", "STOP"), help=argparse.SUPPRESS
     )
     p.add_argument("--_prepare", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--_snapshot_catalogue",
+        nargs=3,
+        metavar=("SOURCE", "TARGET", "REQUESTS"),
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--_prepare_v6_snapshot",
+        nargs=2,
+        metavar=("SNAPSHOT", "REQUESTS"),
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--_hash_catalogue", type=Path, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--_fixed_catalogue_sample",
+        nargs=4,
+        metavar=("SOURCE", "ROOT", "LABEL", "REQUESTS"),
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--_claim_resource",
+        nargs=2,
+        metavar=("SOURCE_ROOT", "TARGET_ROOT"),
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--_prepare_api_seed", choices=API_WORKLOADS, help=argparse.SUPPRESS)
     p.add_argument("--_claim_diagnostics", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--_claim_diagnostics_v4", action="store_true", help=argparse.SUPPRESS)
@@ -3818,6 +5265,42 @@ def _save(path: Path, report: dict):
 
 
 def run(args) -> int:
+    if args._prepare_v6_snapshot:
+        try:
+            source, requests = map(Path, args._prepare_v6_snapshot)
+            print(json.dumps(prepare_v6_snapshot(source, requests), default=str))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"status": "blocked", "message": f"{type(exc).__name__}: {exc}"}))
+            return 3
+    if args._hash_catalogue:
+        try:
+            print(json.dumps(locked_catalogue_hash(args._hash_catalogue), default=str))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"status": "blocked", "message": f"{type(exc).__name__}: {exc}"}))
+            return 3
+    if args._snapshot_catalogue:
+        try:
+            source, target, requests_path = map(Path, args._snapshot_catalogue)
+            print(json.dumps(snapshot_catalogue(source, target, requests_path), default=str))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"status": "blocked", "message": f"{type(exc).__name__}: {exc}"}))
+            return 3
+    if args._fixed_catalogue_sample:
+        source, root, label, requests_path = args._fixed_catalogue_sample
+        return fixed_catalogue_worker(
+            Path(source),
+            Path(root),
+            Path(args.output),
+            label,
+            Path(requests_path),
+            attribution=args._attribution,
+        )
+    if args._claim_resource:
+        source_root, target_root = args._claim_resource
+        return claim_resource_worker(Path(source_root), Path(target_root), Path(args.output))
     if args._scheduler_diagnostics:
         seed, root = args._scheduler_diagnostics
         root = Path(root)

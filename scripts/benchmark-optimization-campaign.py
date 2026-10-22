@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Compare frozen catalogue runtime variants using one synthetic full-pass budget.
+"""Compare frozen catalogue runtime variants using one shared offline budget.
 
 Version 1 manifests retain the binding-first workflow. Version 2 compares the
 outcome-grouping and queue candidates independently against one common baseline.
 Version 3 evaluates claim, queue and certified-acquisition candidates against a
 common baseline with workload-specific evidence. Version 4 evaluates two
 independent store candidates and an explicitly supplied combined runtime.
+Version 5 evaluates receipt factoring, state reads and typed lookup keys.
+Version 6 adds full-size application work, index diagnostics and a synthetic guard.
 """
 
 from __future__ import annotations
@@ -14,11 +16,13 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -33,6 +37,7 @@ CAMPAIGN_BUDGET_S = 1800.0
 V3_CAMPAIGN_BUDGET_S = 10800.0
 V4_CAMPAIGN_BUDGET_S = 10800.0
 V5_CAMPAIGN_BUDGET_S = 10800.0
+V6_CAMPAIGN_BUDGET_S = 10800.0
 VARIANTS = {
     "outcome_grouping": "current_store.py",
     "queue": "current_reconcile.py",
@@ -68,6 +73,26 @@ V4_CANDIDATES = ("outcome_grouping", "claim_reverse_lookup")
 V4_OWNERSHIP = {name: "current_store.py" for name in (*V4_CANDIDATES, "combined")}
 V5_CANDIDATES = ("receipt_factoring", "read_consolidation", "typed_keys")
 V5_OWNERSHIP = {name: "current_store.py" for name in (*V5_CANDIDATES, "combinations")}
+V6_CANDIDATES = ("claim_asset_index", "staged_state_keys", "columnar_renewals")
+V6_OWNERSHIP = {
+    "claim_asset_index": {
+        "current_store.py",
+        "current_config.py",
+        "current_runtime.py",
+        "cli.py",
+        "current_claim_indexes.py",
+    },
+    "staged_state_keys": {"current_store.py"},
+    "columnar_renewals": {"current_store.py"},
+    "combinations": {
+        "current_store.py",
+        "current_config.py",
+        "current_runtime.py",
+        "cli.py",
+        "current_claim_indexes.py",
+    },
+}
+V6_INDEX_OWNERSHIP = V6_OWNERSHIP["claim_asset_index"]
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -95,8 +120,42 @@ def _load_manifest(path: Path) -> dict:
         if not {"baseline", "binding"}.issubset(data) or not set(data).issubset(MANIFEST_KEYS):
             raise ValueError("legacy manifest requires baseline and binding package entries")
         return {**data, "_version": 1}
-    if type(data.get("version")) is not int or data["version"] not in {2, 3, 4, 5}:
-        raise ValueError("manifest version must be integer 2, 3, 4 or 5")
+    if type(data.get("version")) is not int or data["version"] not in {2, 3, 4, 5, 6}:
+        raise ValueError("manifest version must be integer 2, 3, 4, 5 or 6")
+    if data["version"] == 6:
+        required = {"version", "baseline", "candidates", "combinations", "catalogue_source"}
+        if set(data) != required:
+            raise ValueError(
+                "version 6 manifest requires only version, baseline, candidates, combinations and catalogue_source"
+            )
+        candidates = data["candidates"]
+        if not isinstance(candidates, dict) or set(candidates) != set(V6_CANDIDATES):
+            raise ValueError(
+                "version 6 manifest requires claim_asset_index, staged_state_keys and columnar_renewals"
+            )
+        combinations = data["combinations"]
+        if not isinstance(combinations, dict):
+            raise ValueError("version 6 combinations must be an object")
+        required_all = "+".join(sorted(V6_CANDIDATES))
+        if required_all not in combinations:
+            raise ValueError(f"version 6 requires the explicit {required_all} combination")
+        normalized = {
+            "_version": 6,
+            "baseline": data["baseline"],
+            **candidates,
+            "_catalogue_source": data["catalogue_source"],
+        }
+        for feature_key, entry in combinations.items():
+            features = feature_key.split("+") if isinstance(feature_key, str) else []
+            if (
+                len(features) < 2
+                or features != sorted(set(features))
+                or not set(features).issubset(V6_CANDIDATES)
+                or feature_key != "+".join(features)
+            ):
+                raise ValueError("combination keys must be sorted feature names joined by '+'")
+            normalized[f"_combination:{feature_key}"] = entry
+        return normalized
     if data["version"] == 5:
         if set(data) - {"version", "baseline", "candidates", "combinations"} or not {
             "version",
@@ -269,7 +328,7 @@ def _preflight_paths(manifest, manifest_path: Path, output: Path) -> dict:
     paths = {
         name: _entry_path(entry, manifest_path)
         for name, entry in manifest.items()
-        if name not in {"_version", "_claims_mode"}
+        if name not in {"_version", "_claims_mode", "_catalogue_source"}
     }
     package_paths = [package for package, _expected in paths.values()]
     for package in package_paths:
@@ -279,6 +338,162 @@ def _preflight_paths(manifest, manifest_path: Path, output: Path) -> dict:
             if package != other and (package in other.parents or other in package.parents):
                 raise ValueError("manifest runtime package paths must not overlap")
     return paths
+
+
+def _validate_v6_source_entry(
+    entry, manifest_path: Path, output: Path | None = None, budget=None
+) -> tuple[Path, dict[str, str]]:
+    """Validate the explicit, read-only full-catalogue source inventory."""
+    if not isinstance(entry, dict) or set(entry) != {"path", "source_hashes"}:
+        raise ValueError("catalogue_source must contain only path and source_hashes")
+    raw_path, expected = entry["path"], entry["source_hashes"]
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("catalogue source path must be a nonempty string")
+    source = Path(raw_path)
+    if not source.is_absolute():
+        source = manifest_path.parent / source
+    source = bench.safe_path(source)
+    if output is not None:
+        bench.validate_disjoint(output, source)
+    if not source.is_dir() or bench.is_symlink(source):
+        raise ValueError("catalogue source must be a regular directory")
+    if not (source / "catalogue.duckdb").is_file() or bench.is_symlink(source / "catalogue.duckdb"):
+        raise ValueError("catalogue source must contain a regular catalogue.duckdb")
+    if not isinstance(expected, dict) or not expected:
+        raise ValueError("catalogue source_hashes must inventory every source file")
+    for name, digest in expected.items():
+        pure = PurePosixPath(name) if isinstance(name, str) else None
+        if (
+            pure is None
+            or "\\" in name
+            or pure.is_absolute()
+            or any(part in {"", ".", ".."} for part in name.split("/"))
+            or ":" in name
+            or not isinstance(digest, str)
+            or not HEX_SHA256.fullmatch(digest)
+        ):
+            raise ValueError("catalogue source hash inventory is malformed")
+    if len({name.casefold() for name in expected}) != len(expected):
+        raise ValueError("catalogue source inventory has case-colliding paths")
+    actual = _hash_catalogue_source(source, budget)
+    if actual != expected:
+        raise ValueError("catalogue source hash inventory does not match source contents")
+    return source, actual
+
+
+def _hash_catalogue_source(source: Path, budget=None) -> dict[str, str]:
+    source = bench.safe_path(source)
+    result = {}
+    for path in sorted(source.rglob("*")):
+        if budget:
+            budget.admit(0.001)
+        if bench.is_symlink(path):
+            raise ValueError("catalogue source contains a symlink")
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError("catalogue source contains a special file")
+        relative = path.relative_to(source).as_posix()
+        # The writer-lock PID is a mutable control artifact, not catalogue data.
+        # Match the worker inventory exactly while still rejecting a symlink or
+        # special file at this reserved root path above.
+        if relative == ".catalogue.lock":
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                if budget:
+                    budget.admit(0.001)
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        result[relative] = digest.hexdigest()
+    return result
+
+
+def _freeze_v6_packages(resolved, output, budget):
+    """Freeze independent single-file variants and the supplied exact combos."""
+    frozen, provenance = {}, {}
+    for name, (source, expected_hashes) in resolved.items():
+        budget.admit(1)
+        target = output / "inputs" / name.replace(":", "-") / "oddsfox_catalogue"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tree_bounded(source, target, budget)
+        actual = _hash_package(target, budget)
+        if actual != expected_hashes:
+            raise ValueError(f"package changed while it was being frozen: {name}")
+        frozen[name] = target
+        provenance[name] = {"path": str(source), "source_hashes": actual}
+
+    baseline_hashes = _hash_package(frozen["baseline"], budget)
+    for name in resolved:
+        if name == "baseline":
+            continue
+        entry_name = (
+            f"combination:{name.removeprefix('_combination:')}"
+            if name.startswith("_combination:")
+            else name
+        )
+        candidate_hashes = _hash_package(frozen[name], budget)
+        features = (
+            entry_name.removeprefix("combination:").split("+")
+            if entry_name.startswith("combination:")
+            else [entry_name]
+        )
+        allowed = set().union(*(V6_OWNERSHIP[feature] for feature in features))
+        missing = set(baseline_hashes) - set(candidate_hashes)
+        if missing:
+            raise ValueError(
+                f"{entry_name} deletes baseline runtime files: " + ", ".join(sorted(missing))
+            )
+        added = set(candidate_hashes) - set(baseline_hashes)
+        allowed_added = {"current_claim_indexes.py"} if "claim_asset_index" in features else set()
+        if added - allowed_added:
+            raise ValueError(
+                f"{entry_name} adds files outside its declared production surface: "
+                + ", ".join(sorted(added - allowed_added))
+            )
+        changed = {
+            path
+            for path in set(baseline_hashes) | set(candidate_hashes)
+            if baseline_hashes.get(path) != candidate_hashes.get(path)
+        }
+        if changed - allowed:
+            raise ValueError(
+                f"{entry_name} changes files outside its declared production surface: "
+                + ", ".join(sorted(changed - allowed))
+            )
+        eligible = bool(changed)
+        if entry_name.startswith("combination:"):
+            for feature in features:
+                if not changed.intersection(V6_OWNERSHIP[feature]):
+                    raise ValueError(
+                        f"{entry_name} contains no changed file for declared feature {feature}"
+                    )
+                if feature in frozen and candidate_hashes == _hash_package(frozen[feature], budget):
+                    raise ValueError(
+                        f"{entry_name} is identical to its {feature} package and omits a declared feature"
+                    )
+        elif eligible and not changed.intersection(V6_OWNERSHIP[entry_name]):
+            raise ValueError(f"{entry_name} contains no changed file on its owned surface")
+        provenance[entry_name] = {
+            "path": provenance[name]["path"],
+            "source_hashes": candidate_hashes,
+            "eligible": eligible,
+            "changed_files": sorted(
+                path
+                for path in set(baseline_hashes) | set(candidate_hashes)
+                if baseline_hashes.get(path) != candidate_hashes.get(path)
+            ),
+        }
+        if not eligible:
+            provenance[entry_name]["deferred_reason"] = "package is identical to baseline"
+        if entry_name != name:
+            provenance.pop(name, None)
+            frozen[entry_name] = frozen.pop(name)
+    return {"packages": frozen, "provenance": provenance}
 
 
 def _preflight(paths: dict, budget) -> dict:
@@ -569,6 +784,806 @@ def _campaign_provenance(budget) -> dict:
             path.relative_to(bench.REPO).as_posix(): _digest_bounded(path, budget) for path in paths
         },
     }
+
+
+def _v6_worker_result(command, output, package, budget, label):
+    result = bench.supervised(command, output, package, budget, output / f"{label}.log")
+    if result.get("status") != "measured":
+        raise ValueError(result.get("message", f"{label} worker failed"))
+    if Path(result.get("runtime_source", "")).resolve() != package.resolve():
+        raise CampaignIntegrityError(f"{label} imported a different runtime package")
+    required = (
+        "acquire_apply_s",
+        "runtime_sequence_wall_s",
+        "wall_s",
+        "peak_rss_bytes",
+        "worker_peak_before_oracle_bytes",
+        "http_attempts",
+        "downloaded_bytes",
+        "runtime_reserved_attempts",
+        "runtime_downloaded_bytes",
+    )
+    if not all(
+        type(result.get(key)) in (int, float) and math.isfinite(result[key]) and result[key] >= 0
+        for key in required
+    ):
+        raise ValueError(f"{label} omitted valid V6 metrics")
+    if result.get("publication_verified") is not True:
+        raise ValueError(f"{label} publication verification failed")
+    if not isinstance(result.get("semantic_hash"), str):
+        raise ValueError(f"{label} omitted the full-state semantic digest")
+    if not isinstance(result.get("settled_requests"), list):
+        raise ValueError(f"{label} omitted settled request-order evidence")
+    if type(result.get("settled_units")) is not int or not isinstance(
+        result.get("completed_work"), dict
+    ):
+        raise ValueError(f"{label} omitted completed-work evidence")
+    if not isinstance(result.get("classification_signature"), (str, dict)):
+        raise ValueError(f"{label} omitted renewal-classification evidence")
+    if not isinstance(result.get("capture_units"), list) or not isinstance(
+        result.get("scheduler_cursor_progression"), str
+    ):
+        raise ValueError(f"{label} omitted capture or progress evidence")
+    if type(result.get("publication_noop")) is not bool:
+        raise ValueError(f"{label} omitted publication no-op evidence")
+    if result.get("cleanup_deferred") or result.get("cleanup_warnings"):
+        result["cleanup_deferred"] = True
+    bench.validate_source_accounting(
+        result.get("source_stats", {}),
+        result["runtime_reserved_attempts"],
+        result["runtime_downloaded_bytes"],
+        result.get("source_failure"),
+    )
+    return result
+
+
+def _v6_sample(source_root, requests_path, output, package, budget, label, *, attribution=False):
+    output.mkdir(parents=True, exist_ok=False)
+    target_id = hashlib.sha256(str(output).encode("utf-8")).hexdigest()[:16]
+    target = output.parent / f"fixed-root-{target_id}"
+    command = [
+        sys.executable,
+        str(Path(bench.__file__).resolve()),
+        "--profile",
+        "perf",
+        "--output",
+        str(output),
+        "--_fixed_catalogue_sample",
+        str(source_root),
+        str(target),
+        label,
+        str(requests_path),
+    ]
+    if attribution:
+        command.append("--_attribution")
+    return _v6_worker_result(command, output, package, budget, label)
+
+
+def _v6_control_worker(args, output, package, budget, label):
+    """Run one bounded hidden full-pass control action under the shared supervisor."""
+    output.mkdir(parents=True, exist_ok=False)
+    command = [
+        sys.executable,
+        str(Path(bench.__file__).resolve()),
+        "--profile",
+        "perf",
+        "--output",
+        str(output),
+        *map(str, args),
+    ]
+    result = bench.supervised_prepare(
+        command, output, budget, output / f"{label}.log", package_root=package
+    )
+    if result.get("status") not in {"prepared", "snapshotted", "hashed", "measured"}:
+        raise ValueError(result.get("message", f"{label} worker failed"))
+    if package is not None and result.get("runtime_source_hashes") not in (
+        None,
+        _hash_package(package, budget),
+    ):
+        raise CampaignIntegrityError(f"{label} imported a different runtime package")
+    return result
+
+
+def _v6_warm(name, source_root, requests_path, output, package, budget, report, warmed):
+    key = (bench.canonical_hash(_hash_package(package, budget)), "fixed_catalogue_application")
+    if key in warmed:
+        return report["warmups"][name]
+    sample = _v6_sample(
+        source_root,
+        requests_path,
+        output / "warmups" / name,
+        package,
+        budget,
+        f"warm-{name}",
+        attribution=True,
+    )
+    warmed.add(key)
+    report.setdefault("warmups", {})[name] = sample
+    bench._save(output / "report.json", report)
+    return sample
+
+
+def _v6_fixed_comparison(
+    stage,
+    left_name,
+    left,
+    right_name,
+    right,
+    source_root,
+    requests_path,
+    output,
+    budget,
+    report,
+    warmed,
+    *,
+    expected_requests_hash=None,
+):
+    baseline_rows, candidate_rows = [], []
+    if (
+        expected_requests_hash is not None
+        and _digest_bounded(requests_path, budget) != expected_requests_hash
+    ):
+        raise CampaignIntegrityError("frozen full-catalogue request manifest changed")
+    request_manifest = json.loads(requests_path.read_text())
+    requests = request_manifest.get("requests")
+    bench.require(isinstance(requests, dict), "frozen requests manifest is malformed")
+    for key in ("closed_event_batches", "active_event_batches"):
+        batches = requests.get(key)
+        bench.require(
+            isinstance(batches, list)
+            and batches
+            and all(
+                isinstance(batch, list)
+                and len(batch) == 100
+                and all(isinstance(entity_id, str) and entity_id for entity_id in batch)
+                for batch in batches
+            ),
+            f"frozen request manifest has invalid {key}",
+        )
+    orphan_ids = requests.get("orphan_market_ids")
+    bench.require(
+        isinstance(orphan_ids, list)
+        and orphan_ids
+        and all(isinstance(entity_id, str) and entity_id for entity_id in orphan_ids),
+        "frozen request manifest has invalid orphan market IDs",
+    )
+    expected_work = {
+        "closed_batches_requested": len(requests.get("closed_event_batches", [])),
+        "active_batches_requested": len(requests.get("active_event_batches", [])),
+        "event_ids_requested": sum(len(batch) for batch in requests.get("closed_event_batches", []))
+        + sum(len(batch) for batch in requests.get("active_event_batches", [])),
+        "orphan_market_ids_requested": len(requests.get("orphan_market_ids", [])),
+    }
+    expected_settled_units = (
+        expected_work["closed_batches_requested"] + expected_work["active_batches_requested"] + 1
+    )
+    expected_base_requests = [
+        {"lane": "events", "ids": list(batch)}
+        for batch in requests["closed_event_batches"] + requests["active_event_batches"]
+    ] + [{"lane": "markets", "ids": list(orphan_ids)}]
+    _v6_warm(f"{left_name}_fixed", source_root, requests_path, output, left, budget, report, warmed)
+    _v6_warm(
+        f"{right_name}_fixed", source_root, requests_path, output, right, budget, report, warmed
+    )
+    order = (
+        (left_name, left),
+        (right_name, right),
+        (right_name, right),
+        (left_name, left),
+        (left_name, left),
+        (right_name, right),
+    )
+    for index, (name, package) in enumerate(order, 1):
+        if (
+            expected_requests_hash is not None
+            and _digest_bounded(requests_path, budget) != expected_requests_hash
+        ):
+            raise CampaignIntegrityError("frozen full-catalogue request manifest changed")
+        row = _v6_sample(
+            source_root,
+            requests_path,
+            output / "samples" / stage / f"{index:02d}-{name}",
+            package,
+            budget,
+            f"{stage}-{index:02d}-{name}",
+        )
+        row.update(category=name, pair=(index + 1) // 2)
+        for key, expected in expected_work.items():
+            bench.require(
+                row["completed_work"].get(key) == expected,
+                f"{stage} did not complete the frozen {key} work",
+            )
+        completed_work = row["completed_work"]
+        bench.require(
+            all(
+                type(completed_work.get(key)) is int and completed_work[key] >= 0
+                for key in (
+                    "omission_ids_confirmed",
+                    "native_repair_requests",
+                    "native_repair_responses",
+                )
+            )
+            and completed_work["native_repair_requests"]
+            == completed_work["native_repair_responses"],
+            f"{stage} omitted native confirmation or completed-work accounting",
+        )
+        bench.require(
+            row.get("fixed_receipt_coverage") is True and row.get("publication_verified") is True,
+            f"{stage} did not verify fixed-work receipt coverage and publication",
+        )
+        bench.require(
+            row["settled_units"] == expected_settled_units,
+            f"{stage} did not settle every frozen workload unit",
+        )
+        base_requests = [
+            {"lane": request.get("lane"), "ids": request.get("ids")}
+            for request in row["settled_requests"]
+            if request.get("native") is not True
+        ]
+        bench.require(
+            base_requests == expected_base_requests,
+            f"{stage} did not execute the exact frozen base request sequence",
+        )
+        report.setdefault("stages", {}).setdefault(stage, {"samples": []})["samples"].append(row)
+        (baseline_rows if name == left_name else candidate_rows).append(row)
+        bench._save(output / "report.json", report)
+    bench.require(
+        all(
+            candidate_rows[index].get("settled_requests")
+            == baseline_rows[index].get("settled_requests")
+            for index in range(3)
+        ),
+        f"{stage} completed request order differs between paired runs",
+    )
+    bench.require(
+        all(
+            candidate_rows[index].get("settled_units") == baseline_rows[index].get("settled_units")
+            and candidate_rows[index].get("completed_work")
+            == baseline_rows[index].get("completed_work")
+            and candidate_rows[index].get("scheduler_cursor_progression")
+            == baseline_rows[index].get("scheduler_cursor_progression")
+            and candidate_rows[index].get("classification_signature")
+            == baseline_rows[index].get("classification_signature")
+            and candidate_rows[index].get("capture_units")
+            == baseline_rows[index].get("capture_units")
+            and candidate_rows[index].get("publication_noop")
+            == baseline_rows[index].get("publication_noop")
+            for index in range(3)
+        ),
+        f"{stage} completed work, classifications, captures or cursor progression differ",
+    )
+    result = bench.comparison(baseline_rows, candidate_rows, "perf")
+    report["stages"][stage].update(
+        status=result["status"],
+        comparison=result,
+        left=left_name,
+        right=right_name,
+        workload="fixed_catalogue_application",
+    )
+    bench._save(output / "report.json", report)
+    return result
+
+
+def _v6_synthetic_guard(name, package, baseline_package, seed, output, budget, warmed, report):
+    """The canonical interrupted/resumed synthetic full pass is a nonregression guard."""
+    stage = f"{name}_synthetic_guard_vs_baseline"
+    result = _compare_stage(
+        stage,
+        "baseline",
+        baseline_package,
+        name,
+        package,
+        seed,
+        output,
+        budget,
+        warmed,
+        report,
+    )
+    rows = report["stages"][stage]["samples"]
+    baseline_rows = [row for row in rows if row["category"] == "baseline"]
+    candidate_rows = [row for row in rows if row["category"] == name]
+    if len(baseline_rows) != 3 or len(candidate_rows) != 3:
+        return {"status": "insufficient_evidence", "reason": "synthetic guard pairs incomplete"}
+    baseline_median = statistics.median(row["acquire_apply_s"] for row in baseline_rows)
+    candidate_median = statistics.median(row["acquire_apply_s"] for row in candidate_rows)
+    semantic_equal = all(
+        row["semantic_hash"] == baseline_rows[0]["semantic_hash"]
+        for row in baseline_rows + candidate_rows
+    )
+    cleanup_complete = all(
+        not row.get("cleanup_deferred") for row in baseline_rows + candidate_rows
+    )
+    no_regression = candidate_median <= baseline_median * 1.05
+    baseline_by_pair = {row["pair"]: row for row in baseline_rows}
+    candidate_by_pair = {row["pair"]: row for row in candidate_rows}
+    complete_pairs = set(baseline_by_pair) == set(candidate_by_pair) == {1, 2, 3}
+    progression_equal = complete_pairs and all(
+        candidate_by_pair[pair].get("settled_requests")
+        == baseline_by_pair[pair].get("settled_requests")
+        and candidate_by_pair[pair].get("settled_units")
+        == baseline_by_pair[pair].get("settled_units")
+        and candidate_by_pair[pair].get("cursor") == baseline_by_pair[pair].get("cursor")
+        and candidate_by_pair[pair].get("counts") == baseline_by_pair[pair].get("counts")
+        for pair in (1, 2, 3)
+    )
+    nonregression = complete_pairs and all(
+        candidate_by_pair[pair][metric] <= baseline_by_pair[pair][metric] * 1.05
+        for pair in (1, 2, 3)
+        for metric in ("wall_s", "peak_rss_bytes", "worker_peak_before_oracle_bytes")
+    )
+    http_nonincrease = complete_pairs and all(
+        candidate_by_pair[pair][metric] <= baseline_by_pair[pair][metric]
+        for pair in (1, 2, 3)
+        for metric in (
+            "http_attempts",
+            "downloaded_bytes",
+            "runtime_reserved_attempts",
+            "runtime_downloaded_bytes",
+        )
+    )
+    passed = (
+        result.get("status") in {"qualified", "deferred"}
+        and semantic_equal
+        and cleanup_complete
+        and no_regression
+        and progression_equal
+        and nonregression
+        and http_nonincrease
+    )
+    return {
+        "status": "passed" if passed else "failed",
+        "baseline_median_acquire_apply_s": baseline_median,
+        "candidate_median_acquire_apply_s": candidate_median,
+        "regression_fraction": (
+            (candidate_median / baseline_median) - 1 if baseline_median else None
+        ),
+        "semantic_equal": semantic_equal,
+        "cleanup_complete": cleanup_complete,
+        "complete_pairs": complete_pairs,
+        "request_and_cursor_progression_equal": progression_equal,
+        "wall_rss_nonregression": nonregression,
+        "http_counters_nonincrease": http_nonincrease,
+        "http_and_publication_guard": result,
+    }
+
+
+def _v6_resource_diagnostic(source_snapshot, package, output, budget):
+    """Measure index resource behavior without assuming it establishes safety."""
+    budget.holdback_s = 15.0  # Preserve final integrity; Budget reserves shutdown itself.
+    root = output / "index-resource"
+    action = output / "resource-control"
+    action.mkdir(parents=True, exist_ok=False)
+    command = [
+        sys.executable,
+        str(Path(bench.__file__).resolve()),
+        "--profile",
+        "perf",
+        "--output",
+        str(action),
+        "--_claim_resource",
+        str(source_snapshot),
+        str(root),
+    ]
+    try:
+        result = bench.supervised(command, action, package, budget, action / "claim-resource.log")
+        if result.get("status") != "measured":
+            raise ValueError(result.get("message", "claim resource worker failed"))
+        if Path(result.get("runtime_source", "")).resolve() != package.resolve():
+            raise CampaignIntegrityError("claim resource worker imported another runtime package")
+    except CampaignIntegrityError:
+        raise
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        return {
+            "status": "insufficient_evidence",
+            "reason": str(exc),
+            "log": str(action / "claim-resource.log"),
+            "resource_envelope": None,
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "log": str(action / "claim-resource.log"),
+            "resource_envelope": None,
+        }
+    supported = (
+        result.get("supported_envelope_established") is True
+        and isinstance(result.get("resource_envelope"), dict)
+        and result.get("candidate_supported_envelope") == result.get("resource_envelope")
+        and result.get("index_used") is True
+    )
+    return {
+        **result,
+        "status": "measured" if result.get("status") == "measured" else result.get("status"),
+        "supported_envelope_established": supported,
+        "resource_envelope": result.get("resource_envelope") if supported else None,
+    }
+
+
+def _v6_run(
+    seed,
+    seed_hash,
+    source_snapshot,
+    requests_path,
+    output,
+    budget,
+    warmed,
+    report,
+    packages,
+    provenance,
+    harness,
+):
+    report["retained"] = []
+    report["qualified_candidates"] = {}
+    report["invalid_candidates"] = []
+    report["deferred"] = {}
+    source_warmed = set()
+    qualified_duration = 0.0
+    reserve = 15.0
+    budget.holdback_s = reserve
+
+    for name in V6_CANDIDATES:
+        if not provenance[name].get("eligible"):
+            report["deferred"][name] = provenance[name].get(
+                "deferred_reason", "candidate is unchanged"
+            )
+            continue
+        if name == "claim_asset_index":
+            # The index package is eligible only after actual-size build, sustained-write,
+            # checkpoint, plan-use and supported-envelope evidence has been completed.
+            resource = report.get("index_resource_evidence")
+            if (
+                not isinstance(resource, dict)
+                or resource.get("supported_envelope_established") is not True
+            ):
+                report["deferred"][name] = (
+                    "insufficient_evidence: actual-size index resource envelope is unavailable"
+                )
+                continue
+        stage = f"{name}_fixed_catalogue_vs_baseline"
+        started = time.monotonic()
+        try:
+            reserve_combo = 1.25 * qualified_duration if qualified_duration else 0.0
+            # Keep integrity, shutdown and a possible final combination funded
+            # before spending budget on any candidate warmups.
+            budget.holdback_s = reserve + reserve_combo
+            left_warm = _v6_warm(
+                "baseline_fixed",
+                source_snapshot,
+                requests_path,
+                output,
+                packages["baseline"],
+                budget,
+                report,
+                source_warmed,
+            )
+            right_warm = _v6_warm(
+                f"{name}_fixed",
+                source_snapshot,
+                requests_path,
+                output,
+                packages[name],
+                budget,
+                report,
+                source_warmed,
+            )
+            # Admit the complete fixed-work comparison and its synthetic
+            # nonregression guard together. Each workload has its own warm-up;
+            # scored runs remain uninstrumented.
+            _warm("baseline", packages["baseline"], seed, output, budget, warmed, report)
+            _warm(name, packages[name], seed, output, budget, warmed, report)
+            synthetic_rows = report.get("warmups", {})
+            baseline_synthetic_warm = synthetic_rows.get("baseline", {}).get("sample", {})
+            candidate_synthetic_warm = synthetic_rows.get(name, {}).get("sample", {})
+            required_metrics = (
+                left_warm,
+                right_warm,
+                baseline_synthetic_warm,
+                candidate_synthetic_warm,
+            )
+            bench.require(
+                all(type(row.get("wall_s")) in (int, float) for row in required_metrics),
+                f"{name} did not produce all fixed and synthetic warmups",
+            )
+            estimate = 1.25 * 3 * sum(row["wall_s"] for row in required_metrics)
+            reserve_combo = 1.25 * qualified_duration if qualified_duration else 0.0
+            report.setdefault("admission", {})[name] = {
+                "projected_fixed_comparison_seconds": estimate,
+                "headroom_fraction": 0.25,
+                "final_integrity_reserve_seconds": 15.0,
+                "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
+                "combination_reserve_seconds": reserve_combo,
+            }
+            budget.holdback_s = reserve + reserve_combo
+            if estimate > budget.remaining:
+                report["deferred"][name] = (
+                    "insufficient_evidence: fixed-work pairs do not fit budget"
+                )
+                bench._save(output / "report.json", report)
+                continue
+            fixed = _v6_fixed_comparison(
+                stage,
+                "baseline",
+                packages["baseline"],
+                name,
+                packages[name],
+                source_snapshot,
+                requests_path,
+                output,
+                budget,
+                report,
+                source_warmed,
+                expected_requests_hash=report["catalogue_source"]["request_manifest_sha256"],
+            )
+            _assert_campaign_provenance(harness, budget)
+            if fixed.get("status") == "invalid":
+                report["invalid_candidates"].append(name)
+                report["deferred"][name] = fixed.get("reason", "fixed workload equivalence failed")
+                continue
+            if fixed.get("status") != "qualified":
+                report["deferred"][name] = fixed.get(
+                    "reason", "fixed-work performance gate not met"
+                )
+                continue
+
+            synthetic = _v6_synthetic_guard(
+                name, packages[name], packages["baseline"], seed, output, budget, warmed, report
+            )
+            report.setdefault("synthetic_guards", {})[name] = synthetic
+            _assert_campaign_provenance(harness, budget)
+            if synthetic.get("status") != "passed":
+                report["deferred"][name] = "candidate failed canonical synthetic full-pass guard"
+                continue
+            duration = time.monotonic() - started
+            qualified_duration = max(qualified_duration, duration)
+            report["qualified_candidates"][name] = {
+                "fixed_comparison": fixed,
+                "synthetic_guard": synthetic,
+                "stage": stage,
+            }
+            bench._save(output / "report.json", report)
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
+            report["deferred"][name] = f"insufficient_evidence: {exc}"
+            report["stages"].setdefault(stage, {"samples": []})["status"] = "incomplete"
+            bench._save(output / "report.json", report)
+            break
+
+    qualified = list(report["qualified_candidates"])
+    if len(qualified) == 1:
+        chosen = qualified[0]
+        report["retained"] = [chosen]
+        report["status"] = "qualified"
+        report["final_combination"] = {
+            "status": "reused_independent_evidence",
+            "features": qualified,
+        }
+        _v6_record_retained_runtime(chosen, packages, provenance, budget, report)
+        return
+    if not qualified:
+        report["status"] = (
+            "invalid"
+            if report["invalid_candidates"]
+            else (
+                "insufficient_evidence"
+                if any("insufficient_evidence" in str(v) for v in report["deferred"].values())
+                else "deferred"
+            )
+        )
+        return
+
+    combo_key = "+".join(sorted(qualified))
+    combo_name = f"combination:{combo_key}"
+    if combo_name not in packages or not provenance.get(combo_name, {}).get("eligible"):
+        chosen = max(
+            qualified,
+            key=lambda candidate: (
+                report["qualified_candidates"][candidate]["fixed_comparison"].get("saved_s", 0),
+                -V6_CANDIDATES.index(candidate),
+            ),
+        )
+        report["retained"] = [chosen]
+        report["status"] = "qualified_individual_combination_deferred"
+        report["final_combination"] = {"status": "not_supplied", "features": qualified}
+        _v6_record_retained_runtime(chosen, packages, provenance, budget, report)
+        return
+    # A supplied combination is always measured as a fresh exact package. No source
+    # files are copied or synthesized here.
+    try:
+        baseline_fixed = _v6_warm(
+            "baseline_fixed",
+            source_snapshot,
+            requests_path,
+            output,
+            packages["baseline"],
+            budget,
+            report,
+            source_warmed,
+        )
+        combination_fixed = _v6_warm(
+            f"{combo_name}_fixed",
+            source_snapshot,
+            requests_path,
+            output,
+            packages[combo_name],
+            budget,
+            report,
+            source_warmed,
+        )
+        _warm("baseline", packages["baseline"], seed, output, budget, warmed, report)
+        _warm(combo_name, packages[combo_name], seed, output, budget, warmed, report)
+        baseline_perf = report["warmups"]["baseline"]["sample"]
+        combination_perf = report["warmups"][combo_name]["sample"]
+        estimate = (
+            1.25
+            * 3
+            * sum(
+                row["wall_s"]
+                for row in (baseline_fixed, combination_fixed, baseline_perf, combination_perf)
+            )
+        )
+        combo_reserve = 1.25 * qualified_duration
+        budget.holdback_s = reserve
+        report.setdefault("admission", {})[combo_name] = {
+            "projected_fixed_and_synthetic_comparison_seconds": estimate,
+            "headroom_fraction": 0.25,
+            "final_integrity_reserve_seconds": 15.0,
+            "shutdown_reserve_seconds": bench.SHUTDOWN_RESERVE_S,
+            "combination_reserve_seconds": combo_reserve,
+        }
+        if estimate > budget.remaining:
+            raise TimeoutError(
+                "insufficient_evidence: exact combination does not fit protected budget"
+            )
+        fixed = _v6_fixed_comparison(
+            f"{combo_name}_fixed_vs_baseline",
+            "baseline",
+            packages["baseline"],
+            combo_name,
+            packages[combo_name],
+            source_snapshot,
+            requests_path,
+            output,
+            budget,
+            report,
+            source_warmed,
+            expected_requests_hash=report["catalogue_source"]["request_manifest_sha256"],
+        )
+        synthetic = _v6_synthetic_guard(
+            combo_name,
+            packages[combo_name],
+            packages["baseline"],
+            seed,
+            output,
+            budget,
+            warmed,
+            report,
+        )
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        fixed = {"status": "insufficient_evidence", "reason": str(exc)}
+        synthetic = {"status": "not_run"}
+    report["final_combination"] = {
+        "status": fixed.get("status"),
+        "fixed": fixed,
+        "synthetic": synthetic,
+    }
+    if fixed.get("status") == "qualified" and synthetic.get("status") == "passed":
+        report["retained"] = qualified
+        report["status"] = "qualified"
+        _v6_record_retained_runtime(combo_name, packages, provenance, budget, report)
+    else:
+        chosen = max(
+            qualified,
+            key=lambda candidate: (
+                report["qualified_candidates"][candidate]["fixed_comparison"].get("saved_s", 0),
+                -V6_CANDIDATES.index(candidate),
+            ),
+        )
+        report["retained"] = [chosen]
+        report["status"] = "qualified_individual_combination_deferred"
+        _v6_record_retained_runtime(chosen, packages, provenance, budget, report)
+
+
+def _v6_record_retained_runtime(name, packages, provenance, budget, report):
+    hashes = _hash_package(packages[name], budget)
+    if hashes != provenance[name]["source_hashes"]:
+        raise CampaignIntegrityError("retained runtime differs from its frozen evidence package")
+    report["retained_runtime"] = {
+        "package": name,
+        "path": str(packages[name]),
+        "source_hashes": hashes,
+        "source_hash": bench.canonical_hash(hashes),
+        "evidence_stage": "final_combination" if name.startswith("combination:") else name,
+    }
+
+
+def _v6_prepare_source(manifest, manifest_path, output, baseline_package, budget, report):
+    """Take a locked snapshot, freeze deterministic requests, then recalibrate its copy."""
+    source, expected = _validate_v6_source_entry(
+        manifest["_catalogue_source"], manifest_path, output, budget
+    )
+    action = output / "source-before"
+    before = _v6_control_worker(
+        ["--_hash_catalogue", source], action, baseline_package, budget, "source-before"
+    )
+    if before.get("source_hashes") != expected:
+        raise CampaignIntegrityError("locked source inventory differs from the V6 manifest")
+
+    source_snapshot = output / "source-snapshot"
+    requests_path = output / "frozen-requests.json"
+    action = output / "snapshot-control"
+    snapshot = _v6_control_worker(
+        ["--_snapshot_catalogue", source, source_snapshot, requests_path],
+        action,
+        baseline_package,
+        budget,
+        "source-snapshot",
+    )
+    if snapshot.get("source_hashes") != expected:
+        raise CampaignIntegrityError("catalogue source changed or disagreed during locked snapshot")
+    if snapshot.get("snapshot_hashes") != expected:
+        raise CampaignIntegrityError(
+            "locked catalogue snapshot does not match the source inventory"
+        )
+    if not requests_path.is_file() or bench.is_symlink(requests_path):
+        raise CampaignIntegrityError("snapshot worker did not produce a safe request manifest")
+
+    prepared = _v6_control_worker(
+        ["--_prepare_v6_snapshot", source_snapshot, requests_path],
+        output / "recalibration-control",
+        baseline_package,
+        budget,
+        "snapshot-recalibration",
+    )
+    if prepared.get("status") != "prepared":
+        raise ValueError(prepared.get("message", "cloned full-catalogue recalibration failed"))
+    frozen_hashes = _hash_catalogue_source(source_snapshot, budget)
+    report["catalogue_source"] = {
+        "path": str(source),
+        "manifest_source_hashes": expected,
+        "locked_source_hashes": before["source_hashes"],
+        "snapshot_source_hashes": snapshot["source_hashes"],
+        "snapshot_hashes_before_recalibration": snapshot["snapshot_hashes"],
+        "frozen_measurement_snapshot_hashes": frozen_hashes,
+        "source_counts": snapshot.get("source_counts"),
+        "request_counts": snapshot.get("request_counts"),
+        "frozen_clock": snapshot.get("domain_clock"),
+        "canonical_recalibration": prepared,
+        "request_manifest_sha256": _digest_bounded(requests_path, budget),
+    }
+    bench._save(output / "report.json", report)
+    return source, expected, source_snapshot, requests_path, frozen_hashes
+
+
+def _v6_final_integrity(
+    packages,
+    provenance,
+    seed,
+    seed_hash,
+    harness,
+    source,
+    expected_source_hashes,
+    source_snapshot,
+    snapshot_hashes,
+    requests_path,
+    expected_requests_hash,
+    output,
+    budget,
+    baseline_package,
+):
+    budget.holdback_s = 0.0
+    _integrity_check(packages, provenance, seed, seed_hash, budget)
+    _assert_campaign_provenance(harness, budget)
+    action = output / "source-after"
+    after = _v6_control_worker(
+        ["--_hash_catalogue", source], action, baseline_package, budget, "source-after"
+    )
+    if after.get("source_hashes") != expected_source_hashes:
+        raise CampaignIntegrityError("original catalogue changed during V6 campaign")
+    if _hash_catalogue_source(source_snapshot, budget) != snapshot_hashes:
+        raise CampaignIntegrityError("frozen full-catalogue measurement snapshot changed")
+    if _digest_bounded(requests_path, budget) != expected_requests_hash:
+        raise CampaignIntegrityError("frozen full-catalogue request manifest changed")
+    return after["source_hashes"]
 
 
 def _machine_provenance(output: Path) -> dict:
@@ -1949,6 +2964,8 @@ def run(args, *, budget=None) -> int:
         if manifest["_version"] == 3
         else V4_CAMPAIGN_BUDGET_S
         if manifest["_version"] == 4
+        else V6_CAMPAIGN_BUDGET_S
+        if manifest["_version"] == 6
         else CAMPAIGN_BUDGET_S
     )
     if supplied_budget and budget.limit_s != expected_budget:
@@ -1971,6 +2988,8 @@ def run(args, *, budget=None) -> int:
         "warmup_mode": (
             "one direct-unprofiled attribution warm-up per distinct runtime"
             if manifest["_version"] == 5
+            else "one attributed full-size warm-up and unprofiled synthetic warm-up per runtime; scores uninstrumented"
+            if manifest["_version"] == 6
             else "one unprofiled fresh-worker run per distinct runtime"
         ),
         "samples": [],
@@ -1989,6 +3008,25 @@ def run(args, *, budget=None) -> int:
             "scored_runs_per_runtime": 3,
             "pair_order": "AB, BA, AB",
         }
+    if manifest["_version"] == 6:
+        report.update(
+            campaign_budget_scope=(
+                "preparation, source snapshot, package freezing, resource diagnostics, "
+                "warmups, comparisons, integrity validation and shutdown"
+            ),
+            effective_settings={
+                "full_size_workload": "32 closed batches + 4 active batches + orphan work",
+                "closed_event_batches": 32,
+                "active_event_batches": 4,
+                "max_ids_per_event_batch": 100,
+                "canonical_synthetic_guard": "10,000 events / 40,400 markets; 50-unit stop/resume",
+                "candidate_order": list(V6_CANDIDATES),
+                "scored_runs_per_comparison": 3,
+                "pair_order": "AB, BA, AB",
+                "scored_instrumentation": "none",
+                "index_resource_envelope_required": True,
+            },
+        )
     if manifest["_version"] == 5:
         report["effective_settings"] = {
             "profile": "perf",
@@ -2001,6 +3039,10 @@ def run(args, *, budget=None) -> int:
             "warmup_diagnostics_version": 1,
         }
     output.mkdir(parents=True)
+    if manifest["_version"] == 6:
+        # Keep the final bounded source/seed/package integrity pass funded from
+        # campaign start; Budget.remaining separately reserves shutdown time.
+        budget.holdback_s = 15.0
     bench._save(output / "report.json", report)
     packages = {}
     provenance = {}
@@ -2009,7 +3051,7 @@ def run(args, *, budget=None) -> int:
     harness = None
     binding_qualified = False
     try:
-        if manifest["_version"] in {4, 5}:
+        if manifest["_version"] in {4, 5, 6}:
             report["machine_provenance"] = _machine_provenance(output.parent)
             bench._save(output / "report.json", report)
         harness = _campaign_provenance(budget)
@@ -2023,6 +3065,8 @@ def run(args, *, budget=None) -> int:
             if manifest["_version"] == 4
             else _freeze_v5_packages(resolved, output, budget)
             if manifest["_version"] == 5
+            else _freeze_v6_packages(resolved, output, budget)
+            if manifest["_version"] == 6
             else _freeze_packages(resolved, output, budget)
         )
         packages, provenance = frozen["packages"], frozen["provenance"]
@@ -2030,7 +3074,9 @@ def run(args, *, budget=None) -> int:
             provenance["_claims_mode"] = {"value": claims_mode, "source": "manifest"}
         report["inputs"] = provenance
         report_candidates = (
-            tuple(V5_CANDIDATES)
+            tuple(V6_CANDIDATES)
+            if manifest["_version"] == 6
+            else tuple(V5_CANDIDATES)
             if manifest["_version"] == 5
             else (*V4_CANDIDATES, "combined")
             if manifest["_version"] == 4
@@ -2041,7 +3087,7 @@ def run(args, *, budget=None) -> int:
         for name in report_candidates:
             if name in provenance and not provenance[name].get("eligible"):
                 report["deferred"][name] = provenance[name]["deferred_reason"]
-        if manifest["_version"] == 5:
+        if manifest["_version"] in {5, 6}:
             for name in packages:
                 if name.startswith("combination:") and not provenance[name].get("eligible"):
                     report["deferred"][name] = provenance[name]["deferred_reason"]
@@ -2067,6 +3113,69 @@ def run(args, *, budget=None) -> int:
         bench._save(output / "report.json", report)
 
         warmed = set()
+        if manifest["_version"] == 6:
+            source, expected_source_hashes, source_snapshot, requests_path, snapshot_hashes = (
+                _v6_prepare_source(
+                    manifest, manifest_path, output, packages["baseline"], budget, report
+                )
+            )
+            if provenance.get("claim_asset_index", {}).get("eligible"):
+                report["index_resource_evidence"] = _v6_resource_diagnostic(
+                    source_snapshot,
+                    packages["claim_asset_index"],
+                    output,
+                    budget,
+                )
+            else:
+                report["index_resource_evidence"] = {
+                    "status": "not_run",
+                    "reason": "index candidate package is absent or unchanged",
+                    "resource_envelope": None,
+                    "supported_envelope_established": False,
+                }
+            bench._save(output / "report.json", report)
+            _v6_run(
+                seed,
+                seed_hash,
+                source_snapshot,
+                requests_path,
+                output,
+                budget,
+                warmed,
+                report,
+                packages,
+                provenance,
+                harness,
+            )
+            report["original_source_hashes_after_campaign"] = _v6_final_integrity(
+                packages,
+                provenance,
+                seed,
+                seed_hash,
+                harness,
+                source,
+                expected_source_hashes,
+                source_snapshot,
+                snapshot_hashes,
+                requests_path,
+                report["catalogue_source"]["request_manifest_sha256"],
+                output,
+                budget,
+                packages["baseline"],
+            )
+            report["integrity_validation"] = "passed"
+            bench._save(output / "report.json", report)
+            return (
+                0
+                if report["status"]
+                in {
+                    "qualified",
+                    "qualified_individual_combination_deferred",
+                    "insufficient_evidence",
+                    "deferred",
+                }
+                else 1
+            )
         if manifest["_version"] == 3:
             _run_v3(
                 seed,
@@ -2292,7 +3401,7 @@ def run(args, *, budget=None) -> int:
     except (TimeoutError, subprocess.TimeoutExpired) as exc:
         report["status"] = "insufficient_evidence"
         report["error"] = str(exc)
-        if report.get("manifest_version") in {4, 5}:
+        if report.get("manifest_version") in {4, 5, 6}:
             report["retained"] = []
             report["integrity_validation"] = "incomplete"
         elif report.get("manifest_version") == 3:
@@ -2315,7 +3424,7 @@ def run(args, *, budget=None) -> int:
         report["interrupted_exit_code"] = (
             128 + exc.signum if isinstance(exc, bench.Terminated) else 130
         )
-        if report.get("manifest_version") in {4, 5}:
+        if report.get("manifest_version") in {4, 5, 6}:
             report["retained"] = []
             report["integrity_validation"] = "incomplete"
         elif report.get("manifest_version") == 3:
@@ -2332,12 +3441,12 @@ def run(args, *, budget=None) -> int:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
         report["retained"] = []
-        if report.get("manifest_version") in {4, 5}:
+        if report.get("manifest_version") in {4, 5, 6}:
             report["integrity_validation"] = "failed"
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
-        if report.get("manifest_version") in {4, 5}:
+        if report.get("manifest_version") in {4, 5, 6}:
             report["retained"] = []
             report["integrity_validation"] = "failed"
         elif report.get("manifest_version") == 3:

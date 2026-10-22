@@ -44,8 +44,14 @@ def build_parser():
     sub.add_parser("version")
     config = sub.add_parser("config")
     config.add_subparsers(dest="config_command", required=True).add_parser("show")
-    for name in ("init", "refresh", "publish", "status", "verify", "current"):
+    for name in ("init", "refresh", "status", "verify", "current"):
         sub.add_parser(name)
+    publish = sub.add_parser("publish")
+    publish.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="force a fresh verified release and update the measured publication reservation",
+    )
     reconcile = sub.add_parser("reconcile", help="bounded reconcile of known events and markets")
     reconcile.add_argument(
         "--full-pass",
@@ -169,6 +175,8 @@ def _current(args):
     operation, options = args.command, {}
     if operation == "reconcile":
         options = {"full_pass": args.full_pass}
+    if operation == "publish":
+        options = {"recalibrate": args.recalibrate}
     if operation == "probe":
         options = {
             "api_optimizations": args.api_optimizations,
