@@ -40,6 +40,8 @@
 
 ### Fixed
 
+- Version-6 offline oversized responses exercise the real client byte guard and
+  ID-batch splitting, with explicit marker accounting and visible single-ID failures.
 - Acquisition now reports an actionable error before HTTP or checkpoint changes
   when its saved publication reservation consumes the entire invocation, instead
   of repeatedly making no progress. Publication and verification remain usable.

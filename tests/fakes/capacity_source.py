@@ -21,6 +21,10 @@ MAX_AUDIT_BYTES = 128 * 1024**2
 _ID = re.compile(r"[1-9][0-9]{0,19}\Z")
 
 
+class ClientResponseLimitExceeded(OverflowError):
+    """A bounded provider response exceeded the client body limit."""
+
+
 class CapacitySource:
     def __init__(
         self,
@@ -30,6 +34,7 @@ class CapacitySource:
         delay_s=0.3,
         max_audit_bytes=MAX_AUDIT_BYTES,
         source_root: Path | None = None,
+        allow_oversized_200=False,
     ):
         self.seed_root = safe_path(Path(source_root or seed_root)).resolve(strict=True)
         self.db_path = self.seed_root / "catalogue.duckdb"
@@ -41,7 +46,11 @@ class CapacitySource:
                 raise ValueError("unsafe audit parent")
         if self.db_path.is_symlink() or not stat.S_ISREG(self.db_path.stat().st_mode):
             raise ValueError("seed database must be regular")
-        if not 0 <= delay_s <= 10 or not 0 < max_audit_bytes <= MAX_AUDIT_BYTES:
+        if (
+            type(allow_oversized_200) is not bool
+            or not 0 <= delay_s <= 10
+            or not 0 < max_audit_bytes <= MAX_AUDIT_BYTES
+        ):
             raise ValueError("invalid source limits")
         before = self.db_path.stat()
         self.conn = duckdb.connect(
@@ -53,6 +62,7 @@ class CapacitySource:
         self.audit_path = audit_path
         self.delay_s = delay_s
         self.max_audit_bytes = max_audit_bytes
+        self.allow_oversized_200 = allow_oversized_200
         self.stats = {
             "requests": 0,
             "audit_bytes": 0,
@@ -261,7 +271,7 @@ class CapacitySource:
                 raw.update(id=key, markets=[markets[mid] for mid in membership.get(key, [])])
                 self._bounded_append(result, raw)
         if len(json.dumps(result, separators=(",", ":")).encode()) > MAX_RESPONSE_BYTES:
-            raise OverflowError
+            raise ClientResponseLimitExceeded
         return result
 
     def _request(self, target):
@@ -413,6 +423,7 @@ class CapacitySource:
         kind, ids, records, native = None, [], [], False
         closed, keyset = None, False
         status = 200
+        overflow_marker = False
         try:
             if self.failure:
                 raise RuntimeError("source failed")
@@ -438,9 +449,19 @@ class CapacitySource:
             self._check_identity()
             body = json.dumps(payload, separators=(",", ":")).encode()
             if len(body) > MAX_RESPONSE_BYTES:
-                raise OverflowError
+                raise ClientResponseLimitExceeded
         except ValueError:
             status, body = 400, b'{"error":"invalid request"}'
+        except ClientResponseLimitExceeded:
+            if self.allow_oversized_200:
+                # Exercise the real client-side streaming limit without retaining or
+                # claiming to emit a fabricated copy of the oversized record set.
+                status = 200
+                body = b" " * (MAX_RESPONSE_BYTES + 1)
+                records = []
+                overflow_marker = True
+            else:
+                status, body = 413, b'{"error":"response too large"}'
         except OverflowError:
             status, body = 413, b'{"error":"response too large"}'
         except Exception:
@@ -463,6 +484,8 @@ class CapacitySource:
             "body_sha256": hashlib.sha256(body).hexdigest(),
             "body_bytes": len(body),
         }
+        if overflow_marker:
+            entry["overflow_marker"] = True
         encoded = (json.dumps(entry, separators=(",", ":")) + "\n").encode()
         if self.stats["audit_bytes"] + len(encoded) > self.max_audit_bytes:
             self.failure = "audit limit exceeded"

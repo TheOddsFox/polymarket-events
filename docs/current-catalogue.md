@@ -891,6 +891,12 @@ reference fields. Optional index resource-ledger metadata is checked against exa
 stored claim accounting before its physical-optimization differences are normalized;
 it cannot hide domain, receipt or progress differences.
 
+For V6 only, the offline provider models a response above the client byte limit
+with a bounded HTTP 200 overflow marker. The real client rejects it before parsing
+and the existing acquisition code splits the ID batch. The marker claims no emitted
+records; its attempts and bytes remain accounted. A single oversized record still
+fails visibly, and the provider's separate construction limit remains enforced.
+
 Each measured runtime/workload gets an unscored warm-up and three fresh-worker
 AB, BA, AB pairs. Retention requires at least 10% and one second lower median
 acquisition/application time, at most 5% regression in wall and both worker-lifetime

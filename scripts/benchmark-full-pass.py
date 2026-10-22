@@ -4871,7 +4871,13 @@ def fixed_catalogue_worker(
     current_sync._write_response = traced_write_response
     audit = output / f"fixed-source-{label}.jsonl"
     try:
-        with CapacitySource(source_root, audit, delay_s=0, source_root=source_root) as source:
+        with CapacitySource(
+            source_root,
+            audit,
+            delay_s=0,
+            source_root=source_root,
+            allow_oversized_200=True,
+        ) as source:
             settings = load_current_settings(
                 root, env=child_environment(source.url, expected_package)
             )
