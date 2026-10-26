@@ -27,6 +27,24 @@ that was initialized with `init` (store contract `oddsfox.polymarket.catalogue_s
 and never migrates or mutates other data. There is no supported path from the earlier
 v2 release; preserve any old root and runtime yourself if you need them.
 
+## Authoritative production root on this MacBook
+
+The sole authoritative production database is
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production/catalogue.duckdb`.
+Its complete root is `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production`,
+accepted on 26 October 2026. Other catalogue roots are recovery or test/evidence
+copies and must not be treated as production.
+
+Use the explicit production `--root` for every production command. Consult that
+root's `HANDOFF.md` for the verified-runtime commands and acceptance evidence;
+`PRODUCTION-STATE.json` records its designation. Preserve the entire root, including
+configuration, raw recovery files and published releases. Do not initialize, replace
+or reset it when following the fresh-installation examples below.
+
+The `/srv/catalogue-v3` paths in this guide are examples, not the production location
+on this MacBook. A completed pass does not prove absolute upstream completeness or
+sustained freshness; no automatic refresh scheduler is enabled.
+
 ## Root and configuration
 
 Use an external root. `--root` is a global option and must precede the command.

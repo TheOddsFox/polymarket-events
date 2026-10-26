@@ -10,10 +10,34 @@ Version 1.0.0 is a manual tool. It runs one invocation at a time, has no schedul
 opens only a root initialized with `init`. It has no import, backup, restore, or metadata
 export command.
 
+## Authoritative production database on this MacBook
+
+The **main production database** is:
+
+```text
+/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production/catalogue.duckdb
+```
+
+Its containing directory, `catalogue-production`, is the **sole authoritative
+production root**, accepted on 26 October 2026. Keep the entire root: configuration,
+raw recovery files and published releases are required alongside the database.
+Other catalogue roots are recovery copies or test/evidence data, not production.
+
+Use this explicit root for production commands; do not run `init` on it. Its local
+`HANDOFF.md` contains the verified-runtime commands and acceptance evidence, and
+`PRODUCTION-STATE.json` records its accepted designation. The `/srv/catalogue-v3`
+paths below are examples for a separate fresh installation, not this MacBook's database.
+
+The completed full pass does not establish absolute upstream completeness or sustained
+freshness. Refresh remains manual; no scheduler is enabled.
+
+## Usage and verification
+
 See [the operator guide](docs/current-catalogue.md) for the contract, probe procedure,
 full-pass semantics, raw retention, limits, and metadata.v1 handoff.
-The [acceptance page](docs/current-catalogue-acceptance.md) records the v1 bar; no
-acceptance measurement is recorded yet.
+The [acceptance page](docs/current-catalogue-acceptance.md) records the versioned
+acceptance criteria and historical measurements; the local production handoff records
+the accepted operational state of this MacBook's database.
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
