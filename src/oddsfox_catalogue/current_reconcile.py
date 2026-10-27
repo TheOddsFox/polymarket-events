@@ -51,6 +51,7 @@ def _due(conn, lane, cold, now, interval, *, pass_started=None):
     else:
         # A forced pass visits every known entity, open or closed, until its receipt is newer.
         bypass, threshold = True, pass_started
+    # DuckDB 2.0 can drop this query's plain LIMIT; OFFSET 0 retains the batch cap.
     return conn.execute(
         f"""SELECT e.id,e.receipt FROM ({entities}) e
         LEFT JOIN _reconcile_attempts a ON a.kind=? AND a.id=e.id
@@ -58,7 +59,7 @@ def _due(conn, lane, cold, now, interval, *, pass_started=None):
         (e.receipt IS NULL OR e.receipt<=? OR e.unresolved) AND
         (a.last_attempt IS NULL OR a.last_attempt<=?)
         ORDER BY a.last_attempt NULLS FIRST,e.receipt NULLS FIRST,try_cast(e.id AS HUGEINT)
-        LIMIT 100""",
+        LIMIT 100 OFFSET 0""",
         [lane, bypass, cold, threshold, now - timedelta(hours=1)],
     ).fetchall()
 

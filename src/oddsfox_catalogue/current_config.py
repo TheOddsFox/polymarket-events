@@ -253,7 +253,11 @@ def connect_store(settings: CurrentSettings, *, read_only: bool = False):
     validate_root(settings.root)
     usage = admit(settings)
     settings.temporary_dir.mkdir(exist_ok=True)
-    connection = duckdb.connect(str(settings.store_path), read_only=read_only)
+    connection = duckdb.connect(
+        str(settings.store_path),
+        read_only=read_only,
+        config={"async_threads": 2, "read_ahead_depth": -1},
+    )
     try:
         _configure_connection(connection, settings)
         connection.execute("SET TimeZone='UTC'")
@@ -272,7 +276,7 @@ def memory_connection(settings: CurrentSettings):
     """Independent verification uses the same memory and aggregate spill allowance."""
     usage = admit(settings)
     settings.temporary_dir.mkdir(exist_ok=True)
-    connection = duckdb.connect(":memory:")
+    connection = duckdb.connect(":memory:", config={"async_threads": 2, "read_ahead_depth": -1})
     try:
         _configure_connection(connection, settings)
         connection.execute("SET temp_directory=?", [str(settings.temporary_dir)])

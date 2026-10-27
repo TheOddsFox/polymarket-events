@@ -3,6 +3,13 @@
 **Status: pending.** No v1 acceptance run has been recorded. Earlier measurements were
 taken under the backup and import design that v1 removes, so they are not carried forward.
 
+The campaign instructions below require their recorded source/harness revision,
+original DuckDB 1.5.6 lock and trusted frozen packages in a disposable checkout.
+The current DuckDB 2.0 candidate lock does not reproduce those measurements.
+Select a separate external `UV_PROJECT_ENVIRONMENT` for that frozen checkout;
+never reuse the accepted production `.venv`. See the
+[environment instructions](current-catalogue.md#root-and-configuration).
+
 ## Bounded live follow-up, 2026-10-22
 
 **Full-catalogue runtime and freshness remain pending.** This follow-up permits
@@ -109,6 +116,7 @@ evidence are supplemental files, not a completed performance sample.
 For a separately authorized fresh campaign, use a fresh output directory:
 
 ```sh
+export UV_PROJECT_ENVIRONMENT=/absolute/path/to/frozen-campaign-env
 uv run --locked python scripts/benchmark-optimization-campaign.py --manifest "/absolute/path/manifest-v6.json" --output "/absolute/path/fresh-v6-campaign"
 ```
 
@@ -168,6 +176,7 @@ claims that a candidate or cable caused a particular timing difference.
 Reproduce with trusted frozen packages and a fresh output directory:
 
 ```sh
+export UV_PROJECT_ENVIRONMENT=/absolute/path/to/frozen-campaign-env
 EVIDENCE="/absolute/path/catalogue-evidence/application-v5-20261021T210432Z"
 uv run --locked python scripts/benchmark-optimization-campaign.py --manifest "$EVIDENCE/manifest-v5.json" --output "$EVIDENCE/fresh-campaign"
 ```

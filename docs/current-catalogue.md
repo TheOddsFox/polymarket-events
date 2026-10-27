@@ -50,7 +50,14 @@ sustained freshness; no automatic refresh scheduler is enabled.
 Use an external root. `--root` is a global option and must precede the command.
 `CATALOGUE_ROOT` is the environment alternative.
 
+The current lock is an unqualified DuckDB 2.0 candidate. Preserve the default
+`.venv` used by the accepted production runtime: select a separate, external
+environment for candidate commands. Running `uv sync` or `uv run` without this
+selection would upgrade the production environment. Production commands must
+continue to use the root's existing verified-runtime handoff.
+
 ```sh
+export UV_PROJECT_ENVIRONMENT=/absolute/path/to/catalogue-candidate-venv
 uv sync --locked
 uv run catalogue --root /srv/catalogue-v3 init
 uv run catalogue --root /srv/catalogue-v3 config show
@@ -385,6 +392,51 @@ Benchmarks are characterization tools and never claim sustained acceptance:
 uv run python scripts/benchmark-current.py --help
 uv run python scripts/benchmark-capacity.py --help
 ```
+
+### DuckDB engine qualification
+
+The candidate lock selects DuckDB 2.0.0 LTS. Deployment is blocked while the
+existing 32 MiB joined-row fingerprint tests fail on that engine; their memory,
+temporary-space and golden assertions must not be relaxed. No production
+acceptance or performance improvement is claimed. Keep the accepted production
+runtime and whole root unchanged until its replacement passes qualification. Use
+`UV_PROJECT_ENVIRONMENT` to select a separate candidate environment when the
+checkout's `.venv` is also used by production. The engine uses two asynchronous
+I/O workers in addition to the configured SQL workers, with memory-governed
+read-ahead. SQL memory, spill, disk and command limits still apply.
+
+Run cross-engine benchmarks with each environment's Python and matching installed
+CLI. Reports identify the **harness** Python and DuckDB environment; an explicit
+`--executable` must belong to that environment. The report's `lock_sha256` refers
+to the checkout lock, so retain each environment's actual lock and wheel hashes
+alongside the report. Hold application logic and other dependencies fixed and
+record necessary connection-setting differences. The full-pass `--compare`
+option compares saved application code under one engine; it is not a cross-engine
+comparison.
+
+The developer-only qualifier is available through
+`uv run --locked python scripts/qualify-duckdb-upgrade.py --help`. Its `inventory`
+command verifies an idle, checkpointed v4 copy and writes hashes; `convert` copies
+that root into a fresh, disjoint destination with the requested storage format.
+Neither destination nor evidence output may be inside the source; destinations
+must also be outside other catalogue and legacy roots. Use frozen disposable
+copies, not the authoritative root. A failed conversion retains its partial
+destination for diagnosis; preserve it and retry at a new path. The tool alone
+does not qualify performance or authorize a production cutover.
+
+Opening an existing old-format file in 2.0 preserves its storage format. A newly
+created 2.0-format file cannot be opened by 1.5.6. Qualify both formats on fresh,
+disjoint copies, including all private tables and progress, raw references, and
+current/previous releases. Unchanged row counts alone are insufficient. Never
+convert the authoritative root in place or infer compatibility from its filename.
+
+Before native-format cutover, prove a post-write reverse copy into a fresh
+`STORAGE_VERSION 'v1.5.0'` database and verify the complete matching root using the
+old runtime. `COPY FROM DATABASE` omits triggers; reject unexpected objects rather
+than silently losing them. Reverse conversion needs a readable source. If it
+fails after writes, preserve both roots and stop; restoring a stale snapshot
+would lose committed catalogue progress. See DuckDB's
+[storage conversion documentation](https://duckdb.org/docs/2.0/internals/storage).
 
 Use a fresh output directory and an idle, verified seed with no pending work. Pass the
 installed-wheel Python for the harness and the CLI, and repeat `--account-root` for every

@@ -210,7 +210,9 @@ def test_old_omissions_do_not_starve_later_ids(setup):
     calls = []
     run(settings, conn, lambda r: calls.append(r) or httpx.Response(200, json=[]))
     assert [len(r.url.params.get_list("id")) for r in calls] == [100, 100, 1]
-    assert calls[-1].url.params.get_list("id") == ["201"]
+    assert [entity_id for request in calls for entity_id in request.url.params.get_list("id")] == [
+        str(entity_id) for entity_id in range(1, 202)
+    ]
 
 
 def test_missing_parent_omission_is_bounded_and_empty_windows_leave_no_id_state(setup):

@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import sys
 from argparse import Namespace
 from inspect import signature
 from pathlib import Path
@@ -283,9 +284,9 @@ def test_tiny_characterization_with_real_commands(tmp_path, monkeypatch):
     from oddsfox_catalogue.current_rows import project_response
     from oddsfox_catalogue.current_store import apply, initialize
 
-    executable = SCRIPT.parents[1] / ".venv/bin/catalogue"
-    if not executable.is_file():
-        pytest.skip("local catalogue entrypoint unavailable")
+    executable = Path(sys.executable).parent / "catalogue"
+    assert executable.is_file(), f"required catalogue entrypoint missing: {executable}"
+    assert os.access(executable, os.X_OK), f"catalogue entrypoint is not executable: {executable}"
     seed, root, output = tmp_path / "seed", tmp_path / "candidate", tmp_path / "evidence"
     for selected in (seed, root):
         validate_root(selected, initialize=True)

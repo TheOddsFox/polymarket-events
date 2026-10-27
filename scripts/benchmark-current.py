@@ -26,6 +26,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import duckdb
 from filelock import FileLock
 
 REPO = Path(__file__).resolve().parents[1]
@@ -857,6 +858,14 @@ def run(args):
             "cpu_count": os.cpu_count(),
         },
         "cache_policy": "OS caches not flushed; equivalent serial copies, source frozen before timing",
+        "harness_environment": {
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+            "duckdb_version": duckdb.__version__,
+            "duckdb_record_sha256": hashlib.sha256(
+                (importlib.metadata.distribution("duckdb").read_text("RECORD") or "").encode()
+            ).hexdigest(),
+        },
         "settings": asdict(CurrentSettings(seed)),
         "lock_sha256": digest(REPO / "uv.lock"),
     }

@@ -41,7 +41,16 @@ the accepted operational state of this MacBook's database.
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
+This checkout contains an **unqualified DuckDB 2.0 candidate**. Its default `.venv`
+still supplies the accepted production DuckDB 1.5.6 runtime. Select a separate,
+external candidate environment before running the commands below: a default
+`uv sync` or `uv run` would upgrade that production environment. For production,
+continue using the verified-runtime commands in the production root's `HANDOFF.md`.
+The [qualification notes](docs/current-catalogue.md#duckdb-engine-qualification)
+record the failed memory gate; no production upgrade is accepted.
+
 ```sh
+export UV_PROJECT_ENVIRONMENT=/absolute/path/to/catalogue-candidate-venv
 uv sync --locked
 uv run catalogue --help
 uv run catalogue --root /srv/catalogue-v3 init
