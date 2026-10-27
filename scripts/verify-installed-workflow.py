@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 
 from fakes.current_gamma import CurrentGammaServer  # noqa: E402
-from oddsfox_catalogue.current_config import CurrentLimits  # noqa: E402
+from oddsfox_catalogue.current_config import CurrentLimits, safe_path  # noqa: E402
 from oddsfox_catalogue.platform_support import (  # noqa: E402
     is_symlink,
     operator_signals,
@@ -396,7 +396,13 @@ def main() -> int:
             )
         )
     )
-    if output.is_relative_to(REPO):
+    try:
+        output = safe_path(output)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if output.is_relative_to(REPO.resolve()) or any(
+        path.exists() and path.samefile(REPO) for path in (output, *output.parents)
+    ):
         parser.error("installed proof must run outside the checkout")
     if args.output:
         if output.exists() or any(is_symlink(path) for path in (output, *output.parents)):

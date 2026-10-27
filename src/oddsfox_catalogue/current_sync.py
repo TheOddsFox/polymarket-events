@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime
 from types import SimpleNamespace
 
 from . import current_store
@@ -945,6 +946,11 @@ def fetch_unit(
         "passes": passes,
         "api_certificate_version": _api_certificate_version(conn),
     }
+    attempt_metadata = (
+        _pending_attempts_metadata(attempts, lane, wanted, native=native)
+        if attempts is not None
+        else None
+    )
     if existing is not None:
         validate_fetch_pending(settings, conn, existing)
         expected_identity = dict(identity)
@@ -952,6 +958,12 @@ def fetch_unit(
             expected_identity.pop("api_certificate_version")
         if existing["identity"] != expected_identity:
             raise CurrentError("resume the pending repair before starting another")
+        if attempt_metadata is not None:
+            if "attempts" in existing:
+                if existing["attempts"] != attempt_metadata:
+                    raise CurrentError("resume the pending repair before starting another")
+            else:
+                existing = {**existing, "attempts": attempt_metadata}
     requests = (
         [{"endpoint": f"/{lane}/{key}", "params": {}} for key in wanted]
         if native
@@ -965,7 +977,10 @@ def fetch_unit(
         "remaining": requests,
         "raw_id": uuid.uuid4().hex,
         "absence": bool(absence) and native,
+        **({"attempts": attempt_metadata} if attempt_metadata is not None else {}),
     }
+    if attempts is None:
+        attempts = _pending_attempts_from_work(work)
     absence = work.get("absence", False)
     admit(settings, additional_bytes=65536)
     current_store.set_state(conn, "fetch_pending", work)
@@ -1082,6 +1097,7 @@ def validate_fetch_pending(settings, conn, work):
         ids = identity["ids"]
         if not ids or len(ids) > 100 or len(set(ids)) != len(ids):
             raise CurrentError("invalid pending repair IDs")
+        _pending_attempts_from_work(work)
         if not work["remaining"]:
             raise CurrentError("empty pending repair")
         for request in work["remaining"]:
@@ -1128,4 +1144,60 @@ def resume_pending(settings, conn, client):
         identity["ids"],
         progress=identity["progress"],
         native=identity["native"],
+        attempts=_pending_attempts_from_work(work),
     )
+
+
+def _pending_attempts_metadata(attempts, request_lane, ids, *, native):
+    """Encode the scheduler attempt committed with the final response as JSON."""
+    try:
+        lane, attempt_ids, when = attempts
+        if (
+            lane not in (*LANES, "native")
+            or not isinstance(attempt_ids, (list, tuple))
+            or not isinstance(when, datetime)
+            or when.utcoffset() is None
+        ):
+            raise ValueError
+        metadata = [lane, list(attempt_ids), when.isoformat()]
+        _pending_attempts_from_metadata(
+            metadata, {"lane": request_lane, "native": native, "ids": ids}
+        )
+        return metadata
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CurrentError("invalid scheduler attempt metadata") from exc
+
+
+def _pending_attempts_from_work(work):
+    """Validate and restore optional frozen attempt metadata; old checkpoints omit it."""
+    if "attempts" not in work:
+        return None
+    return _pending_attempts_from_metadata(work["attempts"], work["identity"])
+
+
+def _pending_attempts_from_metadata(metadata, identity):
+    try:
+        lane, ids, timestamp = metadata
+        when = datetime.fromisoformat(timestamp)
+        valid_ids = (
+            type(ids) is list
+            and bool(ids)
+            and len(ids) <= 100
+            and all(type(value) in (int, str) for value in ids)
+            and len({str(value) for value in ids}) == len(ids)
+            and {str(value) for value in ids} == {str(value) for value in identity["ids"]}
+        )
+        valid_lane = lane == identity["lane"] or (
+            lane == "native" and identity["lane"] == "markets" and identity["native"]
+        )
+        if (
+            not valid_lane
+            or not valid_ids
+            or when.tzinfo is None
+            or when.utcoffset() is None
+            or timestamp != when.isoformat()
+        ):
+            raise ValueError
+        return lane, ids, when
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise CurrentError("incompatible pending scheduler attempt metadata") from exc

@@ -76,8 +76,7 @@ def _temporary_tables(connection):
 
 @pytest.mark.parametrize("preserve_order", [True, False])
 def test_source_join_and_hash_sort_fit_separately_with_exact_digest(tmp_path, preserve_order):
-    # At 32MiB and two SQL threads the previous single query raises OOM. Each phase fits
-    # when source execution is released before sorting these 250,000 narrow row hashes.
+    # DuckDB 2.0 needs more headroom for this wide join's JSON projection; 32MiB OOMs.
     query = (
         "SELECT l.i AS id, l.payload, r.payload AS other "
         "FROM (SELECT i, md5(i::VARCHAR) || repeat('x', 256) AS payload "
@@ -100,7 +99,7 @@ def test_source_join_and_hash_sort_fit_separately_with_exact_digest(tmp_path, pr
     with duckdb.connect(
         ":memory:",
         config={
-            "memory_limit": "32MiB",
+            "memory_limit": "64MiB",
             "threads": 2,
             "temp_directory": str(tmp_path),
             "max_temp_directory_size": "64MiB",

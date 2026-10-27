@@ -7,6 +7,7 @@ import pytest
 
 from oddsfox_catalogue.current_contract import CurrentError, columns
 from oddsfox_catalogue.current_rows import project_response
+from oddsfox_catalogue.normalization import NormalizationError, _read_json
 
 
 def rows(payload, key="events", **kwargs):
@@ -116,3 +117,35 @@ def test_sanitized_fixture_preserves_native_ids():
     assert all(row["usable"] for row in result.markets)
     assert result.outcomes[0]["asset_id"] == payload["markets"][0]["positionIds"][0]
     assert result.outcomes[2]["asset_id"] == json.loads(payload["markets"][1]["clobTokenIds"])[0]
+
+
+@pytest.mark.parametrize("field", ["outcomes", "clobTokenIds"])
+def test_deeply_nested_market_json_is_quarantined_without_losing_siblings(field):
+    bad_id, good_id, event_id = "9007199254740993", "9007199254740994", "9007199254740995"
+    malformed = market()
+    malformed["id"] = bad_id
+    malformed[field] = "[" * 10_000 + '"Yes"' + "]" * 10_000
+    valid = market()
+    valid["id"] = good_id
+
+    result = rows(
+        [{"id": event_id, "markets": [malformed, valid]}],
+        native_market_ids=[bad_id, good_id],
+    )
+
+    markets = {row["market_id"]: row for row in result.markets}
+    assert result.memberships == {event_id: [bad_id, good_id]}
+    assert result.native_market_ids == {bad_id, good_id}
+    assert not markets[bad_id]["usable"]
+    assert markets[bad_id]["identity_error"] == f"{field} is not a JSON array"
+    assert markets[good_id]["usable"]
+    assert [row["asset_id"] for row in result.outcomes] == [
+        "123456789012345678901234567890",
+        "8",
+    ]
+
+
+def test_deeply_nested_top_level_json_uses_normalization_error():
+    malformed = ("[" * 10_000 + '"Yes"' + "]" * 10_000).encode()
+    with pytest.raises(NormalizationError, match="invalid JSON evidence"):
+        _read_json(malformed)

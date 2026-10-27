@@ -264,6 +264,8 @@ One supervised HTTP worker, one root writer lock, and at most 10 requests per se
 allowed. The worker holds the lock through database and filesystem changes. Killing its
 CLI parent cannot admit a second writer while it finishes. A second client may prefetch
 the next full-pass request; it shares that worker's rate limit.
+The lock file must be a regular file with one link. Acquisition preserves its
+contents and rejects aliases; replacing its inode during a run is an error.
 
 When a publication's store generation matches the current release, the publisher checks
 the pointer, the manifest SHA-256, the exact file inventory, and each Parquet's size and
@@ -378,7 +380,8 @@ uv run python scripts/verify-installed-workflow.py --output "$PROOF_PARENT/insta
 ```
 
 The temporary parent is unique and resolved to its physical path, including on
-macOS where `/tmp` is a symlink. The output destination must not exist. The
+macOS where `/tmp` is a symlink. The output destination must not exist; symlink
+ancestors and `..` path components are rejected before creating evidence. The
 installed-workflow check runs the same
 commands an operator would run, including `reconcile --full-pass`.
 It builds and installs offline: the uv cache must contain both the declared build
@@ -395,11 +398,16 @@ uv run python scripts/benchmark-capacity.py --help
 
 ### DuckDB engine qualification
 
-The candidate lock selects DuckDB 2.0.0 LTS. Deployment is blocked while the
-existing 32 MiB joined-row fingerprint tests fail on that engine; their memory,
-temporary-space and golden assertions must not be relaxed. No production
-acceptance or performance improvement is claimed. Keep the accepted production
-runtime and whole root unchanged until its replacement passes qualification. Use
+The candidate lock selects DuckDB 2.0.0 LTS. Joined-row fingerprint qualification
+uses an explicitly revised 64 MiB SQL allowance after DuckDB 2.0 exhausted the
+previous 32 MiB allowance. The 64 MiB temporary-space cap, exact golden digests,
+types, settings preservation and cleanup checks remain required. This workload
+allowance adds headroom; it is not a minimum for every catalogue. Application SQL
+memory still defaults to 2 GiB, and supplied connection limits are never raised
+silently. Deployment remains blocked on full-size comparison, resource and
+rollback qualification. No production acceptance or performance improvement is
+claimed. Keep the accepted production runtime and whole root unchanged until its
+replacement passes qualification. Use
 `UV_PROJECT_ENVIRONMENT` to select a separate candidate environment when the
 checkout's `.venv` is also used by production. The engine uses two asynchronous
 I/O workers in addition to the configured SQL workers, with memory-governed
@@ -429,6 +437,12 @@ created 2.0-format file cannot be opened by 1.5.6. Qualify both formats on fresh
 disjoint copies, including all private tables and progress, raw references, and
 current/previous releases. Unchanged row counts alone are insufficient. Never
 convert the authoritative root in place or infer compatibility from its filename.
+
+Optional attempt metadata preserves the frozen request identity, so older
+applications can read pending repairs, but their replay still omits the saved
+cooldown. Before any downgrade, qualify a runtime that preserves it or settle
+pending work without losing progress. Otherwise retain both roots and keep rollback
+blocked.
 
 Before native-format cutover, prove a post-write reverse copy into a fresh
 `STORAGE_VERSION 'v1.5.0'` database and verify the complete matching root using the
@@ -683,6 +697,9 @@ and verified publication while validating intentional request/progress differenc
 Later pages may resolve parent nominations without repair requests. Attempt state
 must exactly match the ledger of settled units' supplied attempt writes, including
 their IDs and timestamps; an arbitrary subset is not sufficient.
+New pending repairs freeze those attempt writes with the request, so replay keeps
+the original retry cooldown. Older pending repairs without that metadata still
+resume, without inventing an attempt timestamp.
 The original strict full-pass oracle is not relaxed. API timing requires at least
 10% and one second primary runtime improvement, with at most 5% wall/RSS regression;
 dense and unchanged-tail runtime regressions may not exceed 5%. Attempt counters

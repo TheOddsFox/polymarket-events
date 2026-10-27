@@ -17,6 +17,46 @@ harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 
 
+@pytest.mark.parametrize("spelling", ["direct", "dotdot", "symlink", "case-alias"])
+def test_output_rejects_checkout_aliases_before_creating_files(tmp_path, monkeypatch, spelling):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if spelling == "case-alias":
+        alias = tmp_path / "CHECKOUT"
+        if not alias.exists():
+            pytest.skip("requires a case-insensitive filesystem")
+        output = alias / "proof"
+    elif spelling == "symlink":
+        alias = tmp_path / "alias"
+        alias.symlink_to(checkout, target_is_directory=True)
+        output = alias / "proof"
+    elif spelling == "dotdot":
+        output = outside / ".." / "checkout" / "proof"
+    else:
+        output = checkout / "proof"
+    monkeypatch.setattr(harness, "REPO", checkout)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])
+    monkeypatch.setattr(harness, "verify", lambda output: pytest.fail("must reject before proof"))
+    with pytest.raises(SystemExit) as error:
+        harness.main()
+    assert error.value.code == 2
+    assert list(checkout.iterdir()) == []
+
+
+def test_output_accepts_fresh_physical_directory_outside_checkout(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    output = tmp_path / "external-proof"
+    monkeypatch.setattr(harness, "REPO", checkout)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])
+    monkeypatch.setattr(harness, "verify", lambda path: {"status": "passed"})
+    assert harness.main() == 0
+    assert harness.json.loads((output / "report.json").read_text())["output"] == str(output)
+    assert list(checkout.iterdir()) == []
+
+
 def test_resource_freeze_preserves_inventory_and_detects_tampering(tmp_path):
     (tmp_path / "__init__.py").write_text("project")
     (tmp_path / "cli.py").write_text("profile")

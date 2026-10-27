@@ -96,7 +96,7 @@ def validate_market_ids(values: list[str]) -> list[str]:
 def _read_json(data: bytes) -> Any:
     try:
         return json.loads(data, parse_float=Decimal, parse_constant=lambda _: _invalid_json())
-    except (ValueError, UnicodeError) as exc:
+    except (ValueError, UnicodeError, RecursionError) as exc:
         raise NormalizationError("invalid JSON evidence") from exc
 
 

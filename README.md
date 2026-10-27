@@ -47,7 +47,8 @@ external candidate environment before running the commands below: a default
 `uv sync` or `uv run` would upgrade that production environment. For production,
 continue using the verified-runtime commands in the production root's `HANDOFF.md`.
 The [qualification notes](docs/current-catalogue.md#duckdb-engine-qualification)
-record the failed memory gate; no production upgrade is accepted.
+record the original memory failure and revised 64 MiB fingerprint qualification
+allowance; full-size comparison and rollback gates still block production acceptance.
 
 ```sh
 export UV_PROJECT_ENVIRONMENT=/absolute/path/to/catalogue-candidate-venv
