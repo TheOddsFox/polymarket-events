@@ -468,6 +468,7 @@ def _connection_config(settings):
         "memory_limit": f"{min(MEMORY_BYTES, settings.limits.duckdb_memory_bytes)}B",
         "threads": str(min(THREADS, int(settings.limits.duckdb_threads))),
         "max_temp_directory_size": f"{settings.limits.max_temp_bytes}B",
+        "preserve_insertion_order": "false",
     }
     if pair >= (2, 0):
         config.update(async_threads=config["threads"], read_ahead_depth="-1")

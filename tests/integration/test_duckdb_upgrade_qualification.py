@@ -25,6 +25,30 @@ qualify = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(qualify)
 
 
+@pytest.mark.parametrize("engine", [(1, 5), (2, 0)])
+def test_qualification_connections_use_application_order_policy_and_limits(
+    tmp_path, monkeypatch, engine
+):
+    monkeypatch.setattr(qualify, "_engine_version_pair", lambda: engine)
+    settings = CurrentSettings(
+        tmp_path,
+        limits=CurrentLimits(duckdb_memory_bytes=64 * 1024**2, max_temp_bytes=32 * 1024**2),
+    )
+    config = qualify._connection_config(settings)
+    with duckdb.connect(":memory:", config=config) as connection:
+        assert connection.execute(
+            "SELECT current_setting('preserve_insertion_order')"
+        ).fetchone() == (False,)
+        assert connection.execute("SELECT current_setting('threads')").fetchone() == (2,)
+        assert connection.execute("SELECT current_setting('memory_limit')").fetchone() == (
+            "64.0 MiB",
+        )
+        assert connection.execute(
+            "SELECT current_setting('max_temp_directory_size')"
+        ).fetchone() == ("32.0 MiB",)
+    assert ("async_threads" in config) == (engine >= (2, 0))
+
+
 @pytest.fixture
 def source_root(tmp_path):
     root = tmp_path / "source"
