@@ -90,7 +90,9 @@ def _referenced_raw(conn):
         "SELECT latest_response FROM _membership",
         "SELECT invalidated_response FROM _identity",
     ):
-        ids.update(row[0] for row in conn.execute(query).fetchall() if row[0] is not None)
+        cursor = conn.execute(query)
+        while rows := cursor.fetchmany(8192):
+            ids.update(row[0] for row in rows if row[0] is not None)
     return ids
 
 

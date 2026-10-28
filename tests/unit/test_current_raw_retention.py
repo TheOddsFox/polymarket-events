@@ -1,6 +1,8 @@
 """Raw responses are kept by reference only: store state, pending work and pins."""
 
+import json
 from dataclasses import replace
+from itertools import chain, islice, repeat
 
 import duckdb
 import pytest
@@ -13,6 +15,85 @@ from oddsfox_catalogue.current_store import apply, initialize, set_state
 RECEIPT, MEMBERSHIP, LATEST, INVALIDATED, PENDING, NESTED, UNREFERENCED = (
     format(index, "032x") for index in range(1, 8)
 )
+RAW_BATCH_SIZE = 8192
+RAW_REFERENCE_QUERIES = (
+    "SELECT response FROM _receipts",
+    "SELECT response FROM _membership",
+    "SELECT latest_response FROM _membership",
+    "SELECT invalidated_response FROM _identity",
+)
+
+
+class GeneratedRawCursor:
+    """A large cursor that makes unbounded materialization visible in the test."""
+
+    def __init__(self, rows, count, *, fail_after_batches=None):
+        self.rows = iter(rows)
+        self.remaining = count
+        self.fail_after_batches = fail_after_batches
+        self.batches = 0
+        self.fetchmany_sizes = []
+
+    def fetchall(self):
+        if self.remaining > RAW_BATCH_SIZE:
+            raise AssertionError("large raw reference result fetched without a bound")
+        return self.fetchmany(self.remaining)
+
+    def fetchmany(self, size):
+        if size > RAW_BATCH_SIZE:
+            raise AssertionError("raw reference fetch exceeded the bounded batch size")
+        if self.fail_after_batches is not None and self.batches >= self.fail_after_batches:
+            raise RuntimeError("injected raw reference cursor failure")
+        self.fetchmany_sizes.append(size)
+        self.batches += 1
+        batch = list(islice(self.rows, size))
+        self.remaining -= len(batch)
+        return batch
+
+
+class GeneratedRawConnection:
+    def __init__(self, rows_by_query, sync_values=()):
+        self.rows_by_query = rows_by_query
+        self.sync_values = sync_values
+        self.executed = []
+        self.cursors = []
+
+    def execute(self, query):
+        self.executed.append(query)
+        if query == "SELECT value FROM sync_state":
+            rows = [(value,) for value in self.sync_values]
+            cursor = GeneratedRawCursor(rows, len(rows))
+        else:
+            rows, count = self.rows_by_query[query]
+            cursor = GeneratedRawCursor(rows, count)
+        self.cursors.append(cursor)
+        return cursor
+
+
+def raw_rows_with_none_first_batch(*tail):
+    return chain(repeat((None,), RAW_BATCH_SIZE), ((value,) for value in tail))
+
+
+class FailingRawConnection:
+    def __init__(self, connection):
+        self.connection = connection
+        self.cursor = GeneratedRawCursor(
+            chain(
+                ((RECEIPT,),),
+                repeat((None,), RAW_BATCH_SIZE - 1),
+                ((LATEST,),),
+            ),
+            RAW_BATCH_SIZE + 1,
+            fail_after_batches=1,
+        )
+
+    def execute(self, query, *args, **kwargs):
+        if query == RAW_REFERENCE_QUERIES[0]:
+            return self.cursor
+        return self.connection.execute(query, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
 
 
 @pytest.fixture
@@ -40,6 +121,57 @@ def make_raw(settings, identifier):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "p000001.json.gz").write_bytes(b"1234")
     return directory
+
+
+def test_referenced_raw_streams_large_results_in_bounded_batches():
+    rows_by_query = {
+        query: (raw_rows_with_none_first_batch(*tail), RAW_BATCH_SIZE + len(tail))
+        for query, tail in zip(
+            RAW_REFERENCE_QUERIES,
+            (
+                (RECEIPT, RECEIPT, None),
+                (MEMBERSHIP, MEMBERSHIP),
+                (LATEST, RECEIPT),
+                (INVALIDATED,),
+            ),
+            strict=True,
+        )
+    }
+    connection = GeneratedRawConnection(
+        rows_by_query,
+        [
+            json.dumps({"raw_id": PENDING}),
+            json.dumps({"lanes": [{"nested": {"raw_id": NESTED}}]}),
+        ],
+    )
+
+    assert publisher._referenced_raw(connection) == {
+        RECEIPT,
+        MEMBERSHIP,
+        LATEST,
+        INVALIDATED,
+        PENDING,
+        NESTED,
+    }
+    assert connection.executed == ["SELECT value FROM sync_state", *RAW_REFERENCE_QUERIES]
+    assert all(
+        cursor.fetchmany_sizes and max(cursor.fetchmany_sizes) <= RAW_BATCH_SIZE
+        for cursor in connection.cursors[1:]
+    )
+
+
+def test_reference_scan_failure_aborts_publication_before_raw_prune(store):
+    settings, conn = store
+    garbage = make_raw(settings, UNREFERENCED)
+    unprocessed_reference = make_raw(settings, LATEST)
+    failing = FailingRawConnection(conn)
+
+    with pytest.raises(RuntimeError, match="injected raw reference cursor failure"):
+        publisher.publish(settings, failing)
+
+    assert failing.cursor.fetchmany_sizes == [RAW_BATCH_SIZE]
+    assert garbage.exists()
+    assert unprocessed_reference.exists()
 
 
 def advance(conn, title, index):
