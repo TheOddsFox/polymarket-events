@@ -29,35 +29,52 @@ v2 release; preserve any old root and runtime yourself if you need them.
 
 ## Authoritative production root on this MacBook
 
-The sole authoritative production database is
-`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production/catalogue.duckdb`.
-Its complete root is `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production`,
-accepted on 26 October 2026. Other catalogue roots are recovery or test/evidence
-copies and must not be treated as production.
+Accepted on 29 October 2026, the authoritative root is
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2`. Preserve the whole
+root: database, configuration, `PRODUCTION-STATE.json`, handoff, raw recovery files,
+published releases and pointer. The former
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production` root is a historical runnable
+asset, not a rollback target after the new root has accepted writes.
 
-Use the explicit production `--root` for every production command. Consult that
-root's `HANDOFF.md` for the verified-runtime commands and acceptance evidence;
-`PRODUCTION-STATE.json` records its designation. Preserve the entire root, including
-configuration, raw recovery files and published releases. Do not initialize, replace
-or reset it when following the fresh-installation examples below.
+The permanent production executable is
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue`.
+Run it with a clean environment and the global `--root` before the command:
 
-The `/srv/catalogue-v3` paths in this guide are examples, not the production location
-on this MacBook. A completed pass does not prove absolute upstream completeness or
-sustained freshness; no automatic refresh scheduler is enabled.
+```sh
+CATALOGUE_B='/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue'
+CATALOGUE_ROOT='/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2'
+catalogue_prod() {
+  /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    "$CATALOGUE_B" --root "$CATALOGUE_ROOT" "$@"
+}
+catalogue_prod status
+catalogue_prod verify
+```
+
+The old executable at
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue`
+is retained for verification of a fresh rollback copy made from the complete updated
+root. Stop writers; preserve or clone database, config, pending work, raw files, releases
+and pointers; settle pending work under DuckDB 2.0 when necessary; then verify that copy
+with the old runtime before changing designation. Never restore a stale root over new
+committed writes.
 
 ## Root and configuration
 
-Use an external root. `--root` is a global option and must precede the command.
-`CATALOGUE_ROOT` is the environment alternative.
+Fresh-install examples below remain examples. Never initialize or reset the production
+root. Production continues to use the root's existing configuration and the explicit
+runtime above. The established application limits remain unchanged: 1,200 seconds per
+invocation, 25,000 requests, 4 GiB downloaded, 16 MiB per response, 160 GiB retained,
+16 GiB temporary storage, 8 GiB free-space reserve, 2 GiB SQL memory and two SQL threads.
+DuckDB 2.0's two asynchronous I/O workers and `read_ahead_depth=-1` are engine behavior,
+not new catalogue tuning or a public configuration change. The contract, schema and CLI
+version are unchanged. Metadata.v1 continues to use isolated staging; it does not reuse
+the production root.
 
-The current lock is an unqualified DuckDB 2.0 candidate. Preserve the default
-`.venv` used by the accepted production runtime: select a separate, external
-environment for candidate commands. Running `uv sync` or `uv run` without this
-selection would upgrade the production environment. Production commands must
-continue to use the root's existing verified-runtime handoff.
+Use an external root. Global `--root` must precede the command.
 
 ```sh
-export UV_PROJECT_ENVIRONMENT=/absolute/path/to/catalogue-candidate-venv
 uv sync --locked
 uv run catalogue --root /srv/catalogue-v3 init
 uv run catalogue --root /srv/catalogue-v3 config show
@@ -398,59 +415,35 @@ uv run python scripts/benchmark-capacity.py --help
 
 ### DuckDB engine qualification
 
-The candidate lock selects DuckDB 2.0.0 LTS. Joined-row fingerprint qualification
-uses an explicitly revised 64 MiB SQL allowance after DuckDB 2.0 exhausted the
-previous 32 MiB allowance. The 64 MiB temporary-space cap, exact golden digests,
-types, settings preservation and cleanup checks remain required. This workload
-allowance adds headroom; it is not a minimum for every catalogue. Application SQL
-memory still defaults to 2 GiB, and supplied connection limits are never raised
-silently. Deployment remains blocked on full-size comparison, resource and
-rollback qualification. No production acceptance or performance improvement is
-claimed. Keep the accepted production runtime and whole root unchanged until its
-replacement passes qualification. Use
-`UV_PROJECT_ENVIRONMENT` to select a separate candidate environment when the
-checkout's `.venv` is also used by production. The engine uses two asynchronous
-I/O workers in addition to the configured SQL workers, with memory-governed
-read-ahead. SQL memory, spill, disk and command limits still apply.
+DuckDB 2.0.0 LTS is qualified for the existing full-size v1.0.0+ database format. The
+database was not converted: the native-format conversion trial failed its 2 GiB memory
+gate, so no further conversion is planned. SQL memory (2 GiB), SQL threads (2), temporary
+storage (16 GiB), retained storage (160 GiB), free reserve (8 GiB), and request/download
+ceilings remain unchanged. DuckDB 2.0 adds two asynchronous I/O workers and uses
+`read_ahead_depth=-1`; no public tuning, schema or CLI version changed.
 
-Run cross-engine benchmarks with each environment's Python and matching installed
-CLI. Reports identify the **harness** Python and DuckDB environment; an explicit
-`--executable` must belong to that environment. The report's `lock_sha256` refers
-to the checkout lock, so retain each environment's actual lock and wheel hashes
-alongside the report. Hold application logic and other dependencies fixed and
-record necessary connection-setting differences. The full-pass `--compare`
-option compares saved application code under one engine; it is not a cross-engine
-comparison.
+The three-pair full-size comparison recorded original initial-refresh medians of
+308.753648833 seconds on A and 332.719545458 seconds on B (+7.762%). This slower initial
+refresh is an explicitly reviewed acceptance exception, not a speedup claim. The
+reported sequence, verify, process-tree RSS and individual-process RSS ratios were
+0.9716814, 0.5198431, 1.0317762 and 1.0353859. The all-fixed comparison used 687 requests
+and 2,013,176 downloaded bytes while other host work continued; it does not establish
+cold-cache performance or a universal speedup.
 
-The developer-only qualifier is available through
-`uv run --locked python scripts/qualify-duckdb-upgrade.py --help`. Its `inventory`
-command verifies an idle, checkpointed v4 copy and writes hashes; `convert` copies
-that root into a fresh, disjoint destination with the requested storage format.
-Neither destination nor evidence output may be inside the source; destinations
-must also be outside other catalogue and legacy roots. Use frozen disposable
-copies, not the authoritative root. A failed conversion retains its partial
-destination for diagnosis; preserve it and retry at a new path. The tool alone
-does not qualify performance or authorize a production cutover.
+Capacity remained within all resource gates: A completed the original 803-request run
+and a separate 14-request real-retry proof; B completed 864 attempts and downloaded
+224,021,005 bytes with one injected 503 successfully retried. Recovery, committed-write
+no-HTTP-replay, full 11-table/55,267,774-row equivalence with DuckDB 1.5.6, unchanged
+physical database bytes, and verification of a relocated updated fixture with the
+preserved 1.5.6 runtime passed. The fast/full suites (1,725 tests), distribution audit
+and installed-workflow evidence were reused because application source and wheel hashes
+were unchanged; the affected 92 tests and one targeted regression also passed.
 
-Opening an existing old-format file in 2.0 preserves its storage format. A newly
-created 2.0-format file cannot be opened by 1.5.6. Qualify both formats on fresh,
-disjoint copies, including all private tables and progress, raw references, and
-current/previous releases. Unchanged row counts alone are insufficient. Never
-convert the authoritative root in place or infer compatibility from its filename.
+These are bounded qualification results, not a live full reconciliation or sustained
+freshness claim. See the [2026-10-29 qualification and cutover record](current-catalogue-acceptance.md#duckdb-2-engine-qualification-and-cutover-2026-10-29)
+for evidence identifiers and the post-cutover live values.
 
-Optional attempt metadata preserves the frozen request identity, so older
-applications can read pending repairs, but their replay still omits the saved
-cooldown. Before any downgrade, qualify a runtime that preserves it or settle
-pending work without losing progress. Otherwise retain both roots and keep rollback
-blocked.
-
-Before native-format cutover, prove a post-write reverse copy into a fresh
-`STORAGE_VERSION 'v1.5.0'` database and verify the complete matching root using the
-old runtime. `COPY FROM DATABASE` omits triggers; reject unexpected objects rather
-than silently losing them. Reverse conversion needs a readable source. If it
-fails after writes, preserve both roots and stop; restoring a stale snapshot
-would lose committed catalogue progress. See DuckDB's
-[storage conversion documentation](https://duckdb.org/docs/2.0/internals/storage).
+Joined-row fingerprint qualification retains its documented 64 MiB SQL and 64 MiB temporary-space test allowance, exact golden digests and types, and cleanup checks. Application connection limits are unchanged.
 
 Use a fresh output directory and an idle, verified seed with no pending work. Pass the
 installed-wheel Python for the harness and the CLI, and repeat `--account-root` for every

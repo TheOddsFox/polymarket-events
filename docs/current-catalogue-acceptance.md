@@ -1,14 +1,12 @@
 # Current catalogue v1 acceptance
 
-**Status: pending.** No v1 acceptance run has been recorded. Earlier measurements were
-taken under the backup and import design that v1 removes, so they are not carried forward.
-
-The campaign instructions below require their recorded source/harness revision,
-original DuckDB 1.5.6 lock and trusted frozen packages in a disposable checkout.
-The current DuckDB 2.0 candidate lock does not reproduce those measurements.
-Select a separate external `UV_PROJECT_ENVIRONMENT` for that frozen checkout;
-never reuse the accepted production `.venv`. See the
-[environment instructions](current-catalogue.md#root-and-configuration).
+**Status: full-catalogue runtime and sustained freshness acceptance remain pending.**
+DuckDB 2.0 engine qualification and production cutover were accepted separately on
+29 October 2026; see the [dated cutover record](#duckdb-2-engine-qualification-and-cutover-2026-10-29).
+The historical campaign instructions below require their recorded source/harness,
+DuckDB 1.5.6 lock and frozen packages in a disposable checkout. The current lock
+and default development environment select qualified DuckDB 2.0.0. Production uses
+its permanent executable; the preserved 1.5.6 environment is reserved for recovery.
 
 ## Bounded live follow-up, 2026-10-22
 
@@ -319,3 +317,59 @@ It includes frozen packages, patches, candidate tests, measured harness, reports
 logs; large synthetic databases remain beside it. Candidate-only traversal-count
 tests stay in that private bundle; unconditional application regressions ship.
 Windows acceptance is retired; deployment acceptance remains open.
+
+## DuckDB 2 engine qualification and cutover, 2026-10-29
+
+**Status: production cutover accepted after one supervised live refresh and verification.**
+
+- Accepted UTC: `2026-10-29T02:10:46.565119+00:00`
+- Production root: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2`
+- Runtime: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue`
+- Live generation: `5670`
+- Published release: `dd2885a834044c38a7b2bda996f12180`
+- Post-cutover requests: `1321`
+- Post-cutover results: `refresh published; verification valid; store and published generation match`
+- Evidence directory: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-duckdb2-qualification-20261028T080656Z-fqf71tcz/evidence`
+
+DuckDB 2.0.0 passed the bounded full-size application, resource, retry, recovery and
+old-runtime equivalence checks described in the operator guide. Production retains
+the original v1.0.0+ database format; no native-format conversion was applied. The
+initial-refresh median was 7.762% slower and was accepted as an explicit reviewed
+exception. Other reported phase/RSS ratios are characterization measurements, not a
+universal speedup claim. Host work continued during measurement; no cold-cache claim,
+full live reconciliation or sustained-freshness claim is made.
+
+The application source and wheel were unchanged. The existing fast/full suites (1,725 tests), distribution audit and
+installed-workflow proofs were reused, and the affected 92 tests plus one targeted regression
+passed. Limits and public contract remain unchanged. The previous production root is
+retained as a historical runnable asset, not a rollback target after new writes.
+
+Rollback requires stopping writers, preserving or cloning the complete updated root,
+settling pending work under DuckDB 2.0 if needed, and verifying a fresh updated copy
+with `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue`
+before changing designation. Never restore a stale pre-cutover root over committed
+updates.
+
+The supervised refresh took 931.794859625 seconds, made 1,321 HTTP attempts, and downloaded 1,000,808,180 bytes without retries. Peak process-tree RSS was 3,747,676,160 bytes; peak allocated temporary storage was 2,541,191,168 bytes. The live verification passed. Active overdue count remains 19,998 and parent-event repairs 7,452; this ordinary refresh does not settle the reconciliation backlog.
+
+Runtime native SHA-256: `1e0c41d7d52834b43bf66c1e8b25d6aeee7911609515c9563383b3ffb28919b3`.
+Application wheel SHA-256: `a22b492edc43503df4d37d396c65663c11b07b6aa3a6d6b12e7e7932e4f1b709`.
+Live command/resource reports are under `evidence/production-cutover-20261029`;
+qualification acceptance and independent verification are recorded alongside them.
+
+The checkout's default `.venv` was synced with the existing lock using
+`UV_PROJECT_ENVIRONMENT="$PWD/.venv" UV_CACHE_DIR=/private/tmp/duckdb-finish-20261028/uv-cache UV_LINK_MODE=copy uv sync --locked --offline`.
+Python remains 3.12.13; DuckDB changed from 1.5.6 to exactly 2.0.0, with no other
+installed dependency version changes. Package consistency, offline CLI help and a
+read-only production-status command passed. Production continues to use its permanent
+executable rather than the development environment.
+
+After independent production review and verification passed, cleanup removed 34 idle
+disposable paths and preserved 631 frozen input artifacts. Both production roots,
+both permanent runtimes, one immutable baseline and all audit evidence remain.
+The observed volume free-space increase was 32,988,098,560 bytes; APFS sharing and
+competing host work prevent exact attribution. `cleanup-result.json` lists every
+removed path and preserved artifact. The temporary cache in the sync command above
+was removed after use. Independent reports are `production-final-review.json` and
+`production-final-independent-verification.json`; post-cleanup verification is
+recorded separately.

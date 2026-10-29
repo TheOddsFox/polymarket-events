@@ -20,6 +20,7 @@ import pytest
 
 from fakes.capacity_source import CapacitySource
 from fakes.world import make_event, make_market
+from oddsfox_catalogue.capture.writer import write_page
 from oddsfox_catalogue.current_config import CurrentSettings
 from oddsfox_catalogue.current_rows import project_response
 from oddsfox_catalogue.current_store import apply, initialize
@@ -238,27 +239,40 @@ def test_database_and_audit_symlinks_cannot_escape_seed_or_overwrite_evidence(se
         {"positionIds": ["1", "1"]},
     ],
 )
-def test_unsupported_unusable_identity_fails_closed_without_inventing_assets(
+def test_unsupported_unusable_identity_roundtrips_verified_raw_without_inventing_assets(
     seed, tmp_path, mutation
 ):
     raw = make_market("13", "Unusable")
     raw.update(mutation)
+    response_id = "c" * 32
+    received_at = "2026-01-01T00:01:00Z"
+    write_page(
+        seed / "raw" / response_id,
+        1,
+        json.dumps(raw, separators=(",", ":")).encode(),
+        {
+            "request": {"endpoint": "/markets/13", "params": {}},
+            "received_at": received_at,
+            "status": 200,
+        },
+    )
     with duckdb.connect(str(seed / "catalogue.duckdb")) as conn:
         apply(
             conn,
-            project_response(
-                [raw], "markets", received_at="2026-01-01T00:00:00Z", response_id="bad"
-            ),
+            project_response([raw], "markets", received_at=received_at, response_id=response_id),
         )
         assert conn.execute("SELECT usable FROM markets WHERE market_id='13'").fetchone() == (
             False,
         )
     with CapacitySource(seed, tmp_path / "audit", delay_s=0) as source:
-        assert get(source, "/markets?id=10&id=13&limit=2") == (500, {"error": "source failed"})
-        assert source.stats["emitted_markets"] == 0
-        assert source.failure == "source read failed"
+        status, records = get(source, "/markets?id=10&id=13&limit=2")
+        assert status == 200
+        retained = next(record for record in records if record["id"] == "13")
+        assert retained == raw
+        assert source.stats["emitted_markets"] == 2
+        assert source.failure is None
         entry = json.loads((tmp_path / "audit").read_text())
-        assert entry["emitted_ids"] == []
+        assert entry["emitted_ids"] == ["10", "13"]
 
 
 def test_real_output_overflow_retains_failed_bounded_log_and_report(tmp_path, monkeypatch):

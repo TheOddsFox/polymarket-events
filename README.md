@@ -12,24 +12,59 @@ export command.
 
 ## Authoritative production database on this MacBook
 
-The **main production database** is:
+Accepted on 29 October 2026, the sole production root is
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2`. Keep the complete
+root, including `config.toml`, raw recovery files, releases and the publication pointer.
+The previous `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production` root is retained
+as a historical runnable asset. It is not a rollback point after the new root receives
+writes.
 
-```text
-/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production/catalogue.duckdb
+Production uses the permanent DuckDB 2.0 runtime at
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue`.
+Use an isolated environment and pass the global `--root` before each command:
+
+```sh
+CATALOGUE_B='/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue'
+CATALOGUE_ROOT='/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2'
+catalogue_prod() {
+  /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    "$CATALOGUE_B" --root "$CATALOGUE_ROOT" "$@"
+}
+
+catalogue_prod status
+catalogue_prod verify
+# Run only when operationally needed:
+catalogue_prod refresh
+catalogue_prod reconcile
 ```
 
-Its containing directory, `catalogue-production`, is the **sole authoritative
-production root**, accepted on 26 October 2026. Keep the entire root: configuration,
-raw recovery files and published releases are required alongside the database.
-Other catalogue roots are recovery copies or test/evidence data, not production.
+Do not initialize, replace or reset the production root. The old DuckDB 1.5.6 runtime at
+`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue`
+is reserved for verifying a fresh rollback copy of the complete updated root. Stop all
+writers, preserve or clone the updated root (including pending work and raw/releases),
+settle pending work under DuckDB 2.0 if needed, and verify that fresh copy with the old
+runtime before changing the production designation. Never restore the stale old
+production root after new writes.
 
-Use this explicit root for production commands; do not run `init` on it. Its local
-`HANDOFF.md` contains the verified-runtime commands and acceptance evidence, and
-`PRODUCTION-STATE.json` records its accepted designation. The `/srv/catalogue-v3`
-paths below are examples for a separate fresh installation, not this MacBook's database.
+The service remains manually operated; no scheduler, automatic full pass, or sustained
+freshness claim is enabled. See the operator guide and acceptance record for the
+qualification scope and measured limitations.
 
-The completed full pass does not establish absolute upstream completeness or sustained
-freshness. Refresh remains manual; no scheduler is enabled.
+For `polymarket-market-data`, `--events-executable` selects the catalogue runtime;
+point it at `CATALOGUE_B`. Its own `--root` remains the market-data store. Example:
+
+```sh
+polymarket-market-data --root /absolute/path/market-data run \
+  --market-id 667082 --feed clob-history \
+  --start 2026-10-28T10:00:00Z --end 2026-10-28T11:00:00Z --duration 60 \
+  --events-executable "$CATALOGUE_B"
+```
+
+Other readers should use the new production root only where they already expose a
+catalogue-root option. Polygon settlements continues to consume a verified metadata
+bundle through its existing `--metadata` input. Metadata.v1 production remains staged
+under its isolated producer root; do not point that producer at the production root.
 
 ## Usage and verification
 
@@ -41,17 +76,12 @@ the accepted operational state of this MacBook's database.
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
-This checkout contains an **unqualified DuckDB 2.0 candidate**. Its default `.venv`
-still supplies the accepted production DuckDB 1.5.6 runtime. Select a separate,
-external candidate environment before running the commands below: a default
-`uv sync` or `uv run` would upgrade that production environment. For production,
-continue using the verified-runtime commands in the production root's `HANDOFF.md`.
-The [qualification notes](docs/current-catalogue.md#duckdb-engine-qualification)
-record the original memory failure and revised 64 MiB fingerprint qualification
-allowance; full-size comparison and rollback gates still block production acceptance.
+The lock selects qualified DuckDB 2.0.0. Development uses the checkout's `.venv`;
+production uses the permanent executable above. The existing storage format and
+public contract are unchanged. See the [qualification notes](docs/current-catalogue.md#duckdb-engine-qualification)
+for the accepted timing tradeoff and recovery proof.
 
 ```sh
-export UV_PROJECT_ENVIRONMENT=/absolute/path/to/catalogue-candidate-venv
 uv sync --locked
 uv run catalogue --help
 uv run catalogue --root /srv/catalogue-v3 init

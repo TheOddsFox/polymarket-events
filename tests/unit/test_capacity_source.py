@@ -9,6 +9,7 @@ import pytest
 
 from fakes.capacity_source import MAX_AUDIT_BYTES, CapacitySource
 from fakes.world import make_event, make_market
+from oddsfox_catalogue.capture.writer import write_page
 from oddsfox_catalogue.current_rows import project_response
 from oddsfox_catalogue.current_store import apply, initialize
 
@@ -54,19 +55,47 @@ def seed(tmp_path):
     market["positionIds"] = [str(10**75 + 1), str(10**75 + 2)]
     null = make_market("12", "Unknown")
     null["closed"] = None
+    unresolved = make_market(
+        "13", "Home or away", version="v1", outcomes=("Home Team", "Away Team")
+    )
+    unresolved.pop("clobTokenIds")
+    unresolved.pop("positionIds")
+    empty = make_market("14", "Unresolved outcome", version="v1")
+    empty.update(outcomes="[]", outcomePrices="[]", lastTradePrice=None, bestBid=None, bestAsk=None)
+    empty.pop("clobTokenIds")
+    empty.pop("positionIds")
     events = [
         make_event("1", "Open", markets=[market, null]),
         make_event("2", "Closed", closed=True, markets=[make_market("11", "Closed", closed=True)]),
         make_event("3", "Empty"),
         make_event("4", "Shared", markets=[market]),
+        make_event("5", "Unusable", markets=[unresolved, empty]),
     ]
     apply(
         conn,
         project_response(events, "events", received_at="2026-01-01T00:00:00Z", response_id="seed"),
     )
-    conn.execute(
-        "INSERT INTO markets (venue,market_id,source_market_version,protocol,usable,identity_error) VALUES ('polymarket','13','v1','ctf',false,'CTF market lacks clobTokenIds'),('polymarket','14','v1','ctf',false,'outcomes must contain nonempty labels')"
-    )
+    for raw_market, response_id, received_at in (
+        (unresolved, "0000000000000000000000000000000d", "2026-01-01T00:00:13Z"),
+        (empty, "0000000000000000000000000000000e", "2026-01-01T00:00:14Z"),
+    ):
+        body = json.dumps(raw_market, separators=(",", ":")).encode()
+        write_page(
+            root / "raw" / response_id,
+            1,
+            body,
+            {
+                "request": {"endpoint": f"/markets/{raw_market['id']}", "params": {}},
+                "received_at": received_at,
+                "status": 200,
+            },
+        )
+        apply(
+            conn,
+            project_response(
+                [raw_market], "markets", received_at=received_at, response_id=response_id
+            ),
+        )
     conn.close()
     return root
 
@@ -93,10 +122,12 @@ def test_frozen_full_shapes_and_controls(seed, tmp_path):
         assert get(source, "/events/3")[1]["markets"] == []
         assert get(source, "/markets?id=12&limit=1&closed=false")[1][0]["closed"] is None
         assert get(source, "/markets?id=10&id=11&limit=2&closed=true")[1][0]["id"] == "11"
-        assert get(source, "/events?limit=1&order=id&ascending=false")[1][0]["id"] == "4"
-        assert get(source, "/markets/13")[1]["outcomes"] == ["Yes", "No"]
-        assert "clobTokenIds" not in get(source, "/markets/13")[1]
-        assert get(source, "/markets/14")[1]["outcomes"] == []
+        assert get(source, "/events?limit=1&order=id&ascending=false")[1][0]["id"] == "5"
+        market_13 = get(source, "/markets/13")[1]
+        assert json.loads(market_13["outcomes"]) == ["Home Team", "Away Team"]
+        assert "clobTokenIds" not in market_13
+        assert "positionIds" not in market_13
+        assert json.loads(get(source, "/markets/14")[1]["outcomes"]) == []
         assert get(source, "/events/99")[0] == 404
         assert get(source, "/events?id=99&limit=1")[1] == []
         status, mixed = get(
@@ -183,11 +214,12 @@ def test_100_id_lookup_cost(seed, tmp_path):
 
 def test_query_count_is_constant_per_batch(seed, tmp_path):
     with CapacitySource(seed, tmp_path / "queries", delay_s=0) as source:
-        for kind, expected in (("markets", 3), ("events", 5)):
-            for ids in (["1"], list(map(str, range(1, 101)))):
+        batches = (["1"], list(map(str, range(1, 101))))
+        for kind, expected in (("markets", (3, 4)), ("events", (5, 6))):
+            for ids, query_count in zip(batches, expected, strict=True):
                 before = source.stats.get("sql_queries", 0)
                 source.records(kind, ids)
-                assert source.stats["sql_queries"] - before == expected
+                assert source.stats["sql_queries"] - before == query_count
 
 
 def test_supplied_symlink_and_changed_seed_rejected(seed, tmp_path):

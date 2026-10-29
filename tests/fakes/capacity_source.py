@@ -8,17 +8,22 @@ import re
 import stat
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import duckdb
 
+from oddsfox_catalogue.capture.writer import read_body, read_manifest
 from oddsfox_catalogue.current_config import safe_path
+from oddsfox_catalogue.current_rows import entity_id
+from oddsfox_catalogue.gamma.paginators import unpack
 
 MAX_RESPONSE_BYTES = 16 * 1024**2
 MAX_AUDIT_BYTES = 128 * 1024**2
 _ID = re.compile(r"[1-9][0-9]{0,19}\Z")
+_RESPONSE_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
 class ClientResponseLimitExceeded(OverflowError):
@@ -84,6 +89,7 @@ class CapacitySource:
         self.controls = {}
         self.high = {}
         self.faults = False
+        self._fault_on_request = None
         self.failure = None
         try:
             for kind in ("events", "markets"):
@@ -173,6 +179,66 @@ class CapacitySource:
             cursor.close()
         return rows
 
+    def _retained_market_records(self, market_ids):
+        """Read verified native market bodies only for selected unusable markets."""
+        if not market_ids:
+            return {}
+        receipts = self._query(
+            "SELECT id,response,CAST(receipt AS VARCHAR) AS receipt_text FROM _receipts "
+            "WHERE kind='market' AND venue='polymarket' AND id IN (SELECT unnest(?))",
+            market_ids,
+        )
+        by_market = {}
+        for receipt in receipts:
+            market_id = receipt["id"]
+            if market_id not in market_ids or market_id in by_market:
+                raise RuntimeError("invalid retained market receipt selection")
+            by_market[market_id] = receipt
+
+        records = {}
+        for market_id in market_ids:
+            receipt = by_market.get(market_id)
+            response_id = receipt.get("response") if receipt else None
+            if not isinstance(response_id, str) or not _RESPONSE_ID.fullmatch(response_id):
+                raise RuntimeError("retained native market receipt is missing or invalid")
+            raw_dir = self.seed_root / "raw" / response_id
+            manifest = read_manifest(raw_dir / "p000001.manifest.json", trusted_root=self.seed_root)
+            if (
+                manifest is None
+                or type(manifest.get("seq")) is not int
+                or manifest.get("seq") != 1
+                or type(manifest.get("status")) is not int
+                or manifest.get("status") != 200
+                or manifest.get("request") != {"endpoint": f"/markets/{market_id}", "params": {}}
+            ):
+                raise RuntimeError("retained native market receipt does not match request")
+            try:
+                receipt_at = datetime.fromisoformat(receipt["receipt_text"])
+                manifest_at = datetime.fromisoformat(manifest["received_at"].replace("Z", "+00:00"))
+                if (
+                    receipt_at.utcoffset() is None
+                    or manifest_at.utcoffset() is None
+                    or receipt_at.astimezone(UTC) != manifest_at.astimezone(UTC)
+                ):
+                    raise ValueError("receipt timestamp mismatch")
+                body = read_body(
+                    raw_dir,
+                    manifest,
+                    trusted_root=self.seed_root,
+                    max_body_bytes=16 * 1024**2,
+                )
+                payload = json.loads(body)
+                found, cursor = unpack(payload, "markets")
+                if cursor is not None or len(found) != 1 or not isinstance(found[0], dict):
+                    raise ValueError("native market response has an invalid shape")
+                record = found[0]
+                if entity_id(record.get("id")) != market_id:
+                    raise ValueError("native market response ID mismatch")
+            except Exception as exc:
+                raise RuntimeError("retained native market response is invalid") from exc
+            records[market_id] = record
+        return records
+
     def records(self, kind, ids, closed=None):
         if (
             kind not in ("events", "markets")
@@ -229,9 +295,15 @@ class CapacitySource:
         parent_map = {}
         for row in parents:
             parent_map.setdefault(row["market_id"], []).append({"id": row["event_id"]})
+        unusable_ids = [row["market_id"] for row in market_rows if not row["usable"]]
+        retained = self._retained_market_records(unusable_ids)
         markets = {}
         for row in market_rows:
             key = row["market_id"]
+            if not row["usable"]:
+                raw = {**retained[key], "events": parent_map.get(key, [])}
+                markets[key] = raw
+                continue
             raw = {name: row[name] for name in ("question", "slug", "active", "closed", "archived")}
             raw.update(
                 id=key,
@@ -244,12 +316,6 @@ class CapacitySource:
             for field, name in (("clob_token_id", "clobTokenIds"), ("position_id", "positionIds")):
                 if identity and all(o[field] is not None for o in identity):
                     raw[name] = [o[field] for o in identity]
-            if not row["usable"]:
-                error = row["identity_error"]
-                if error == "CTF market lacks clobTokenIds":
-                    raw["outcomes"] = ["Yes", "No"]
-                elif error != "outcomes must contain nonempty labels":
-                    raise RuntimeError("unsupported unusable source identity")
             markets[key] = raw
         result = []
         if kind == "markets":
@@ -430,7 +496,7 @@ class CapacitySource:
             self._check_identity()
             kind, ids, closed, native, keyset, cursor_args = self._request(handler.path)
             time.sleep(self.delay_s)
-            if self.faults and number % 1000 == 0:
+            if self.faults and (number == self._fault_on_request or number % 1000 == 0):
                 status, payload = 503, {"error": "injected failure"}
                 self.stats["faults"] += 1
             else:
@@ -511,6 +577,7 @@ class CapacitySource:
 
     def enable_faults(self):
         self.faults = True
+        self._fault_on_request = self.stats["requests"] + 1
 
     def close(self):
         if getattr(self, "server", None) is not None:
