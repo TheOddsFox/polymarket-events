@@ -45,6 +45,7 @@ from fakes.world import make_event, make_market  # noqa: E402
 from oddsfox_catalogue.current_config import (  # noqa: E402
     CurrentSettings,
     connect_store,
+    data_path,
     safe_path,
     validate_root,
 )
@@ -477,6 +478,7 @@ def phase_attribution(
 
 def _warmup_native_profiles(root: Path, output: Path, label: str, captured: dict, settings) -> dict:
     """Replay the slowest actual bounded lookup/write on a disposable clone."""
+    output = data_path(output)
     profile_dir = output / f"native-profile-{label}"
     profile_dir.mkdir(parents=True, exist_ok=False)
     database = profile_dir / "diagnostic.duckdb"
@@ -973,6 +975,7 @@ def create_seed(
     entity_id_stride: int = 1,
     publish: bool = True,
 ) -> dict:
+    root = data_path(root)
     events, markets, distribution = build_dataset(
         event_count,
         market_count,
@@ -1044,6 +1047,7 @@ def create_seed(
 
 def create_api_seed(root: Path, workload: str, budget: Budget | None = None) -> dict:
     """Freeze one source catalogue and the matching initial workspace for an API workload."""
+    root = data_path(root)
     require(workload in API_WORKLOADS, "unknown API workload")
     if budget is not None:
         budget.admit(0)
@@ -1281,6 +1285,7 @@ def create_api_seed(root: Path, workload: str, budget: Budget | None = None) -> 
 
 
 def copy_runtime(target: Path, source: Path | None = None) -> str:
+    target = data_path(target)
     source = source or REPO / "src" / "oddsfox_catalogue"
     target.mkdir(parents=True)
     casefolded: set[str] = set()
@@ -1339,6 +1344,7 @@ def validate_tree(root: Path, *, python_only=False) -> None:
 
 
 def copy_root(source: Path, target: Path) -> None:
+    target = data_path(target)
     shutil.copytree(source, target, symlinks=False)
 
 
@@ -1439,7 +1445,7 @@ def prepare_api_seed(
 ) -> dict:
     """Build a workload seed in the existing supervised, shared-budget worker."""
     require(workload in API_WORKLOADS, "unknown API workload")
-    output = safe_path(output)
+    output = data_path(output)
     require(not output.exists(), "API seed output must be fresh")
     output.parent.mkdir(parents=True, exist_ok=True)
     result = supervised_prepare(
@@ -1467,7 +1473,7 @@ def claim_resource_diagnostics(
 ) -> dict:
     """Measure synthetic claim-index cost; do not infer a production admission model."""
     package = safe_path(package)
-    output = safe_path(output)
+    output = data_path(output)
     require(package.is_dir() and not is_symlink(package), "claim candidate package is unsafe")
     result_root = output / "claim-scale"
     require(not result_root.exists(), "claim diagnostic output must be fresh")
@@ -1519,6 +1525,7 @@ def validate_argv(output: Path, profile: str, baseline: Path, candidate_package:
 def supervised(
     command: list[str], output: Path, package_root: Path, budget: Budget, log: Path
 ) -> dict:
+    output, log = data_path(output), data_path(log)
     budget.admit(1)
     timeout = min(1200, budget.remaining)
     if timeout <= 0:
@@ -1559,6 +1566,7 @@ def supervised_prepare(
     log: Path,
     package_root: Path | None = None,
 ) -> dict:
+    output, log = data_path(output), data_path(log)
     budget.admit(1)
     timeout = budget.remaining
     from importlib.util import module_from_spec, spec_from_file_location
@@ -2583,6 +2591,7 @@ def run_api_workload(
 
 
 def atomic_write_json(path: Path, value: dict) -> None:
+    path = data_path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
     temporary.replace(path)
@@ -2919,6 +2928,7 @@ def run_claim_scale_diagnostics(root: Path, *, extended: bool = False) -> dict:
     from oddsfox_catalogue.current_store import initialize
     from oddsfox_catalogue.runlock import run_lock
 
+    root = data_path(root)
     root.mkdir(parents=True, exist_ok=False)
     scales = []
     progress_path = root / "claim-scale-progress.json"
@@ -3135,6 +3145,7 @@ def run_sample(
     workload: str | None = None,
     attribution: bool = False,
 ) -> dict:
+    output = data_path(output)
     require(not attribution or warmup, "attribution is available only for unscored warm-ups")
     root = output / f"root-{label}"
     log = output / f"worker-{label}.log"
@@ -3290,6 +3301,8 @@ def worker(
     from oddsfox_catalogue.gamma.http import CaptureStopped
     from oddsfox_catalogue.runlock import run_lock
 
+    root, output = data_path(root), data_path(output)
+    profile = data_path(profile) if profile is not None else None
     require(not attribution or profile is None, "V5 attribution warm-ups must not enable cProfile")
 
     started = time.monotonic()
@@ -3726,6 +3739,7 @@ def worker(
 
 def scheduler_diagnostics_worker(seed: Path, root: Path) -> int:
     """Run bounded, read-only scheduler queries at two synthetic scales."""
+    root = data_path(root)
     actual_package = Path(oddsfox_catalogue.__file__).resolve().parent
     expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
     require(actual_package == expected_package, "scheduler diagnostic imported a different runtime")
@@ -3932,7 +3946,8 @@ def snapshot_catalogue_unrecalibrated(source: Path, target: Path, requests_path:
     from oddsfox_catalogue.current_config import CurrentLimits, load_current_settings
     from oddsfox_catalogue.runlock import run_lock
 
-    source, target, requests_path = map(safe_path, (source, target, requests_path))
+    source = data_path(source)
+    target, requests_path = data_path(target), data_path(requests_path)
     validate_disjoint(source, target)
     validate_disjoint(source, requests_path)
     validate_disjoint(target, requests_path)
@@ -3992,7 +4007,7 @@ def locked_catalogue_hash(source: Path) -> dict:
     from oddsfox_catalogue.current_config import load_current_settings
     from oddsfox_catalogue.runlock import run_lock
 
-    source = safe_path(source)
+    source = data_path(source)
     require(source.is_dir() and not is_symlink(source), "catalogue source root is unsafe")
     validate_tree(source)
     settings = load_current_settings(source)
@@ -4007,7 +4022,7 @@ def prepare_v6_snapshot(source: Path, requests_path: Path) -> dict:
     from oddsfox_catalogue.current_config import load_current_settings
     from oddsfox_catalogue.current_publish import verify_current
 
-    source, requests_path = map(safe_path, (source, requests_path))
+    source, requests_path = data_path(source), data_path(requests_path)
     validate_disjoint(source, requests_path)
     require(source.is_dir() and not is_symlink(source), "V6 snapshot root is unsafe")
     require(
@@ -4410,7 +4425,8 @@ def _verify_fixed_work_receipts(conn, request_spec: dict, stamp: datetime) -> di
 
 def claim_resource_worker(source_root: Path, target_root: Path, output: Path) -> int:
     """Build and exercise the private claim-index experiment on a fresh full-size copy."""
-    source_root, target_root, output = map(safe_path, (source_root, target_root, output))
+    source_root = data_path(source_root)
+    target_root, output = data_path(target_root), data_path(output)
     # Validate every path before creating a report or entering the failure-persistence
     # handler. A malformed output path must never be used to write into the read-only
     # source tree, even when the diagnostic fails immediately.
@@ -4735,9 +4751,9 @@ def fixed_catalogue_worker(
     from oddsfox_catalogue.runlock import run_lock
 
     started = time.monotonic()
-    source_root, root, output, requests_path = map(
-        safe_path, (source_root, root, output, requests_path)
-    )
+    source_root = data_path(source_root)
+    root, output = data_path(root), data_path(output)
+    requests_path = safe_path(requests_path)
     validate_disjoint(source_root, root)
     validate_disjoint(source_root, output)
     validate_disjoint(source_root, requests_path)
@@ -5272,6 +5288,7 @@ def parser():
 
 
 def _save(path: Path, report: dict):
+    path = data_path(path)
     temp = path.with_suffix(".pending")
     temp.write_text(json.dumps(report, indent=2, default=str) + "\n")
     temp.replace(path)
@@ -5316,7 +5333,7 @@ def run(args) -> int:
         return claim_resource_worker(Path(source_root), Path(target_root), Path(args.output))
     if args._scheduler_diagnostics:
         seed, root = args._scheduler_diagnostics
-        root = Path(root)
+        root = data_path(Path(root))
         root.mkdir(parents=True, exist_ok=False)
         return scheduler_diagnostics_worker(Path(seed), root)
     if args._sample:
@@ -5335,9 +5352,10 @@ def run(args) -> int:
     if args._prepare:
         try:
             events, markets = PROFILES[args.profile]
-            seed = Path(args.output) / "seed"
+            output = data_path(args.output)
+            seed = output / "seed"
             distribution = create_seed(seed, events, markets)
-            runtime = Path(args.output) / "runtime" / "oddsfox_catalogue"
+            runtime = output / "runtime" / "oddsfox_catalogue"
             runtime.parent.mkdir(parents=True, exist_ok=True)
             runtime_hash = copy_runtime(runtime, Path(oddsfox_catalogue.__file__).resolve().parent)
             print(
@@ -5358,7 +5376,7 @@ def run(args) -> int:
             return 3
     if args._prepare_api_seed:
         try:
-            seed = Path(args.output)
+            seed = data_path(args.output)
             require(not seed.exists(), "API seed output must be fresh")
             metadata = create_api_seed(seed, args._prepare_api_seed)
             print(
@@ -5378,16 +5396,15 @@ def run(args) -> int:
             return 3
     if args._claim_diagnostics or args._claim_diagnostics_v4:
         try:
-            result = run_claim_scale_diagnostics(
-                Path(args.output), extended=args._claim_diagnostics_v4
-            )
+            output = data_path(args.output)
+            result = run_claim_scale_diagnostics(output, extended=args._claim_diagnostics_v4)
             actual_package = Path(__import__("oddsfox_catalogue").__file__).resolve().parent
             expected_package = Path(os.environ["FULL_PASS_EXPECTED_PACKAGE"]).resolve()
             require(
                 actual_package == expected_package, "claim diagnostic imported the wrong runtime"
             )
             result["runtime_source_hashes"] = source_hashes(actual_package)
-            (Path(args.output) / "claim-scale-report.json").write_text(
+            (output / "claim-scale-report.json").write_text(
                 json.dumps(result, sort_keys=True, indent=2) + "\n"
             )
             print(json.dumps(result))
@@ -5405,7 +5422,7 @@ def run(args) -> int:
             print(json.dumps({"status": "blocked", "message": f"{type(exc).__name__}: {exc}"}))
             return 3
     budget = Budget()
-    output = safe_path(args.output)
+    output = data_path(args.output)
     baseline_dir = safe_path(args.compare) if args.compare else None
     if baseline_dir:
         require(

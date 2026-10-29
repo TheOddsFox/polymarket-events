@@ -322,14 +322,21 @@ Windows acceptance is retired; deployment acceptance remains open.
 
 **Status: production cutover accepted after one supervised live refresh and verification.**
 
+The paths below record where assets were at acceptance. They have since been relocated
+under this checkout's `data/`; see `data/relocation-20261029/relocation-result.json` for
+the path mapping. The historical evidence and its accepted measurements are unchanged.
+
 - Accepted UTC: `2026-10-29T02:10:46.565119+00:00`
-- Production root: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2`
-- Runtime: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue`
+- Production root at acceptance: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2`
+- Current production root: `/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-production-duckdb2`
+- Runtime at acceptance: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue`
+- Current runtime: `/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-runtime/duckdb-2.0.0-local-data-6b78d876fa93/bin/catalogue`
 - Live generation: `5670`
 - Published release: `dd2885a834044c38a7b2bda996f12180`
 - Post-cutover requests: `1321`
 - Post-cutover results: `refresh published; verification valid; store and published generation match`
 - Evidence directory: `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-duckdb2-qualification-20261028T080656Z-fqf71tcz/evidence`
+- Current evidence directory: `data/catalogue-duckdb2-qualification-20261028T080656Z-fqf71tcz/evidence`
 
 DuckDB 2.0.0 passed the bounded full-size application, resource, retry, recovery and
 old-runtime equivalence checks described in the operator guide. Production retains
@@ -342,13 +349,14 @@ full live reconciliation or sustained-freshness claim is made.
 The application source and wheel were unchanged. The existing fast/full suites (1,725 tests), distribution audit and
 installed-workflow proofs were reused, and the affected 92 tests plus one targeted regression
 passed. Limits and public contract remain unchanged. The previous production root is
-retained as a historical runnable asset, not a rollback target after new writes.
+retained at `data/catalogue-production` as a historical runnable asset, not a rollback
+target after new writes.
 
 Rollback requires stopping writers, preserving or cloning the complete updated root,
 settling pending work under DuckDB 2.0 if needed, and verifying a fresh updated copy
-with `/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue`
-before changing designation. Never restore a stale pre-cutover root over committed
-updates.
+with the DuckDB 1.5.6 runtime now at
+`data/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue` before changing
+designation. Never restore a stale pre-cutover root over committed updates.
 
 The supervised refresh took 931.794859625 seconds, made 1,321 HTTP attempts, and downloaded 1,000,808,180 bytes without retries. Peak process-tree RSS was 3,747,676,160 bytes; peak allocated temporary storage was 2,541,191,168 bytes. The live verification passed. Active overdue count remains 19,998 and parent-event repairs 7,452; this ordinary refresh does not settle the reconciliation backlog.
 

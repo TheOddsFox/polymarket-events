@@ -30,19 +30,19 @@ v2 release; preserve any old root and runtime yourself if you need them.
 ## Authoritative production root on this MacBook
 
 Accepted on 29 October 2026, the authoritative root is
-`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2`. Preserve the whole
+`/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-production-duckdb2`. Preserve the whole
 root: database, configuration, `PRODUCTION-STATE.json`, handoff, raw recovery files,
 published releases and pointer. The former
-`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production` root is a historical runnable
-asset, not a rollback target after the new root has accepted writes.
+`/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-production` root is
+a historical runnable asset, not a rollback target after the new root has accepted writes.
 
 The permanent production executable is
-`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue`.
+`/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-runtime/duckdb-2.0.0-local-data-6b78d876fa93/bin/catalogue`.
 Run it with a clean environment and the global `--root` before the command:
 
 ```sh
-CATALOGUE_B='/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-2.0.0-stream-107eb4f/bin/catalogue'
-CATALOGUE_ROOT='/Volumes/Mac SSD/oddsfox/polymarket/catalogue-production-duckdb2'
+CATALOGUE_B='/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-runtime/duckdb-2.0.0-local-data-6b78d876fa93/bin/catalogue'
+CATALOGUE_ROOT='/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-production-duckdb2'
 catalogue_prod() {
   /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
@@ -53,14 +53,36 @@ catalogue_prod verify
 ```
 
 The old executable at
-`/Volumes/Mac SSD/oddsfox/polymarket/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue`
+`/Volumes/Mac SSD/oddsfox/polymarket/polymarket-events/data/catalogue-runtime/duckdb-1.5.6-accepted-63b1a94/bin/catalogue`
 is retained for verification of a fresh rollback copy made from the complete updated
 root. Stop writers; preserve or clone database, config, pending work, raw files, releases
 and pointers; settle pending work under DuckDB 2.0 when necessary; then verify that copy
 with the old runtime before changing designation. Never restore a stale root over new
 committed writes.
 
+The checkout's `data/` holds local production and rollback roots, runtimes, and
+evidence/history. It is Git-ignored and excluded from distributions. Historical evidence
+records the former sibling paths; map them with
+`data/relocation-20261029/relocation-result.json`. Keep snapshots and evidence ignored.
+
 ## Root and configuration
+
+Catalogue code running in this checkout, including its installed production runtime,
+confines writable data to the checkout’s ignored `data/` directory. Explicit `--root`,
+`CATALOGUE_ROOT`, metadata outputs, and maintenance evidence/conversion destinations
+must remain there; symlink and traversal spellings are rejected. The implicit root is
+`data/catalogue-v3` relative to the checkout rather than the caller’s working directory.
+Production remains an explicit selection. `data/catalogue-runtime` is reserved for
+software, so it cannot be selected as a data write destination.
+
+Tests keep isolated scratch under `data/tmp`; installed-workflow proofs default to a
+fresh directory under `data/installed-proofs`. Catalogue-store inputs, including
+benchmark seeds and metadata `--catalogue-root`, must also be local. Identity reads
+and some seed checks take locks or use the store’s spill directory even when the
+database is read-only. Passive configuration, manifests, runtime packages, accounting
+directories and audit/request files retain their existing read-only path validation.
+A standalone wheel installed outside a matching catalogue checkout retains portable
+explicit-root deployment behavior.
 
 Fresh-install examples below remain examples. Never initialize or reset the production
 root. Production continues to use the root's existing configuration and the explicit
@@ -72,12 +94,12 @@ not new catalogue tuning or a public configuration change. The contract, schema 
 version are unchanged. Metadata.v1 continues to use isolated staging; it does not reuse
 the production root.
 
-Use an external root. Global `--root` must precede the command.
+Use a root under the checkout’s ignored `data/`. Global `--root` must precede the command.
 
 ```sh
 uv sync --locked
-uv run catalogue --root /srv/catalogue-v3 init
-uv run catalogue --root /srv/catalogue-v3 config show
+uv run catalogue --root ./data/catalogue-v3 init
+uv run catalogue --root ./data/catalogue-v3 config show
 ```
 
 `init` writes `catalogue.json` and refuses nonempty unstamped roots and roots nested
@@ -121,7 +143,7 @@ control must be an ID the native endpoint answers with HTTP 404. `/events/2` and
 the lane.
 
 ```sh
-uv run catalogue --root /srv/catalogue-v3 probe \
+uv run catalogue --root ./data/catalogue-v3 probe \
   --open-event-id OPEN_EVENT --closed-event-id CLOSED_EVENT --absent-event-id ABSENT_EVENT \
   --open-market-id OPEN_MARKET --closed-market-id CLOSED_MARKET --absent-market-id ABSENT_MARKET
 ```
@@ -198,7 +220,7 @@ If the saved publication reservation consumes the entire configured invocation,
 actionable error. Recalibrate explicitly after investigating the prior slow publish:
 
 ```sh
-uv run catalogue --root /srv/catalogue-v3 publish --recalibrate
+uv run catalogue --root ./data/catalogue-v3 publish --recalibrate
 ```
 
 Recalibration exports and verifies a fresh release even when the store is unchanged.
@@ -211,13 +233,13 @@ if fresh publication itself cannot finish, preserve the root and investigate.
 `status`, `verify` and publication remain usable while acquisition is blocked.
 
 ```sh
-uv run catalogue --root /srv/catalogue-v3 refresh
-uv run catalogue --root /srv/catalogue-v3 reconcile
-uv run catalogue --root /srv/catalogue-v3 reconcile --full-pass
-uv run catalogue --root /srv/catalogue-v3 status
-uv run catalogue --root /srv/catalogue-v3 publish
-uv run catalogue --root /srv/catalogue-v3 current
-uv run catalogue --root /srv/catalogue-v3 verify
+uv run catalogue --root ./data/catalogue-v3 refresh
+uv run catalogue --root ./data/catalogue-v3 reconcile
+uv run catalogue --root ./data/catalogue-v3 reconcile --full-pass
+uv run catalogue --root ./data/catalogue-v3 status
+uv run catalogue --root ./data/catalogue-v3 publish
+uv run catalogue --root ./data/catalogue-v3 current
+uv run catalogue --root ./data/catalogue-v3 verify
 ```
 
 - `refresh` advances durable discovery frontiers and repairs at most 100 parent events
@@ -329,9 +351,9 @@ pre-commit work, release cleanup and raw cleanup; they are not release-manifest 
 The targeted handoff uses a separate, isolated producer root:
 
 ```sh
-uv run catalogue --root /srv/metadata-producer metadata refresh \
-  --market-id MARKET_ID --catalogue-root /srv/catalogue-v3 \
-  --output /srv/handoffs/metadata-release \
+uv run catalogue --root ./data/metadata-producer metadata refresh \
+  --market-id MARKET_ID --catalogue-root ./data/catalogue-v3 \
+  --output ./data/handoffs/metadata-release \
   --max-output-bytes 134217728 --max-response-bytes 8388608 \
   --max-requests 500 --max-download-bytes 134217728
 ```
@@ -385,21 +407,20 @@ The compatibility integration test initializes a minimal root, then runs refresh
 `reconcile --full-pass` against the fake Gamma server. It confirms that `import-release`
 is not available.
 
-Build and audit the distribution, then exercise an installed executable outside the
-checkout:
+Build and audit the distribution, then exercise an installed executable in an isolated
+virtual environment under ignored `data/`:
 
 ```sh
 uv build
 uv run python scripts/verify-distribution.py dist/*.whl dist/*.tar.gz
-PROOF_PARENT="$(mktemp -d)"
-PROOF_PARENT="$(cd "$PROOF_PARENT" && pwd -P)"
-uv run python scripts/verify-installed-workflow.py --output "$PROOF_PARENT/installed-proof"
+uv run python scripts/verify-installed-workflow.py
 ```
 
-The temporary parent is unique and resolved to its physical path, including on
-macOS where `/tmp` is a symlink. The output destination must not exist; symlink
-ancestors and `..` path components are rejected before creating evidence. The
-installed-workflow check runs the same
+The default evidence directory is unique. An explicit `--output` must be a fresh
+path under `data/`, outside any stamped catalogue root; symlink ancestors and `..`
+components are rejected before creating evidence. The imported package must come from
+the proof’s installed virtual environment, and its resources are checked before and
+after the workflow. The installed-workflow check runs the same
 commands an operator would run, including `reconcile --full-pass`.
 It builds and installs offline: the uv cache must contain both the declared build
 backend and exported hash-locked runtime requirements. If it reports a cache miss,
@@ -455,10 +476,10 @@ The full-pass characterization tool generates its own synthetic seed; it never o
 operator data or contacts live Gamma:
 
 ```sh
-uv run --locked python scripts/benchmark-full-pass.py --profile smoke --output "$HOME/catalogue-benchmarks/full-pass-smoke"
-uv run --locked python scripts/benchmark-full-pass.py --profile perf --output "$HOME/catalogue-benchmarks/full-pass-baseline"
+uv run --locked python scripts/benchmark-full-pass.py --profile smoke --output "./data/catalogue-benchmarks/full-pass-smoke"
+uv run --locked python scripts/benchmark-full-pass.py --profile perf --output "./data/catalogue-benchmarks/full-pass-baseline"
 # After a candidate scheduling change, compare against the locally generated baseline:
-uv run --locked python scripts/benchmark-full-pass.py --profile perf --compare "$HOME/catalogue-benchmarks/full-pass-baseline" --output "$HOME/catalogue-benchmarks/full-pass-candidate"
+uv run --locked python scripts/benchmark-full-pass.py --profile perf --compare "./data/catalogue-benchmarks/full-pass-baseline" --output "./data/catalogue-benchmarks/full-pass-candidate"
 ```
 
 Every output directory must be fresh, with no symlink ancestors. Use only trusted,

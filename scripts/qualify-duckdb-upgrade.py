@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO / "src"))
 from oddsfox_catalogue import current_publish  # noqa: E402
 from oddsfox_catalogue.current_config import (  # noqa: E402
     GIB,
+    data_path,
     load_current_settings,
     safe_path,
     validate_root,
@@ -46,7 +47,7 @@ def require(condition, message):
 
 @contextmanager
 def _catalogue_lock(path):
-    path = safe_path(path)
+    path = data_path(path)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         opened = os.fstat(fd)
@@ -537,7 +538,7 @@ def _prepare_source(root, temporary, settings=None):
 
 
 def _safe_evidence_output(path: Path, *roots: Path):
-    path = safe_path(path)
+    path = data_path(path)
     require(not path.exists(), "qualification report output must be fresh")
     require(path.parent.is_dir(), "qualification report parent must exist")
     for root in roots:
@@ -550,8 +551,10 @@ def _safe_evidence_output(path: Path, *roots: Path):
 
 
 def _temp_directory(parent: Path, *roots: Path):
+    parent = safe_path(parent)
+    data_path(parent / "duckdb-qualification-probe")
     path = Path(tempfile.mkdtemp(prefix="duckdb-qualification-", dir=parent))
-    path = safe_path(path)
+    path = data_path(path)
     for root in roots:
         resolved = root.resolve()
         require(
@@ -562,6 +565,7 @@ def _temp_directory(parent: Path, *roots: Path):
 
 
 def _write_report(path: Path, report):
+    path = data_path(path)
     encoded = (json.dumps(report, sort_keys=True, indent=2) + "\n").encode()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "wb") as stream:
@@ -571,7 +575,7 @@ def _write_report(path: Path, report):
 
 
 def inventory(root: Path, output: Path):
-    root = safe_path(root)
+    root = data_path(root)
     output = _safe_evidence_output(output, root)
     temporary = _temp_directory(output.parent, root)
     try:
@@ -601,7 +605,7 @@ def inventory(root: Path, output: Path):
 
 
 def _validate_destination(source: Path, destination: Path, output: Path):
-    source, destination = safe_path(source), safe_path(destination)
+    source, destination = safe_path(source), data_path(destination)
     require(not destination.exists(), "conversion destination must not exist")
     require(destination.parent.is_dir(), "conversion destination parent must exist")
     source, destination = source.resolve(), destination.resolve()
@@ -626,6 +630,7 @@ def _validate_destination(source: Path, destination: Path, output: Path):
 
 
 def _copy_sidefiles(layout, destination):
+    destination = data_path(destination)
     destination.mkdir(mode=0o700)
     for relative in sorted(
         layout["directories"], key=lambda item: (len(item.parts), item.as_posix())
@@ -645,6 +650,7 @@ def _copy_sidefiles(layout, destination):
 
 
 def _copy_database(source, destination, storage_version, settings, temporary):
+    destination, temporary = data_path(destination), data_path(temporary)
     require(
         not (destination / "catalogue.duckdb").exists(),
         "conversion database destination must be absent",
@@ -677,6 +683,7 @@ def _allocated_bytes(path):
 
 
 def convert(root: Path, destination: Path, storage_version: str, output: Path):
+    root = data_path(root)
     root, destination = _validate_destination(root, destination, output)
     output = _safe_evidence_output(output, root, destination)
     validate_root(root)

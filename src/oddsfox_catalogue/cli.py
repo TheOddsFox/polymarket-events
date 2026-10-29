@@ -85,7 +85,7 @@ def build_parser():
 
 
 def _metadata(args):
-    from .current_config import load_current_settings
+    from .current_config import data_path, load_current_settings
     from .ids import sha256_bytes
     from .metadata import GammaClient, refresh_metadata
 
@@ -96,9 +96,10 @@ def _metadata(args):
         raise CurrentError("metadata refresh requires an explicit isolated --root")
     producer = load_current_settings(root)
     catalogue = load_current_settings(args.catalogue_root) if args.catalogue_root else None
+    output = data_path(args.output)
     locations = [
         producer.root,
-        args.output,
+        output,
         producer.root / "metadata" / "raw",
         producer.run_lock_path,
     ]
@@ -124,7 +125,7 @@ def _metadata(args):
                 catalogue,
                 producer.root,
                 args.market_id,
-                args.output,
+                output,
                 client=client,
                 max_output_bytes=args.max_output_bytes,
                 max_body_bytes=args.max_response_bytes,

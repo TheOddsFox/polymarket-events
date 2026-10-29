@@ -37,6 +37,7 @@ from oddsfox_catalogue.current_config import (  # noqa: E402
     CurrentLimits,
     CurrentSettings,
     connect_store,
+    data_path,
     safe_path,
     validate_root,
 )
@@ -814,7 +815,7 @@ def parser():
 
 def run(args):
     seed = validate_root(args.seed_root)
-    output = safe_path(args.output)
+    output = data_path(args.output)
     require(not output.exists(), "output must be a fresh directory")
     require(
         seed not in output.parents and output not in seed.parents,

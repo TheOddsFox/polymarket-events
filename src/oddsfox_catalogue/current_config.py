@@ -121,9 +121,44 @@ def safe_path(path: Path) -> Path:
     return path
 
 
+def repository_data_dir() -> Path | None:
+    """Return the enclosing catalogue checkout’s data directory, or None outside one."""
+    origin = Path(__file__).resolve()
+    for root in origin.parents:
+        project_file = root / "pyproject.toml"
+        source_file = root / "src" / "oddsfox_catalogue" / "current_config.py"
+        if not source_file.is_file() or not project_file.is_file():
+            continue
+        try:
+            project = tomllib.loads(project_file.read_text())
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+            raise CurrentError("cannot identify the local catalogue checkout") from exc
+        project_info = project.get("project")
+        if not isinstance(project_info, dict) or not isinstance(project_info.get("name"), str):
+            raise CurrentError("cannot identify the local catalogue checkout")
+        if project_info["name"] != "oddsfox-catalogue":
+            raise CurrentError("unexpected local catalogue project identity")
+        return root / "data"
+    return None
+
+
+def data_path(path: Path) -> Path:
+    """Confine source and locally installed catalogue writers to checkout data."""
+    path = safe_path(path)
+    data_dir = repository_data_dir()
+    if data_dir is None:
+        return path
+    data_dir = safe_path(data_dir)
+    if not path.is_relative_to(data_dir) or path == data_dir:
+        raise CurrentError("catalogue data must stay inside the repository data directory")
+    if path.relative_to(data_dir).parts[0].casefold() == "catalogue-runtime":
+        raise CurrentError("catalogue data must stay inside the repository data directory")
+    return path
+
+
 def validate_root(root: Path, *, initialize: bool = False) -> Path:
     """Reject an old/unknown root before locks, logs or database files are created."""
-    root = safe_path(root)
+    root = data_path(root)
     for ancestor in root.parents:
         if (ancestor / "catalogue.json").exists():
             raise CurrentError("a catalogue root cannot be nested inside another root")
@@ -156,9 +191,11 @@ def validate_root(root: Path, *, initialize: bool = False) -> Path:
 
 def load_current_settings(root: Path | None = None, *, env=None) -> CurrentSettings:
     environ = dict(os.environ if env is None else env)
-    root = safe_path(
-        Path(root or environ.get("CATALOGUE_ROOT") or Path.cwd() / "data/catalogue-v3")
+    data_dir = repository_data_dir()
+    default_root = (
+        data_dir / "catalogue-v3" if data_dir is not None else Path.cwd() / "data/catalogue-v3"
     )
+    root = data_path(Path(root or environ.get("CATALOGUE_ROOT") or default_root))
     config_path = safe_path(Path(environ.get("CATALOGUE_CONFIG", root / "config.toml")))
     raw = {}
     if config_path.exists():

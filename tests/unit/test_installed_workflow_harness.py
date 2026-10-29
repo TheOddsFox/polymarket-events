@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,44 +18,57 @@ harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 
 
-@pytest.mark.parametrize("spelling", ["direct", "dotdot", "symlink", "case-alias"])
-def test_output_rejects_checkout_aliases_before_creating_files(tmp_path, monkeypatch, spelling):
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    if spelling == "case-alias":
-        alias = tmp_path / "CHECKOUT"
-        if not alias.exists():
-            pytest.skip("requires a case-insensitive filesystem")
-        output = alias / "proof"
-    elif spelling == "symlink":
-        alias = tmp_path / "alias"
-        alias.symlink_to(checkout, target_is_directory=True)
-        output = alias / "proof"
-    elif spelling == "dotdot":
-        output = outside / ".." / "checkout" / "proof"
-    else:
-        output = checkout / "proof"
-    monkeypatch.setattr(harness, "REPO", checkout)
+@pytest.mark.parametrize(
+    "output",
+    [
+        harness.REPO,
+        harness.REPO / "data",
+        harness.REPO / "data" / "catalogue-runtime" / "proof",
+        harness.REPO / "data" / "catalogue-production-duckdb2" / "proof",
+        harness.REPO / "data" / "legacy-data-state" / "proof",
+        harness.REPO.parent / "outside-proof",
+    ],
+)
+def test_output_rejects_checkout_and_catalogue_paths_before_creating_files(monkeypatch, output):
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])
     monkeypatch.setattr(harness, "verify", lambda output: pytest.fail("must reject before proof"))
     with pytest.raises(SystemExit) as error:
         harness.main()
     assert error.value.code == 2
-    assert list(checkout.iterdir()) == []
+    assert output in (harness.REPO, harness.REPO / "data") or not output.exists()
 
 
-def test_output_accepts_fresh_physical_directory_outside_checkout(tmp_path, monkeypatch):
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
-    output = tmp_path / "external-proof"
-    monkeypatch.setattr(harness, "REPO", checkout)
+def test_output_accepts_fresh_directory_under_repo_data(tmp_path, monkeypatch):
+    output = tmp_path / "installed-proof"
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])
     monkeypatch.setattr(harness, "verify", lambda path: {"status": "passed"})
     assert harness.main() == 0
     assert harness.json.loads((output / "report.json").read_text())["output"] == str(output)
-    assert list(checkout.iterdir()) == []
+    assert output.is_relative_to(harness.REPO / "data")
+
+
+def test_default_output_uses_unique_installed_proofs_directory(monkeypatch):
+    created = []
+    mkdtemp = harness.tempfile.mkdtemp
+
+    def capture_mkdtemp(*args, **kwargs):
+        output = Path(mkdtemp(*args, **kwargs))
+        created.append(output)
+        return str(output)
+
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT)])
+    monkeypatch.setattr(harness, "verify", lambda path: {"status": "passed"})
+    monkeypatch.setattr(harness.tempfile, "mkdtemp", capture_mkdtemp)
+    try:
+        assert harness.main() == 0
+        assert len(created) == 1
+        report = harness.json.loads((created[0] / "report.json").read_text())
+        output = Path(report["output"])
+        assert output.parent == harness.REPO / "data" / "installed-proofs"
+        assert output.is_relative_to(harness.REPO / "data")
+    finally:
+        for output in created:
+            shutil.rmtree(output, ignore_errors=True)
 
 
 def test_resource_freeze_preserves_inventory_and_detects_tampering(tmp_path):
@@ -395,7 +409,7 @@ raise SystemExit(harness.main())
 def test_installed_cli_timeout_tracks_default_refresh_budget(tmp_path, monkeypatch):
     output = tmp_path / "evidence"
     output.mkdir()
-    package = output / "venv/lib/oddsfox_catalogue"
+    package = output / "venv/lib/python3.12/site-packages/oddsfox_catalogue"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("")
     (package / "cli.py").write_text("")

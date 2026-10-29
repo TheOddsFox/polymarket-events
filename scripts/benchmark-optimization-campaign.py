@@ -2971,7 +2971,7 @@ def parser():
 def run(args, *, budget=None) -> int:
     supplied_budget = budget is not None
     budget = budget or bench.Budget(limit_s=V3_CAMPAIGN_BUDGET_S)
-    output = bench.safe_path(args.output)
+    output = bench.data_path(args.output)
     manifest_path = bench.safe_path(args.manifest)
     if output.exists():
         raise ValueError("output must be a fresh directory")

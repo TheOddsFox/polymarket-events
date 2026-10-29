@@ -14,7 +14,7 @@ from uuid import UUID
 import duckdb
 
 from oddsfox_catalogue.capture.writer import read_body, read_regular_bytes
-from oddsfox_catalogue.current_config import CurrentSettings, safe_path
+from oddsfox_catalogue.current_config import CurrentSettings, data_path, safe_path
 from oddsfox_catalogue.current_contract import SCHEMAS, projection
 from oddsfox_catalogue.current_publish import verify_current
 from oddsfox_catalogue.fingerprints import semantic_fingerprint
@@ -295,6 +295,7 @@ def authenticate(conn, root, audit):
 
 
 def verify(source, root, audit_path, temporary=None):
+    temporary = data_path(Path(temporary)) if temporary is not None else None
     source, root = safe_path(Path(source)), safe_path(Path(root))
     require(
         source != root and source not in root.parents and root not in source.parents,
@@ -312,7 +313,6 @@ def verify(source, root, audit_path, temporary=None):
     audit = audit_index(audit_path)
     sql_config = {"memory_limit": "2GB", "threads": "2", "max_temp_directory_size": "0B"}
     if temporary is not None:
-        temporary = safe_path(Path(temporary))
         require(not temporary.exists(), "SQL temporary directory must be fresh")
         for directory in (source, root):
             require(
@@ -408,7 +408,7 @@ def main():
         "--temporary", type=Path, help="Fresh private SQL spill directory; bounded to 8 GiB"
     )
     args = parser.parse_args()
-    args.output = safe_path(args.output)
+    args.output = data_path(args.output)
     require(not args.output.exists() and not args.output.is_symlink(), "output must be fresh")
     for directory in (args.source.absolute(), args.root.absolute()):
         require(

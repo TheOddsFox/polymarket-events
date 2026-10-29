@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO / "tests"))
 from fakes.capacity_source import MAX_AUDIT_BYTES, CapacitySource  # noqa: E402
 from oddsfox_catalogue.current_config import (  # noqa: E402
     CurrentLimits,
+    data_path,
     load_current_settings,
     safe_path,
     validate_root,
@@ -82,7 +83,8 @@ def disjoint(left, right):
 
 
 def paths(args):
-    seed, root, output = (safe_path(p) for p in (args.seed_root, args.root, args.output))
+    seed = safe_path(args.seed_root)
+    root, output = data_path(args.root), data_path(args.output)
     accounts = [safe_path(p) for p in args.account_root]
     if not accounts or any(not p.is_dir() for p in accounts):
         raise ValueError("existing frozen accounting roots are required")

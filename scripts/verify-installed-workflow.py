@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove the audited wheel's full workflow outside the checkout, using only loopback fixtures."""
+"""Prove the audited wheel's full workflow using only loopback fixtures."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests"))
 
 from fakes.current_gamma import CurrentGammaServer  # noqa: E402
-from oddsfox_catalogue.current_config import CurrentLimits, safe_path  # noqa: E402
+from oddsfox_catalogue.current_config import CurrentLimits, data_path  # noqa: E402
 from oddsfox_catalogue.platform_support import (  # noqa: E402
     is_symlink,
     operator_signals,
@@ -44,6 +44,21 @@ def resource_inventory(root: Path) -> dict[str, dict[str, object]]:
     if not inventory or "__init__.py" not in inventory or "cli.py" not in inventory:
         raise ValueError("installed package is incomplete")
     return inventory
+
+
+def _require_isolated_output(output: Path) -> None:
+    data_dir = (REPO / "data").resolve()
+    if output == data_dir or not output.is_relative_to(data_dir):
+        raise ValueError("installed proof output must be below the repository data directory")
+    for ancestor in (output, *output.parents):
+        if ancestor == data_dir.parent:
+            break
+        if (
+            (ancestor / "catalogue.json").exists()
+            or any((ancestor / name).exists() for name in ("ledger.sqlite", "warehouse"))
+            or (ancestor / ".state" / "ledger.sqlite").exists()
+        ):
+            raise ValueError("installed proof output overlaps a catalogue or legacy root")
 
 
 def freeze_resources(root: Path) -> None:
@@ -192,6 +207,8 @@ def run_command(
 
 
 def verify(output: Path) -> dict:
+    output = data_path(output)
+    _require_isolated_output(output)
     env = {
         key: value
         for key, value in os.environ.items()
@@ -283,8 +300,11 @@ def verify(output: Path) -> dict:
         env,
         output / "installed-origin.log",
     )
-    origin = Path((output / "installed-origin.log").read_text().strip())
-    if origin.is_relative_to(REPO) or not origin.is_relative_to(venv):
+    origin = Path((output / "installed-origin.log").read_text().strip()).resolve()
+    site_packages = [path.resolve() for path in (venv / "lib").glob("python*/site-packages")]
+    if origin.is_relative_to((REPO / "src").resolve()) or not any(
+        origin.is_relative_to(path) for path in site_packages
+    ):
         raise ValueError("package was imported from checkout instead of installed wheel")
     package = origin.parent
     before = resource_inventory(package)
@@ -385,29 +405,27 @@ def verify(output: Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, help="fresh evidence directory outside the checkout")
-    args = parser.parse_args()
-    output = (
-        args.output.absolute()
-        if args.output
-        else Path(
-            tempfile.mkdtemp(
-                prefix="catalogue-installed-", dir=Path(tempfile.gettempdir()).resolve()
-            )
-        )
+    parser.add_argument(
+        "--output", type=Path, help="fresh evidence directory under repository data"
     )
+    args = parser.parse_args()
     try:
-        output = safe_path(output)
+        if args.output:
+            output = data_path(args.output)
+            _require_isolated_output(output)
+            if output.exists() or any(is_symlink(path) for path in (output, *output.parents)):
+                parser.error("output must be fresh and confined by regular directories")
+            output.mkdir(parents=True)
+        else:
+            proof_parent = data_path(REPO / "data" / "installed-proofs")
+            _require_isolated_output(proof_parent)
+            proof_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            output = data_path(
+                Path(tempfile.mkdtemp(prefix="catalogue-installed-", dir=proof_parent))
+            )
+            _require_isolated_output(output)
     except ValueError as exc:
         parser.error(str(exc))
-    if output.is_relative_to(REPO.resolve()) or any(
-        path.exists() and path.samefile(REPO) for path in (output, *output.parents)
-    ):
-        parser.error("installed proof must run outside the checkout")
-    if args.output:
-        if output.exists() or any(is_symlink(path) for path in (output, *output.parents)):
-            parser.error("output must be fresh and confined by regular directories")
-        output.mkdir(parents=True)
     started = time.monotonic()
     previous = {
         signum: signal.signal(signum, lambda signum, _frame: SIGNALS.receive(signum))

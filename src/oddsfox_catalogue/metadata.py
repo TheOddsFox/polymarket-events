@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from oddsfox_catalogue.capture.writer import atomic_write_bytes, write_marker, write_page
 from oddsfox_catalogue.config import GammaSettings
-from oddsfox_catalogue.current_config import CurrentSettings, connect_store, safe_path
+from oddsfox_catalogue.current_config import CurrentSettings, connect_store, data_path
 from oddsfox_catalogue.current_contract import CurrentError
 from oddsfox_catalogue.gamma.http import GammaClient, GammaError
 from oddsfox_catalogue.ids import (
@@ -265,12 +265,12 @@ def _write_bundle(
         or not 0 < max_output_bytes <= MAX_OUTPUT_BYTES
     ):
         raise MetadataError("metadata output limit must be positive")
-    if is_symlink(output) or output.exists():
-        raise MetadataError("output must be a new immutable directory")
     try:
-        output = safe_path(output)
+        output = data_path(output)
     except CurrentError as exc:
         raise MetadataError("output path is unsafe") from exc
+    if is_symlink(output) or output.exists():
+        raise MetadataError("output must be a new immutable directory")
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".metadata-", dir=output.parent))
     try:
@@ -336,6 +336,7 @@ def _validate_endpoint(gamma: GammaSettings) -> None:
 
 def _catalogue_identity(catalogue: CurrentSettings, market_ids: list[str]) -> list[dict[str, Any]]:
     """Read identity under the catalogue writer lock; the catalogue store is never written here."""
+    data_path(catalogue.root)
     if not catalogue.store_path.exists():
         raise MetadataError("catalogue identity store is not initialized")
     with run_lock(catalogue.run_lock_path), connect_store(catalogue, read_only=True) as conn:
@@ -357,16 +358,21 @@ def refresh_metadata(
 ) -> dict[str, Any]:
     """Fetch only named markets and export this capture's evidence, never stale fallbacks."""
     market_ids = validate_market_ids(market_ids)
-    if is_symlink(output) or output.exists():
-        raise MetadataError("output must be a new immutable directory")
     try:
-        output = safe_path(output)
+        output = data_path(output)
     except CurrentError as exc:
         raise MetadataError("output path is unsafe") from exc
     try:
-        producer_root = safe_path(Path(producer_root))
+        producer_root = data_path(Path(producer_root))
     except CurrentError as exc:
         raise MetadataError("producer path is unsafe") from exc
+    if catalogue is not None:
+        try:
+            data_path(catalogue.root)
+        except CurrentError as exc:
+            raise MetadataError("catalogue path is unsafe") from exc
+    if is_symlink(output) or output.exists():
+        raise MetadataError("output must be a new immutable directory")
     if not 0 < max_body_bytes <= MAX_BODY_BYTES or not 0 < max_output_bytes <= MAX_OUTPUT_BYTES:
         raise MetadataError("metadata byte limits must be positive and within contract bounds")
     if any(
